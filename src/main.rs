@@ -123,6 +123,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             // Started by the service as SYSTEM inside the console session. The service
             // directory must already exist and be the administrators' alone: never create it,
             // and check it before logging there or reading the key.
+            let (stop_event, rest) = platform::service::agent_stop_event(rest);
             let dir = keystore::check_service_dir()?;
             util::set_log_file(&dir.join("host.log"))?;
             let mut cli = parse_host(rest, true)?;
@@ -135,15 +136,14 @@ fn dispatch(args: &[String]) -> Result<()> {
             }
             let key = keystore::load_service_key()?;
             platform::init_process();
-            // The service closes our stdin to stop us: end the session cleanly (release held
-            // keys and buttons, end privacy mode) instead of being killed.
-            std::thread::spawn(|| {
-                use std::io::Read;
-                let mut buf = [0u8; 64];
-                let mut stdin = std::io::stdin();
-                while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
-                STOP.store(true, Ordering::SeqCst);
-            });
+            // The service signals this event to stop us: end the session cleanly (release held
+            // keys and buttons, end privacy mode) instead of being killed. Without it the
+            // service can only terminate us, which is no reason not to run.
+            match stop_event.map(|name| platform::service::watch_stop_event(name, &STOP)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => log!("cannot watch for the service's stop request ({e}); stopping will end this agent abruptly"),
+                None => log!("started without a stop event; stopping will end this agent abruptly"),
+            }
             let listener = host::bind(&cli.opts, &STOP)?;
             host::serve(listener, cli.opts, key, &STOP)
         }

@@ -3,25 +3,64 @@
 use super::capture::virtual_screen;
 use crate::screen::Area;
 use crate::proto::*;
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Mutex, PoisonError};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-/// Marker in `dwExtraInfo` by which the privacy hooks recognise the events we inject. It is
-/// random per process, so that other programs cannot simply copy it from the binary.
-pub fn inject_tag() -> usize {
-    static TAG: OnceLock<usize> = OnceLock::new();
-    *TAG.get_or_init(|| {
-        let mut b = [0u8; size_of::<usize>()];
-        if crate::crypto::random(&mut b).is_err() {
-            // CNG does not fail in practice; std's hash keys come from the OS generator too.
-            use std::hash::{BuildHasher, RandomState};
-            b = (RandomState::new().hash_one(std::process::id()) as usize).to_ne_bytes();
+/// Tags kept for events the privacy hooks have not seen yet. Nothing takes them while privacy
+/// mode is off, so the oldest make room.
+const MAX_PENDING: usize = 4096;
+
+/// Tags of the events we injected that no privacy hook has passed yet, oldest first.
+struct Pending(VecDeque<usize>);
+
+impl Pending {
+    const fn new() -> Pending {
+        Pending(VecDeque::new())
+    }
+
+    fn add(&mut self, tag: usize) {
+        if self.0.len() >= MAX_PENDING {
+            self.0.pop_front();
         }
-        // Never 0 (what other programs send) nor the pen/touch signature 0xFF5157xx.
-        (usize::from_ne_bytes(b) & !0x8000_0000) | 1
-    })
+        self.0.push_back(tag);
+    }
+
+    /// Removes `tag`; false if it is not (or no longer) there. The newest come first: with the
+    /// hooks running, the event they are looking at was sent moments ago.
+    fn take(&mut self, tag: usize) -> bool {
+        match self.0.iter().rposition(|&t| t == tag) {
+            Some(i) => {
+                self.0.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+static PENDING: Mutex<Pending> = Mutex::new(Pending::new());
+
+/// A fresh random marker for the `dwExtraInfo` of one event we inject, recorded for the privacy
+/// hooks, which let an injected event through only with a tag they have not seen before.
+pub fn new_tag() -> usize {
+    let mut b = [0u8; size_of::<usize>()];
+    if crate::crypto::random(&mut b).is_err() {
+        // CNG does not fail in practice; std's hash keys come from the OS generator too.
+        use std::hash::{BuildHasher, RandomState};
+        b = (RandomState::new().hash_one(std::process::id()) as usize).to_ne_bytes();
+    }
+    // Never 0 (what other programs send) nor the pen/touch signature 0xFF5157xx.
+    let tag = (usize::from_ne_bytes(b) & !0x8000_0000) | 1;
+    PENDING.lock().unwrap_or_else(PoisonError::into_inner).add(tag);
+    tag
+}
+
+/// Called by the privacy hooks: whether `tag` is that of an event we injected, which it then
+/// stops being. Each tag lets one event through.
+pub fn take_tag(tag: usize) -> bool {
+    PENDING.lock().unwrap_or_else(PoisonError::into_inner).take(tag)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,7 +85,7 @@ fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: inject_tag() },
+            mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: new_tag() },
         },
     }
 }
@@ -70,7 +109,7 @@ fn key(k: HeldKey, up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, wScan: k.scan, dwFlags: flags, time: 0, dwExtraInfo: inject_tag() },
+            ki: KEYBDINPUT { wVk: vk, wScan: k.scan, dwFlags: flags, time: 0, dwExtraInfo: new_tag() },
         },
     }
 }
@@ -154,17 +193,36 @@ mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 
     #[test]
-    fn inject_tag_is_random_stable_and_never_zero() {
-        let t = inject_tag();
-        assert_eq!(t, inject_tag());
-        assert_ne!(t, 0);
-        assert_ne!(t, 0x5344_5250, "the old fixed tag");
-        assert_ne!(t & 0xFFFF_FF00, 0xFF51_5700);
-        // Both builders carry it.
-        let k = key(HeldKey { vk: 0x41, scan: 0x1e, extended: false }, false);
-        let m = mouse(0, 0, 0, MOUSEEVENTF_MOVE);
-        let extra = unsafe { (k.Anonymous.ki.dwExtraInfo, m.Anonymous.mi.dwExtraInfo) };
-        assert_eq!(extra, (t, t));
+    fn every_event_gets_a_fresh_tag_that_passes_once() {
+        let a = |up| key(HeldKey { vk: 0x41, scan: 0x1e, extended: false }, up);
+        let inputs = [a(false), mouse(0, 0, 0, MOUSEEVENTF_MOVE), a(true), mouse(0, 0, 0, MOUSEEVENTF_MOVE)];
+        let extra = |i: INPUT| unsafe { if i.r#type == INPUT_KEYBOARD { i.Anonymous.ki.dwExtraInfo } else { i.Anonymous.mi.dwExtraInfo } };
+        let tags = inputs.map(extra);
+        for (i, &t) in tags.iter().enumerate() {
+            assert!(!tags[..i].contains(&t), "tag reused: {tags:x?}");
+            assert_ne!(t, 0);
+            assert_ne!(t, 0x5344_5250, "the old fixed tag");
+            assert_ne!(t & 0xFFFF_FF00, 0xFF51_5700);
+        }
+        // In any order, but each only once; anything else never.
+        for &t in tags.iter().rev() {
+            assert!(take_tag(t));
+            assert!(!take_tag(t), "a tag passed twice");
+        }
+        assert!(!take_tag(0));
+        assert!(!take_tag(new_tag() ^ 0x5a5a));
+    }
+
+    #[test]
+    fn pending_tags_are_bounded_and_the_oldest_go() {
+        let mut p = Pending::new();
+        for t in 1..=MAX_PENDING + 10 {
+            p.add(t);
+        }
+        assert_eq!(p.0.len(), MAX_PENDING);
+        assert!(!p.take(10) && p.take(11) && p.take(MAX_PENDING + 10) && p.take(MAX_PENDING));
+        assert!(!p.take(11));
+        assert_eq!(p.0.len(), MAX_PENDING - 3);
     }
 
     #[test]

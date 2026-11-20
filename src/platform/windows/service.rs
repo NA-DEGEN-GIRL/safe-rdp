@@ -5,8 +5,9 @@
 //! is what allows the agent to follow the input desktop onto the lock screen, the sign-in
 //! screen and UAC prompts, and to drive elevated windows. The agent is tied to the service
 //! with a kill-on-close job object and is restarted whenever the console session changes.
-//! To stop it, the service closes the agent's stdin: the agent then releases the keys and
-//! buttons a viewer holds and ends privacy mode, and is killed only if it takes too long.
+//! To stop it, the service signals a SYSTEM-only event whose name it passes on the agent's
+//! command line (handles cannot be inherited across sessions): the agent then releases the keys
+//! and buttons a viewer holds and ends privacy mode, and is killed only if it takes too long.
 //!
 //! Ctrl+Alt+Del cannot be synthesised with SendInput; the agent signals a SYSTEM-only event
 //! and the service calls SendSAS (requires the SoftwareSASGeneration policy, `--enable-sas`).
@@ -15,11 +16,10 @@ use super::keystore;
 use crate::util::{Error, Result, wide};
 use crate::{bail, log};
 use std::ffi::c_void;
-use std::io::PipeWriter;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authentication::Identity::SendSAS;
@@ -35,6 +35,12 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 pub const SERVICE_NAME: &str = "SafeRdpHost";
 const DISPLAY_NAME: &str = "safe-rdp host";
 const SAS_EVENT: &str = r"Global\SafeRdpSas";
+/// Followed by a random suffix: the event the service signals to stop one agent.
+const AGENT_STOP_EVENT: &str = r"Global\SafeRdpAgentStop-";
+/// The agent's first argument, followed by the name of its stop event.
+const STOP_EVENT_ARG: &str = "--stop-event";
+/// Only SYSTEM (the service and its agent) may use the service's events.
+const SYSTEM_ONLY: &str = "D:P(A;;GA;;;SY)";
 const FIREWALL_RULE: &str = "safe-rdp";
 /// How long a stopping agent may take to end its session before it is killed.
 const AGENT_STOP_WAIT: Duration = Duration::from_secs(5);
@@ -55,6 +61,34 @@ pub fn request_sas() -> bool {
         CloseHandle(h);
         true
     }
+}
+
+/// Called by the agent: splits the name of its stop event, which the service puts first, off
+/// its arguments.
+pub fn agent_stop_event(args: &[String]) -> (Option<&str>, &[String]) {
+    match args {
+        [flag, name, rest @ ..] if flag == STOP_EVENT_ARG => (Some(name), rest),
+        _ => (None, args),
+    }
+}
+
+/// Called by the agent: sets `stop` once the service signals the event `name`. An event that
+/// cannot be opened or waited on is never taken for a stop request; the service then
+/// terminates the agent instead.
+pub fn watch_stop_event(name: &str, stop: &'static AtomicBool) -> Result<()> {
+    let h = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(name).as_ptr()) };
+    if h.is_null() {
+        return Err(Error::last_os(&format!("OpenEventW({name})")));
+    }
+    let event = unsafe { OwnedHandle::from_raw_handle(h) };
+    std::thread::Builder::new().name("stop-event".into()).spawn(move || {
+        if unsafe { WaitForSingleObject(event.as_raw_handle() as HANDLE, INFINITE) } == WAIT_OBJECT_0 {
+            stop.store(true, Ordering::SeqCst);
+        } else {
+            log!("cannot wait for the service's stop request: {}", std::io::Error::last_os_error());
+        }
+    })?;
+    Ok(())
 }
 
 /// Quotes one argument the way CommandLineToArgvW and the MSVC/Rust argument parsers undo it:
@@ -380,21 +414,37 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     }
 }
 
-/// Event that only SYSTEM can open, used by the agent to request Ctrl+Alt+Del.
-fn create_sas_event() -> Result<HANDLE> {
+/// Creates the event `name` with security descriptor `sddl`. A name that is already taken is
+/// refused: whoever created that event would control it.
+fn create_event(name: &str, sddl: &str, manual_reset: bool) -> Result<OwnedHandle> {
     unsafe {
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(wide("D:P(A;;GA;;;SY)").as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
             return Err(Error::last_os("security descriptor"));
         }
         let sa = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: 0 };
-        let h = CreateEventW(&sa, 0, 0, wide(SAS_EVENT).as_ptr());
+        SetLastError(0);
+        let h = CreateEventW(&sa, manual_reset as i32, 0, wide(name).as_ptr());
+        let e = std::io::Error::last_os_error();
         LocalFree(sd as HLOCAL);
         if h.is_null() {
-            return Err(Error::last_os("CreateEventW(SAS)"));
+            bail!("CreateEventW({name}) failed: {e}");
+        }
+        let h = OwnedHandle::from_raw_handle(h);
+        if e.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+            bail!("event {name} already exists");
         }
         Ok(h)
     }
+}
+
+/// A new manual-reset event with security descriptor `sddl` and a random name, for stopping one
+/// agent. Manual reset: the agent sees the request even if it opens the event only afterwards.
+fn new_stop_event(sddl: &str) -> Result<(OwnedHandle, String)> {
+    let mut r = [0u8; 8];
+    crate::crypto::random(&mut r)?;
+    let name = format!("{AGENT_STOP_EVENT}{:016x}", u64::from_ne_bytes(r));
+    Ok((create_event(&name, sddl, true)?, name))
 }
 
 fn kill_on_close_job() -> Result<HANDLE> {
@@ -413,18 +463,18 @@ fn kill_on_close_job() -> Result<HANDLE> {
 /// A running agent.
 struct Agent {
     process: HANDLE,
-    /// The write end of the agent's stdin; closing it asks the agent to stop.
-    stdin: Option<PipeWriter>,
+    /// Signalled to ask the agent to stop.
+    stop_event: OwnedHandle,
     session: u32,
     started: Instant,
 }
 
 impl Agent {
-    /// Closes the agent's stdin so that it shuts down cleanly (releasing held keys and buttons,
-    /// ending privacy mode), and kills it if it is still running after `wait`. True if it
-    /// ended by itself.
-    fn stop(mut self, wait: Duration) -> bool {
-        drop(self.stdin.take());
+    /// Signals the agent's stop event so that it shuts down cleanly (releasing held keys and
+    /// buttons, ending privacy mode), and kills it if it is still running after `wait`. True if
+    /// it ended by itself.
+    fn stop(self, wait: Duration) -> bool {
+        unsafe { SetEvent(self.stop_event.as_raw_handle() as HANDLE) };
         let ms = wait.as_millis().min(u32::MAX as u128 - 1) as u32;
         if unsafe { WaitForSingleObject(self.process, ms) } == WAIT_OBJECT_0 {
             return true;
@@ -441,60 +491,41 @@ impl Drop for Agent {
     }
 }
 
-/// Starts `cmd` (program `exe`) with `token`, on `desktop` if given, inside `job`. The read end
-/// of a new pipe becomes its stdin and the only handle it inherits; the write end is returned.
-fn spawn(token: HANDLE, exe: &str, cmd: &str, desktop: Option<&str>, job: HANDLE) -> Result<(HANDLE, PipeWriter)> {
-    let (child_stdin, stdin) = std::io::pipe()?;
-    let inherit = [child_stdin.as_raw_handle() as HANDLE];
+/// Starts `cmd` (program `exe`) with `token`, on `desktop` if given, inside `job`. It inherits
+/// no handles: they cannot be passed into another session.
+fn spawn(token: HANDLE, exe: &str, cmd: &str, desktop: Option<&str>, job: HANDLE) -> Result<HANDLE> {
     unsafe {
-        if SetHandleInformation(inherit[0], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(Error::last_os("SetHandleInformation"));
-        }
-        let mut size = 0usize;
-        InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
-        let mut buf = vec![0usize; size.div_ceil(size_of::<usize>())];
-        let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
-            return Err(Error::last_os("InitializeProcThreadAttributeList"));
-        }
-        let attr = PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize;
-        if UpdateProcThreadAttribute(list, 0, attr, inherit.as_ptr() as *const c_void, size_of_val(&inherit), null_mut(), null()) == 0 {
-            let e = Error::last_os("UpdateProcThreadAttribute");
-            DeleteProcThreadAttributeList(list);
-            return Err(e);
-        }
         let mut desktop = desktop.map(wide);
-        let mut si: STARTUPINFOEXW = std::mem::zeroed();
-        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = inherit[0];
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = size_of::<STARTUPINFOW>() as u32;
         if let Some(d) = &mut desktop {
-            si.StartupInfo.lpDesktop = d.as_mut_ptr();
+            si.lpDesktop = d.as_mut_ptr();
         }
-        si.lpAttributeList = list;
         let mut wcmd = wide(cmd);
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        let flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-        let si = &si.StartupInfo;
-        let ok = CreateProcessAsUserW(token, wide(exe).as_ptr(), wcmd.as_mut_ptr(), null(), null(), 1, flags, null(), null(), si, &mut pi);
-        let failed = (ok == 0).then(|| Error::last_os("CreateProcessAsUserW"));
-        DeleteProcThreadAttributeList(list);
-        if let Some(e) = failed {
-            return Err(e);
+        let flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+        if CreateProcessAsUserW(token, wide(exe).as_ptr(), wcmd.as_mut_ptr(), null(), null(), 0, flags, null(), null(), &si, &mut pi) == 0 {
+            return Err(Error::last_os("CreateProcessAsUserW"));
         }
         AssignProcessToJobObject(job, pi.hProcess);
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
-        Ok((pi.hProcess, stdin))
+        Ok(pi.hProcess)
     }
+}
+
+/// The agent's command line: the name of its stop event first, then the host options.
+fn agent_command(exe: &str, stop_event: &str, host_args: &[String]) -> Vec<String> {
+    let mut parts = vec![exe.to_string(), "agent".to_string(), STOP_EVENT_ARG.to_string(), stop_event.to_string()];
+    parts.extend_from_slice(host_args);
+    parts
 }
 
 /// Starts `safe-rdp agent ...` as SYSTEM in `session` on the interactive window station.
 fn launch_agent(session: u32, job: HANDLE) -> Result<Agent> {
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
-    let mut parts = vec![exe.clone(), "agent".to_string()];
-    parts.extend(AGENT_ARGS.get().into_iter().flatten().cloned());
-    let cmd = command_line(&parts)?;
+    let (stop_event, name) = new_stop_event(SYSTEM_ONLY)?;
+    let cmd = command_line(&agent_command(&exe, &name, AGENT_ARGS.get().map_or(&[], Vec::as_slice)))?;
     unsafe {
         let mut tok: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID, &mut tok) == 0 {
@@ -512,15 +543,14 @@ fn launch_agent(session: u32, job: HANDLE) -> Result<Agent> {
         }
         let r = spawn(dup, &exe, &cmd, Some(r"winsta0\default"), job);
         CloseHandle(dup);
-        let (process, stdin) = r?;
-        Ok(Agent { process, stdin: Some(stdin), session, started: Instant::now() })
+        Ok(Agent { process: r?, stop_event, session, started: Instant::now() })
     }
 }
 
 fn supervise() -> Result<()> {
     let stop = STOP_EVENT.load(Ordering::SeqCst) as HANDLE;
     let session_evt = SESSION_EVENT.load(Ordering::SeqCst) as HANDLE;
-    let sas = create_sas_event()?;
+    let sas = create_event(SAS_EVENT, SYSTEM_ONLY, false)?;
     let job = kill_on_close_job()?;
     log!("service started");
 
@@ -548,7 +578,7 @@ fn supervise() -> Result<()> {
             }
         }
 
-        let mut handles = vec![stop, sas, session_evt];
+        let mut handles = vec![stop, sas.as_raw_handle() as HANDLE, session_evt];
         if let Some(a) = &agent {
             handles.push(a.process);
         }
@@ -578,10 +608,7 @@ fn supervise() -> Result<()> {
     if let Some(a) = agent {
         a.stop(AGENT_STOP_WAIT);
     }
-    unsafe {
-        CloseHandle(job);
-        CloseHandle(sas);
-    }
+    unsafe { CloseHandle(job) };
     log!("service stopped");
     Ok(())
 }
@@ -670,37 +697,82 @@ mod tests {
         }
     }
 
-    /// Starts a console tool from System32 the way the service starts its agent; also returns a
-    /// second handle to the process for watching it.
-    fn start(tool: &str, args: &[&str], job: HANDLE) -> (Agent, HANDLE) {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        let exe = format!(r"{root}\System32\{tool}");
-        let mut parts = vec![exe.clone()];
-        parts.extend(args.iter().map(|a| a.to_string()));
+    #[test]
+    fn the_agent_finds_its_stop_event_in_front_of_the_host_options() {
+        let host = ["--port", "1234", "--transfer-dir", "--stop-event", "--view-only"].map(String::from);
+        let parts = agent_command(EXE, r"Global\SafeRdpAgentStop-0123456789abcdef", &host);
+        let args = split_command_line(&command_line(&parts).unwrap());
+        assert_eq!(args[..2], [EXE, "agent"]);
+        let (name, rest) = agent_stop_event(&args[2..]);
+        assert_eq!(name, Some(r"Global\SafeRdpAgentStop-0123456789abcdef"));
+        assert_eq!(rest, host);
+        // Only in front: elsewhere it is an ordinary (here: the transfer directory's) value.
+        let (name, rest) = agent_stop_event(rest);
+        assert_eq!((name, rest.len()), (None, 5));
+        assert_eq!(agent_stop_event(&["--stop-event".to_string()]).0, None);
+    }
+
+    /// What the stand-in agent of `start_agent` may open: SYSTEM and the owner (this test).
+    const TEST_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+    static CHILD_STOP: AtomicBool = AtomicBool::new(false);
+
+    /// The stand-in agent: watches the stop event named on its command line like the agent does,
+    /// and returns once it is signalled.
+    #[test]
+    #[ignore = "started by agents_stop_when_signalled_and_are_killed_otherwise in a process of its own"]
+    fn stand_in_agent() {
+        let Some(name) = std::env::args().find(|a| a.starts_with(AGENT_STOP_EVENT)) else { return };
+        // Like the agent, keep running when the event cannot be opened.
+        let _ = watch_stop_event(&name, &CHILD_STOP);
+        let t = Instant::now();
+        while !CHILD_STOP.load(Ordering::SeqCst) {
+            assert!(t.elapsed() < Duration::from_secs(60));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Starts this test binary as a stand-in agent watching `stop_event` (named `name`) the way the
+    /// service starts its agent; also returns a second handle to the process for watching it.
+    fn start_agent(stop_event: OwnedHandle, name: &str, job: HANDLE) -> (Agent, HANDLE) {
+        let exe = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let test = format!("{}::stand_in_agent", module_path!().split_once("::").unwrap().1);
+        // The event name is a second filter that matches no test.
+        let parts = [exe.as_str(), "--ignored", "--exact", "-q", test.as_str(), name].map(String::from);
         let token = own_token();
         let r = spawn(token, &exe, &command_line(&parts).unwrap(), None, job);
         unsafe { CloseHandle(token) };
-        let (process, stdin) = r.unwrap();
+        let process = r.unwrap();
         let mut watch: HANDLE = null_mut();
         let me = unsafe { GetCurrentProcess() };
         assert!(unsafe { DuplicateHandle(me, process, me, &mut watch, 0, 0, DUPLICATE_SAME_ACCESS) } != 0);
-        (Agent { process, stdin: Some(stdin), session: 0, started: Instant::now() }, watch)
+        (Agent { process, stop_event, session: 0, started: Instant::now() }, watch)
     }
 
     #[test]
-    fn agents_stop_when_stdin_closes_and_are_killed_otherwise() {
+    fn agents_stop_when_signalled_and_are_killed_otherwise() {
         let job = kill_on_close_job().unwrap();
         unsafe {
-            // sort reads its stdin to the end before it does anything else.
-            let (agent, watch) = start("sort.exe", &[], job);
-            assert_eq!(WaitForSingleObject(watch, 300), WAIT_TIMEOUT, "ended before its stdin was closed");
+            let (event, name) = new_stop_event(TEST_SDDL).unwrap();
+            assert!(name.starts_with(AGENT_STOP_EVENT) && name.len() == AGENT_STOP_EVENT.len() + 16, "{name}");
+            // Nobody can take over the name while it is in use.
+            assert!(create_event(&name, TEST_SDDL, true).is_err());
+            let (agent, watch) = start_agent(event, &name, job);
+            assert_eq!(WaitForSingleObject(watch, 2000), WAIT_TIMEOUT, "ended before it was asked to");
             let t = Instant::now();
-            assert!(agent.stop(Duration::from_secs(10)), "did not end when its stdin was closed");
+            assert!(agent.stop(Duration::from_secs(10)), "did not end when its stop event was signalled");
             assert!(t.elapsed() < Duration::from_secs(5));
+            let mut code = 1u32;
+            GetExitCodeProcess(watch, &mut code);
+            assert_eq!(code, 0, "the stand-in agent failed");
             CloseHandle(watch);
 
-            // ping ignores stdin, so it is terminated once the wait is over.
-            let (agent, watch) = start("ping.exe", &["-n", "30", "127.0.0.1"], job);
+            // The real event admits SYSTEM alone. A stand-in that cannot open it keeps running
+            // and is terminated once the wait is over.
+            let (event, name) = new_stop_event(SYSTEM_ONLY).unwrap();
+            assert!(OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(&name).as_ptr()).is_null());
+            assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
+            let (agent, watch) = start_agent(event, &name, job);
+            assert_eq!(WaitForSingleObject(watch, 2000), WAIT_TIMEOUT, "an event it cannot open was taken for a stop request");
             let t = Instant::now();
             assert!(!agent.stop(Duration::from_millis(300)));
             assert!(t.elapsed() < Duration::from_secs(3));

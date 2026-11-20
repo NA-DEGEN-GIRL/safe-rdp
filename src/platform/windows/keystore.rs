@@ -524,6 +524,10 @@ mod tests {
         // A second name for a file elsewhere.
         std::fs::hard_link(outside.join("keep.txt"), root.join("service.log")).unwrap();
         let have_junction = junction(&root.join("incoming").join("j"), &outside);
+        assert_eq!(entry_facts(&root.join("service.log")).unwrap().links, 2);
+        if have_junction {
+            assert!(entry_facts(&root.join("incoming").join("j")).unwrap().reparse);
+        }
 
         purge_foreign(&root).unwrap();
 
@@ -539,6 +543,39 @@ mod tests {
         } else {
             assert!(left.is_empty(), "left behind: {left:?}");
         }
+    }
+
+    /// `fx` as if SYSTEM or Administrators had created it, which needs no elevation to test.
+    fn admin_owned(fx: Facts) -> Facts {
+        Facts { access: Access { admin_owner: true, admin_aces: true, protected: true }, ..fx }
+    }
+
+    #[test]
+    fn links_are_never_ours_even_when_administrators_own_them() {
+        let t = TempDir::new("links");
+        let (file, dir) = (t.0.join("file"), t.0.join("dir"));
+        std::fs::write(&file, b"f").unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        // Plain entries are ours once SYSTEM or Administrators own them, and only then.
+        assert!(admin_owned(entry_facts(&file).unwrap()).ours());
+        assert!(admin_owned(entry_facts(&dir).unwrap()).ours());
+        let mut fx = admin_owned(entry_facts(&file).unwrap());
+        fx.access.admin_owner = false;
+        assert!(!fx.ours());
+
+        std::fs::hard_link(&file, t.0.join("hard")).unwrap();
+        assert!(junction(&t.0.join("j"), &dir), "cannot create a junction");
+        let fx = entry_facts(&t.0.join("hard")).unwrap();
+        assert_eq!((fx.dir, fx.reparse, fx.links), (false, false, 2));
+        assert!(!admin_owned(fx).ours(), "hard link");
+        // Either name of the file is a way to reach the other.
+        assert!(!admin_owned(entry_facts(&file).unwrap()).ours(), "hard-linked file");
+        let fx = entry_facts(&t.0.join("j")).unwrap();
+        assert!(fx.dir && fx.reparse);
+        assert!(!admin_owned(fx).ours(), "junction");
+        // Removing the second name makes the file plain again.
+        std::fs::remove_file(t.0.join("hard")).unwrap();
+        assert!(admin_owned(entry_facts(&file).unwrap()).ours());
     }
 
     #[test]
