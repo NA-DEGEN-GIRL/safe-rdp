@@ -474,9 +474,9 @@ fn bench(args: &[String]) -> Result<()> {
     let (w, h) = (area.width as usize, area.height as usize);
     println!("screen {w}x{h}, {} encoder threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
+    let t = Instant::now();
     let mut cap = capture::Capturer::open(monitor, area)?;
     let name = cap.backend();
-    let t = Instant::now();
     while !cap.next_frame(500)? {
         if t.elapsed().as_secs() > 3 {
             bail!("{name}: no frame within 3 s");
@@ -493,7 +493,7 @@ fn bench(args: &[String]) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     }
-    println!("capture:       {name}, first frame {first:.1} ms, {frames} frames delivered in 1 s");
+    println!("capture:       {name}, open + first frame {first:.1} ms, {frames} frames delivered in 1 s");
     let mut frame = cap.pixels().to_vec();
     drop(cap);
     let mut fb = vec![0u8; w * h * 4];
