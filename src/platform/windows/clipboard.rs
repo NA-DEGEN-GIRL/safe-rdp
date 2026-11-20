@@ -6,13 +6,17 @@
 
 use crate::proto::MAX_CLIPBOARD;
 use crate::util::{Error, Result, wide};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
-use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_APP_SET: u32 = WM_APP + 1;
@@ -209,7 +213,111 @@ pub fn write_text(hwnd: HWND, text: &str) -> bool {
     }
 }
 
-/// Regular files currently copied in Explorer (CF_HDROP); placeholder until implemented.
-pub fn copied_files() -> Vec<std::path::PathBuf> {
-    Vec::new()
+/// Upper bound on the files taken from one clipboard file list.
+const MAX_COPIED_FILES: u32 = 1000;
+
+/// Regular files currently copied in Explorer (CF_HDROP), as canonical paths without duplicates.
+/// Directories, missing files and relative paths are left out.
+pub fn copied_files() -> Vec<PathBuf> {
+    let names = unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 || !open(null_mut()) {
+            return Vec::new();
+        }
+        // The list is owned by the clipboard: read it while it is open, never DragFinish it.
+        let h = GetClipboardData(CF_HDROP as u32);
+        let names = if h.is_null() { Vec::new() } else { drop_list(h) };
+        CloseClipboard();
+        names
+    };
+    regular_files(names)
+}
+
+/// The paths in a CF_HDROP block.
+unsafe fn drop_list(h: HDROP) -> Vec<PathBuf> {
+    let count = unsafe { DragQueryFileW(h, u32::MAX, null_mut(), 0) }.min(MAX_COPIED_FILES);
+    let mut out = Vec::new();
+    for i in 0..count {
+        // Length in characters without the terminating NUL; long paths go up to 32767.
+        let len = unsafe { DragQueryFileW(h, i, null_mut(), 0) } as usize;
+        if len == 0 || len > 32767 {
+            continue;
+        }
+        let mut buf = vec![0u16; len + 1];
+        let n = unsafe { DragQueryFileW(h, i, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 || n > len {
+            continue;
+        }
+        out.push(PathBuf::from(OsString::from_wide(&buf[..n])));
+    }
+    out
+}
+
+fn regular_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths.into_iter().filter(|p| p.is_absolute()) {
+        let Ok(c) = std::fs::canonicalize(&p) else { continue };
+        if std::fs::metadata(&c).is_ok_and(|m| m.is_file()) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::DROPFILES;
+
+    /// A CF_HDROP block as Explorer puts it on the clipboard (DROPFILES + double-NUL list).
+    fn hdrop(paths: &[PathBuf]) -> HGLOBAL {
+        let mut list: Vec<u16> = Vec::new();
+        for p in paths {
+            list.extend(p.as_os_str().encode_wide());
+            list.push(0);
+        }
+        list.push(0);
+        let header = size_of::<DROPFILES>();
+        let df = DROPFILES { pFiles: header as u32, fWide: 1, ..Default::default() };
+        let mut bytes = vec![0u8; header];
+        unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut DROPFILES, df) };
+        bytes.extend(list.iter().flat_map(|c| c.to_le_bytes()));
+        let h = unsafe { global_copy(&bytes) };
+        assert!(!h.is_null());
+        h
+    }
+
+    #[test]
+    fn drop_list_keeps_regular_files_only() {
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let dir = std::env::temp_dir().join(format!("srdp-hdrop-{}", crate::util::hex_encode(&r)));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("파일 b.bin"), b"b").unwrap();
+        let listed = [
+            dir.join("a.txt"),
+            dir.join("sub"),
+            dir.join("missing.txt"),
+            dir.join("sub").join("..").join("a.txt"),
+            PathBuf::from("a.txt"),
+            dir.join("파일 b.bin"),
+        ];
+        let h = hdrop(&listed);
+        let names = unsafe { drop_list(h) };
+        unsafe { GlobalFree(h) };
+        assert_eq!(names, listed);
+        let files = regular_files(names);
+        let expect = [std::fs::canonicalize(dir.join("a.txt")).unwrap(), std::fs::canonicalize(dir.join("파일 b.bin")).unwrap()];
+        assert_eq!(files, expect);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_the_clipboard_does_not_fail() {
+        // Read-only: whatever is copied right now, every entry must be an existing regular file.
+        for p in copied_files() {
+            assert!(p.is_absolute() && p.is_file());
+        }
+    }
 }

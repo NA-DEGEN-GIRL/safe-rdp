@@ -158,6 +158,7 @@ fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Opti
         clipboard: false,
         view_only: false,
         sas: false,
+        ..host::HostOptions::default()
     };
     let mut key_file = None;
     let mut it = args.iter();
