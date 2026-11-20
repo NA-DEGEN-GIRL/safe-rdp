@@ -8,6 +8,7 @@ mod host;
 mod keys;
 mod net;
 mod platform;
+mod probe;
 mod proto;
 mod screen;
 mod util;
@@ -37,6 +38,9 @@ USAGE:
 
   safe-rdp monitors                  List monitors
   safe-rdp bench [--monitor N]       Measure capture/encode speed on this machine
+  safe-rdp probe <host> [--seconds N] [--type TEXT] [--move X,Y] [--click X,Y] [--set K=V]
+                [--upload FILE] [--pull] [--expect-change] [--snapshot FILE.ppm]
+                                     Headless test client (measures and drives a session)
 
 HOST OPTIONS:
   --bind <ip>              Address to listen on (default: this machine's Tailscale IPv4)
@@ -55,6 +59,10 @@ VIEWER OPTIONS:
   --view-only              Do not send keyboard or mouse input
   --allow-capture          Let local screenshot/recording tools capture the viewer window
   --downscale <2|3|4>      Ask the host for 1/N resolution (e.g. 4K host on a laptop or slow link)
+  --quality <q>            lossless | balanced (default) | low
+  --monitor <n|all>        Which host monitor to show (1 = primary)
+  --audio                  Play the host's sound
+  --privacy                Blank the host's screen and block its local input while connected
   --key-file <path>        Read the key from a text file
 
 Hotkeys in the viewer: Ctrl+Alt+Enter full screen, Ctrl+Alt+End sends Ctrl+Alt+Del.
@@ -93,6 +101,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             host::run(opts, key)
         }
         "connect" => connect(rest),
+        "probe" => probe_cmd(rest),
         #[cfg(windows)]
         "service" => match rest.first().map(String::as_str) {
             Some("install") => {
@@ -199,30 +208,109 @@ fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
     }
 }
 
+fn parse_quality(s: &str) -> Result<u8> {
+    Ok(match s {
+        "lossless" => proto::QUALITY_LOSSLESS,
+        "balanced" => proto::QUALITY_BALANCED,
+        "low" => proto::QUALITY_LOW,
+        _ => bail!("--quality expects lossless, balanced or low"),
+    } as u8)
+}
+
+fn parse_viewer_monitor(s: &str) -> Result<u8> {
+    match s {
+        "all" => Ok(proto::MONITOR_ALL),
+        n => match n.parse::<u8>() {
+            Ok(i) if (1..=200).contains(&i) => Ok(i - 1),
+            _ => bail!("--monitor expects a monitor number (1 = primary) or 'all'"),
+        },
+    }
+}
+
+/// Parses one viewer option; returns false if `a` is not a viewer option.
+fn viewer_option<'a>(o: &mut viewer::ViewerOptions, a: &str, it: &mut impl Iterator<Item = &'a String>) -> Result<bool> {
+    match a {
+        "--fullscreen" => o.fullscreen = true,
+        "--clipboard" => o.clipboard = true,
+        "--view-only" => o.view_only = true,
+        "--allow-capture" => o.allow_capture = true,
+        "--downscale" => o.downscale = next(it, a)?.parse().ok().filter(|d| (1..=4).contains(d)).ok_or("--downscale expects 1-4")?,
+        "--quality" => o.quality = parse_quality(next(it, a)?)?,
+        "--monitor" => o.monitor = parse_viewer_monitor(next(it, a)?)?,
+        "--audio" => o.audio = true,
+        "--privacy" => o.privacy = true,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn connect(args: &[String]) -> Result<()> {
     let mut target = None;
     let mut key_file = None;
     let mut o = viewer::ViewerOptions::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if viewer_option(&mut o, a, &mut it)? {
+            continue;
+        }
         match a.as_str() {
-            "--fullscreen" => o.fullscreen = true,
-            "--clipboard" => o.clipboard = true,
-            "--view-only" => o.view_only = true,
-            "--allow-capture" => o.allow_capture = true,
-            "--downscale" => o.downscale = next(&mut it, a)?.parse().ok().filter(|d| (1..=4).contains(d)).ok_or("--downscale expects 1-4")?,
             "--key-file" => key_file = Some(next(&mut it, a)?.to_string()),
             s if s.starts_with("--") => bail!("unknown viewer option '{s}'"),
             s if target.is_none() => target = Some(s.to_string()),
             s => bail!("unexpected argument '{s}'"),
         }
-    }
-    let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
+    }    let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
     let key = load_key(key_file.as_deref())?;
     platform::init_process();
     platform::viewer::run(&target, o, key)
 }
 
+fn parse_xy(s: &str, opt: &str) -> Result<(u16, u16)> {
+    let (x, y) = s.split_once(',').ok_or_else(|| Error::msg(format!("{opt} expects X,Y")))?;
+    Ok((x.trim().parse().map_err(|_| format!("{opt}: bad X"))?, y.trim().parse().map_err(|_| format!("{opt}: bad Y"))?))
+}
+
+fn probe_cmd(args: &[String]) -> Result<()> {
+    let mut target = None;
+    let mut key_file = None;
+    let mut o = probe::ProbeOptions::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if viewer_option(&mut o.viewer, a, &mut it)? {
+            continue;
+        }
+        match a.as_str() {
+            "--seconds" => o.seconds = next(&mut it, a)?.parse().ok().filter(|s: &f64| *s > 0.0).ok_or("--seconds expects a positive number")?,
+            "--type" => o.type_text = Some(next(&mut it, a)?.to_string()),
+            "--move" => o.moves.push(parse_xy(next(&mut it, a)?, a)?),
+            "--click" => o.clicks.push(parse_xy(next(&mut it, a)?, a)?),
+            "--set" => {
+                let v = next(&mut it, a)?;
+                let (k, val) = v.split_once('=').ok_or("--set expects KEY=VALUE")?;
+                let key = probe::set_key(k).ok_or_else(|| Error::msg(format!("--set: unknown setting '{k}'")))?;
+                let value = match (key, val) {
+                    (proto::SET_QUALITY, q) => parse_quality(q)? as u32,
+                    (proto::SET_MONITOR, m) => parse_viewer_monitor(m)? as u32,
+                    (_, "on") => 1,
+                    (_, "off") => 0,
+                    (_, n) => n.parse().map_err(|_| format!("--set: bad value '{n}'"))?,
+                };
+                o.sets.push((key, value));
+            }
+            "--upload" => o.uploads.push(next(&mut it, a)?.to_string()),
+            "--pull" => o.pull = true,
+            "--expect-change" => o.expect_change = true,
+            "--snapshot" => o.snapshot = Some(next(&mut it, a)?.to_string()),
+            "--key-file" => key_file = Some(next(&mut it, a)?.to_string()),
+            s if s.starts_with("--") => bail!("unknown probe option '{s}'"),
+            s if target.is_none() => target = Some(s.to_string()),
+            s => bail!("unexpected argument '{s}'"),
+        }
+    }
+    let target = target.ok_or("usage: safe-rdp probe <host[:port]> [options]")?;
+    let key = load_key(key_file.as_deref())?;
+    probe::run(&target, o, key)
+}
 fn keygen(args: &[String]) -> Result<()> {
     let force = args.iter().any(|a| a == "--force");
     if let Some(a) = args.iter().find(|a| *a != "--force") {
