@@ -125,26 +125,40 @@ impl Drop for GdiCapture {
     }
 }
 
-/// Screen source: DXGI Desktop Duplication when possible, GDI otherwise
-/// (multi-monitor "all", rotated or HDR displays, no GPU, or DXGI refused).
+/// Screen source: DXGI Desktop Duplication when possible (one monitor, or every monitor
+/// composed for "all"), GDI otherwise (no GPU, DXGI refused, a monitor DXGI cannot duplicate,
+/// or a desktop format it cannot convert).
 pub enum Capturer {
     Dxgi(super::dxgi::DxgiCapture),
     Gdi(GdiCapture),
 }
 
+/// DXGI source for `sel` (already resolved to `area`).
+fn dxgi(sel: MonitorSel, area: Area) -> Result<super::dxgi::DxgiCapture> {
+    match sel {
+        MonitorSel::All => super::dxgi::DxgiCapture::all(area),
+        MonitorSel::Primary | MonitorSel::Index(_) => super::dxgi::DxgiCapture::new(area),
+    }
+}
+
 impl Capturer {
+    /// DXGI capture of the single monitor at `area`, else GDI.
     pub fn new(area: Area) -> Result<Capturer> {
+        Capturer::dxgi_or_gdi(super::dxgi::DxgiCapture::new(area), area)
+    }
+
+    fn dxgi_or_gdi(d: Result<super::dxgi::DxgiCapture>, area: Area) -> Result<Capturer> {
         static LAST_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-        match super::dxgi::DxgiCapture::new(area) {
+        match d {
             Ok(d) => Ok(Capturer::Dxgi(d)),
             Err(e) => {
                 let reason = e.to_string();
-                let mut last = LAST_REASON.lock().unwrap();
+                let mut last = LAST_REASON.lock().unwrap_or_else(|p| p.into_inner());
                 if *last != reason {
                     crate::log!("DXGI capture unavailable ({reason}); using GDI");
                     *last = reason;
                 }
-                Ok(Capturer::Gdi(GdiCapture::new(area)?))
+                Capturer::gdi(area)
             }
         }
     }
@@ -155,10 +169,9 @@ impl Capturer {
 
     /// Opens the best source for `sel` (already resolved to `area`).
     pub fn open(sel: MonitorSel, area: Area) -> Result<Capturer> {
-        if sel == MonitorSel::All && monitors().len() > 1 {
-            Capturer::gdi(area)
-        } else {
-            Capturer::new(area)
+        match sel {
+            MonitorSel::All => Capturer::dxgi_or_gdi(super::dxgi::DxgiCapture::all(area), area),
+            MonitorSel::Primary | MonitorSel::Index(_) => Capturer::new(area),
         }
     }
 
@@ -166,10 +179,7 @@ impl Capturer {
     /// reset may have passed). Returns true if the source changed.
     pub fn try_upgrade(&mut self, sel: MonitorSel) -> bool {
         if let Capturer::Gdi(g) = self {
-            if sel == MonitorSel::All && monitors().len() > 1 {
-                return false;
-            }
-            if let Ok(d) = super::dxgi::DxgiCapture::new(g.area) {
+            if let Ok(d) = dxgi(sel, g.area) {
                 *self = Capturer::Dxgi(d);
                 return true;
             }
