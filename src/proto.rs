@@ -269,15 +269,21 @@ fn windows_device_name(name: &str) -> bool {
         || port.is_some_and(|d| matches!(d, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
 }
 
-/// A transferred file name must be a single, plain path component that every supported OS stores
-/// under exactly that name: no trailing `.` or space (Windows drops them, which would move the
-/// Mark of the Web onto a different file), no device names, no control or bidi characters.
-pub fn valid_file_name(name: &str) -> bool {
+/// What a file name on the wire must be: one path component without control characters. A name
+/// that passes this but not `valid_file_name` (one the peer's OS allows) gets only that file refused.
+fn path_component(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME
-        && !name.ends_with(['.', ' '])
-        && !name.chars().any(|c| matches!(c, '/' | '\\' | ':') || deceptive(c))
-        && !windows_device_name(name)
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+}
+
+/// A file name that is saved or sent must be a single, plain path component that every supported
+/// OS stores under exactly that name: no trailing `.` or space (Windows drops them, which would
+/// move the Mark of the Web onto a different file), no device names, no control or bidi characters.
+pub fn valid_file_name(name: &str) -> bool {
+    path_component(name) && !name.ends_with(['.', ' ']) && !name.chars().any(deceptive) && !windows_device_name(name)
 }
 
 /// Peer-supplied `s` made safe to log or print: control and deceptive format characters become
@@ -293,7 +299,7 @@ pub fn printable(s: &str) -> String {
 
 fn file_name(b: &[u8]) -> Result<String> {
     let name = text(b, MAX_FILE_NAME)?;
-    if !valid_file_name(&name) {
+    if !path_component(&name) {
         bail!("invalid file name");
     }
     Ok(name)
@@ -581,9 +587,14 @@ mod tests {
             let mut b = Vec::new();
             ClientMsg::FileBegin { id: 1, size: 1, name: bad.to_string() }.encode(&mut b);
             assert!(ClientMsg::decode(&b).is_err());
+            let mut b = Vec::new();
+            ServerMsg::FileBegin { id: 1, size: 1, name: bad.to_string() }.encode(&mut b);
+            assert!(ServerMsg::decode(&b).is_err());
         }
         assert!(valid_file_name("ok name (1).tar.gz"));
-        // Names Windows would store under another name, device names, and spoofing characters.
+        // Names Windows would store under another name, device names, and spoofing characters:
+        // refused for the file system, but a peer whose OS allows them (`aux.c` on Linux) may send
+        // them without ending the session; the receiver refuses just that file.
         let spoofed = [
             "setup.exe.",
             "doc.docm ",
@@ -606,9 +617,14 @@ mod tests {
         ];
         for bad in spoofed {
             assert!(!valid_file_name(bad), "{bad:?} accepted");
+            let msg = ServerMsg::FileBegin { id: 1, size: 1, name: bad.to_string() };
             let mut b = Vec::new();
-            ServerMsg::FileBegin { id: 1, size: 1, name: bad.to_string() }.encode(&mut b);
-            assert!(ServerMsg::decode(&b).is_err());
+            msg.encode(&mut b);
+            assert_eq!(ServerMsg::decode(&b).unwrap(), msg);
+            let msg = ClientMsg::FileBegin { id: 1, size: 1, name: bad.to_string() };
+            let mut b = Vec::new();
+            msg.encode(&mut b);
+            assert_eq!(ClientMsg::decode(&b).unwrap(), msg);
         }
         let persian = "می\u{200C}خواهم.txt";
         for good in [".bashrc", "console.log", "com10.txt", "lpt.txt", "nul_", "x.conf", persian, "a\u{200D}b.png", "보고서 v2.pdf"] {

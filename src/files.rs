@@ -3,13 +3,14 @@
 //!
 //! Receiving side guarantees:
 //! * names are a single plain path component (`proto::valid_file_name`), never a path;
-//! * data goes to a hidden, randomly named `.srdp-*.part` file created exclusively, and only
-//!   becomes visible after the size and SHA-256 match; anything incomplete is deleted (parts
-//!   left behind by a crash or kill are removed after a day);
+//! * data goes to a hidden, randomly named `.srdp-*.part` file created exclusively (on Windows
+//!   nobody can delete or rename it while the transfer holds it), and only becomes visible after
+//!   the size and SHA-256 match and the part still holds that many bytes; anything incomplete is
+//!   deleted (parts left behind by a crash or kill are removed after a day);
 //! * existing files are never overwritten (`name (1).ext`, `name (2).ext`, ...);
 //! * received files are marked as coming from another machine (Windows: Mark of the Web, written
-//!   before the file gets its final name), so SmartScreen / Office Protected View treat them as
-//!   untrusted; a file that cannot be marked is not published.
+//!   when the part is created), so SmartScreen / Office Protected View treat them as untrusted;
+//!   a transfer whose file cannot be marked is refused.
 
 use crate::bail;
 use crate::crypto::Sha256;
@@ -71,8 +72,10 @@ fn remove_stale_parts(dir: &Path) {
         if !name.to_str().is_some_and(|n| n.starts_with(PART_PREFIX) && n.ends_with(PART_SUFFIX)) {
             continue;
         }
-        // `DirEntry::metadata` does not follow symlinks: only regular files are removed.
-        let age = e.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
+        // Not `DirEntry::metadata`: on Windows that is the directory entry, which shows a part still
+        // being written with the time it was created. Symlinks are not followed: only regular files go.
+        let meta = std::fs::symlink_metadata(e.path());
+        let age = meta.ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
         if age.is_some_and(|a| a > STALE_PART) {
             let _ = std::fs::remove_file(e.path());
         }
@@ -107,8 +110,22 @@ impl Incoming {
         let mut r = [0u8; 8];
         crate::crypto::random(&mut r)?;
         let part = dir.join(format!("{PART_PREFIX}{}{PART_SUFFIX}", crate::util::hex_encode(&r)));
-        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
-        Ok(Incoming { id, name: name.to_string(), size, received: 0, dir: dir.to_path_buf(), part, file: Some(file), hash: Sha256::new() })
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            // No FILE_SHARE_DELETE: the part cannot be deleted or renamed while it is being written.
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let file = options.open(&part)?;
+        let hash = Sha256::new();
+        let inc = Incoming { id, name: name.to_string(), size, received: 0, dir: dir.to_path_buf(), part, file: Some(file), hash };
+        // Marked before any data arrives (dropping `inc` on failure removes the part): the stream
+        // moves with the data on rename, whatever name the file ends up with.
+        mark_from_other_machine(&inc.part).map_err(|e| format!("{name}: cannot mark it as coming from another computer: {e}"))?;
+        Ok(inc)
     }
 
     pub fn received(&self) -> u64 {
@@ -125,7 +142,8 @@ impl Incoming {
         Ok(())
     }
 
-    /// Verifies size and checksum, then moves the file into place. Returns the final path.
+    /// Verifies size and checksum, and that the part on disk still holds all of it, then moves
+    /// the file into place. Returns the final path.
     pub fn finish(mut self, sha256: &[u8; 32]) -> Result<PathBuf> {
         if self.received != self.size {
             bail!("{}: received {} of {} bytes", self.name, self.received, self.size);
@@ -138,9 +156,12 @@ impl Incoming {
         if !crate::crypto::ct_eq(&hash, sha256) {
             bail!("{}: checksum mismatch", self.name);
         }
-        // Marked while it still has the part's name: the stream moves with the data on rename,
-        // whatever name the file ends up with.
-        mark_from_other_machine(&self.part).map_err(|e| format!("{}: cannot mark it as coming from another computer: {e}", self.name))?;
+        // The checksum covers the bytes as they arrived, not the file: one that was cut short or
+        // removed (and the rename then fails) since is not published.
+        let meta = std::fs::symlink_metadata(&self.part)?;
+        if !meta.is_file() || meta.len() != self.size {
+            bail!("{}: the partial file was changed by another program", self.name);
+        }
         let dest = unique_path(&self.dir, &self.name);
         std::fs::rename(&self.part, &dest)?;
         Ok(dest)
@@ -309,6 +330,50 @@ mod tests {
             assert!(left.contains(&n.to_string()), "{n} removed");
         }
         drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_goes_by_the_file_not_its_directory_entry() {
+        let dir = tmpdir("sweep");
+        // Created long ago, written just now through a handle that is still open: on Windows its
+        // directory entry still shows the old time (and the old length) until the handle closes.
+        let part = dir.join(".srdp-0123456789abcdef.part");
+        std::fs::File::create(&part).unwrap().set_modified(std::time::SystemTime::now() - 2 * STALE_PART).unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+        f.write_all(&[1; 200_000]).unwrap();
+        remove_stale_parts(&dir);
+        assert!(part.exists());
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_part_changed_behind_the_transfer_is_never_published() {
+        let dir = tmpdir("changed");
+        let data = [7u8; 4096];
+        let sum = crate::crypto::sha256(&[&data]);
+        // Marked from the start, so finishing never has to create anything on disk.
+        let mut inc = Incoming::begin(&dir, 1, 4096, "big.iso").unwrap();
+        #[cfg(windows)]
+        assert_eq!(std::fs::read(zone_identifier(&inc.part)).unwrap(), ZONE_INTERNET);
+        inc.write(&data).unwrap();
+        // Cut short by another program: what arrived still matches the checksum, the file does not.
+        std::fs::OpenOptions::new().write(true).open(&inc.part).unwrap().set_len(0).unwrap();
+        assert!(inc.finish(&sum).is_err());
+        assert!(names(&dir).is_empty());
+
+        // Removed: Windows refuses while the transfer holds the part; elsewhere finishing fails.
+        let mut inc = Incoming::begin(&dir, 2, 4096, "big.iso").unwrap();
+        inc.write(&data).unwrap();
+        assert_eq!(std::fs::remove_file(&inc.part).is_err(), cfg!(windows));
+        match inc.finish(&sum) {
+            Ok(path) => {
+                assert!(cfg!(windows));
+                assert_eq!(std::fs::read(path).unwrap(), data);
+            }
+            Err(_) => assert!(names(&dir).is_empty()),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
