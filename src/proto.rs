@@ -242,13 +242,53 @@ fn text(b: &[u8], max: usize) -> Result<String> {
     String::from_utf8(b.to_vec()).map_err(|_| "invalid UTF-8".into())
 }
 
-/// A transferred file name must be a single, plain path component.
+/// Control characters, and invisible format characters that reorder text (bidi overrides,
+/// marks and isolates), break lines or hide text, so `a\u{202E}gpj.exe` cannot pose as `aexe.jpg`.
+fn deceptive(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// Windows device names (`CON`, `nul.txt`, `COM1.tar.gz`, ...), which open a device instead of a file.
+fn windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    let port = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || port.is_some_and(|d| matches!(d, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+}
+
+/// A transferred file name must be a single, plain path component that every supported OS stores
+/// under exactly that name: no trailing `.` or space (Windows drops them, which would move the
+/// Mark of the Web onto a different file), no device names, no control or bidi characters.
 pub fn valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME
-        && name != "."
-        && name != ".."
-        && !name.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control())
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(|c| matches!(c, '/' | '\\' | ':') || deceptive(c))
+        && !windows_device_name(name)
+}
+
+/// Peer-supplied `s` made safe to log or print: control and deceptive format characters become
+/// `?` (no terminal escapes, forged lines or reordered text), and it is cut to 512 characters.
+pub fn printable(s: &str) -> String {
+    const MAX: usize = 512;
+    let mut out: String = s.chars().take(MAX).map(|c| if deceptive(c) { '?' } else { c }).collect();
+    if s.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 fn file_name(b: &[u8]) -> Result<String> {
@@ -543,11 +583,51 @@ mod tests {
             assert!(ClientMsg::decode(&b).is_err());
         }
         assert!(valid_file_name("ok name (1).tar.gz"));
+        // Names Windows would store under another name, device names, and spoofing characters.
+        let spoofed = [
+            "setup.exe.",
+            "doc.docm ",
+            "evil.exe. . ",
+            "CON",
+            "nul.txt",
+            "Aux.tar.gz",
+            "com1",
+            "LPT9.log",
+            "COM¹.txt",
+            "con .txt",
+            "CONOUT$",
+            "holiday\u{202E}gpj.exe",
+            "a\u{2066}b.txt",
+            "a\u{200F}.txt",
+            "a\u{061C}.txt",
+            "\u{FEFF}a.txt",
+            "line\u{2028}break.txt",
+            "hidden\u{E0041}.txt",
+        ];
+        for bad in spoofed {
+            assert!(!valid_file_name(bad), "{bad:?} accepted");
+            let mut b = Vec::new();
+            ServerMsg::FileBegin { id: 1, size: 1, name: bad.to_string() }.encode(&mut b);
+            assert!(ServerMsg::decode(&b).is_err());
+        }
+        let persian = "می\u{200C}خواهم.txt";
+        for good in [".bashrc", "console.log", "com10.txt", "lpt.txt", "nul_", "x.conf", persian, "a\u{200D}b.png", "보고서 v2.pdf"] {
+            assert!(valid_file_name(good), "{good:?} rejected");
+        }
         let mut b = Vec::new();
         ClientMsg::FileBegin { id: 1, size: MAX_FILE_SIZE + 1, name: "big".into() }.encode(&mut b);
         assert!(ClientMsg::decode(&b).is_err());
         let mut b = Vec::new();
         ClientMsg::FileData { id: 1, data: vec![] }.encode(&mut b);
         assert!(ClientMsg::decode(&b).is_err());
+    }
+
+    #[test]
+    fn printable_neutralises_peer_text() {
+        assert_eq!(printable("office-pc 보고서"), "office-pc 보고서");
+        assert_eq!(printable("\x1b]52;c;aGk=\x07\rconnected to x\nerror: y"), "?]52;c;aGk=??connected to x?error: y");
+        assert_eq!(printable("a\u{202E}gpj.exe\u{2028}"), "a?gpj.exe?");
+        assert_eq!(printable(&"x".repeat(512)), "x".repeat(512));
+        assert_eq!(printable(&"가".repeat(600)), "가".repeat(512) + "…");
     }
 }

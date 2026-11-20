@@ -49,9 +49,24 @@ impl Default for ViewerOptions {
     }
 }
 
+/// Largest remote screen accepted (64 Mpx, 256 MiB as BGRA), bounding what a host can make a
+/// viewer allocate and scan.
+pub const MAX_PIXELS: usize = 64 << 20;
+
+/// Rejects an empty remote screen or one larger than `MAX_PIXELS`.
+pub fn check_screen_size(width: usize, height: usize) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("host reported an empty screen");
+    }
+    if width * height > MAX_PIXELS {
+        bail!("the host's screen ({width}x{height}) is too large");
+    }
+    Ok(())
+}
+
 /// An authenticated session, after the hello exchange.
 pub struct Connection {
-    /// Host name, monitors and the monitor being shown, from the host's hello.
+    /// Host name (`proto::printable`), monitors and the monitor being shown, from the host's hello.
     pub host_name: String,
     pub monitors: Vec<MonitorInfo>,
     pub monitor: u8,
@@ -112,13 +127,11 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
     writer.send(&hello)?;
     let (width, height, flags, monitor, monitors, host_name) = match ServerMsg::decode(reader.recv()?)? {
         ServerMsg::Hello { width, height, flags, monitor, monitors, name } => {
-            (width as usize, height as usize, flags, monitor, monitors, name)
+            (width as usize, height as usize, flags, monitor, monitors, printable(&name))
         }
         _ => bail!("unexpected first message from host"),
     };
-    if width == 0 || height == 0 {
-        bail!("host reported an empty screen");
-    }
+    check_screen_size(width, height)?;
     log!("connected to {host_name}: remote screen {width}x{height}");
     Ok(Connection { host_name, monitors, monitor, addr, stream, reader, writer, width, height, flags })
 }
@@ -439,6 +452,16 @@ mod tests {
         assert_eq!(percent(1, 3), 33);
         assert_eq!(percent(5, 0), 100);
         assert_eq!(percent(u64::MAX, u64::MAX), 100);
+    }
+
+    #[test]
+    fn screen_size_limits() {
+        assert!(check_screen_size(1920, 1080).is_ok());
+        assert!(check_screen_size(2 * 7680, 4320).is_ok());
+        assert!(check_screen_size(8192, 8192).is_ok());
+        assert!(check_screen_size(0, 1080).is_err() && check_screen_size(1920, 0).is_err());
+        assert!(check_screen_size(8193, 8192).is_err());
+        assert!(check_screen_size(65535, 65535).is_err());
     }
 
     #[test]
