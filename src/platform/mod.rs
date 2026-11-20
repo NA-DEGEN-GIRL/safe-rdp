@@ -7,7 +7,11 @@
 //! * `mem::{LockedBuf, lock_pages}` — RAM-pinned, wiped pixel buffers
 //! * `keystore` — per-user key storage
 //! * `viewer::run` — the interactive viewer window
+//! * `audio::{AudioCapture, AudioPlayer}` — system sound loopback and playback
 //! * `init_process`, `local_time`, `request_sas`
+
+/// Playback jitter buffer shared by both platforms' `audio::AudioPlayer`.
+mod jitter;
 
 #[cfg(windows)]
 mod windows;
