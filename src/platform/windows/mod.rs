@@ -33,6 +33,33 @@ pub fn request_sas() -> bool {
     service::request_sas()
 }
 
+static STOP_FLAG: std::sync::OnceLock<&'static std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn on_console_event(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    let Some(stop) = STOP_FLAG.get() else { return 0 };
+    // A second Ctrl+C while shutting down falls through to the default handler (exit now).
+    if stop.swap(true, Ordering::SeqCst) {
+        return 0;
+    }
+    if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
+        // Console closed / logoff / shutdown: the process ends when this returns, so give
+        // the host a moment to release held keys and end the session.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    1
+}
+
+/// Ctrl+C / Ctrl+Break / closing the console set `stop` instead of killing the process, so
+/// it can shut down cleanly (release held keys, end privacy mode). A second Ctrl+C exits.
+pub fn stop_on_signals(stop: &'static std::sync::atomic::AtomicBool) {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    if STOP_FLAG.set(stop).is_ok() {
+        unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) };
+    }
+}
+
 /// Reads one line from stdin without echoing it when stdin is a console.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     use windows_sys::Win32::System::Console::*;

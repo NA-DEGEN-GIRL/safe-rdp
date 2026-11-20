@@ -16,6 +16,20 @@ use std::time::{Duration, Instant};
 
 unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+}
+
+const PR_SET_PDEATHSIG: c_int = 1;
+
+/// Backstop for a host killed without a chance to clean up: the child gets SIGTERM when the
+/// thread that started it ends (the main thread, for the host).
+fn die_with_parent(c: &mut Command) -> &mut Command {
+    unsafe {
+        c.pre_exec(|| {
+            prctl(PR_SET_PDEATHSIG, SIGTERM as u64, 0, 0, 0);
+            Ok(())
+        })
+    }
 }
 
 const SIGTERM: c_int = 15;
@@ -27,6 +41,14 @@ pub const FIRST_DISPLAY: u32 = 20;
 /// A session that works on a stock Ubuntu server: a terminal with its own D-Bus session bus
 /// (so it does not attach to a desktop session elsewhere), ending when the terminal closes.
 pub const DEFAULT_SESSION: &str = "exec dbus-run-session -- gnome-terminal --wait";
+
+/// `DEFAULT_SESSION` with a terminal sized to fill a `width` x `height` display: there is no
+/// window manager to maximise it (about 10 x 22 pixels per cell with the stock font).
+pub fn default_session(width: u32, height: u32) -> String {
+    let cols = (width.saturating_sub(20) / 10).max(20);
+    let rows = (height.saturating_sub(30) / 22).max(5);
+    format!("{DEFAULT_SESSION} --geometry={cols}x{rows}+0+0")
+}
 const LAST_DISPLAY: u32 = 99;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -153,7 +175,7 @@ impl VirtualDisplay {
             wipe(&mut cookie);
             r?;
             let log = File::create(&log_path)?;
-            Command::new("Xvfb")
+            die_with_parent(&mut Command::new("Xvfb"))
                 .arg(format!(":{n}"))
                 .args(["-screen", "0", &format!("{width}x{height}x24"), "-nolisten", "tcp", "-noreset", "-auth"])
                 .arg(&auth)
@@ -189,7 +211,7 @@ impl VirtualDisplay {
 
     fn run_session(&self, cmd: &str) -> Result<Child> {
         let log = File::create(self.dir.join("session.log"))?;
-        let child = Command::new("sh")
+        let child = die_with_parent(&mut Command::new("sh"))
             .arg("-c")
             .arg(cmd)
             .env("DISPLAY", self.display_name())

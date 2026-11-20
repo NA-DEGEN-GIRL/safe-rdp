@@ -205,10 +205,8 @@ fn host_cmd(args: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     let _display = match cli.virtual_size {
         Some((w, h)) => {
-            let s = cli.session.as_deref().unwrap_or(platform::xvfb::DEFAULT_SESSION);
-            let d = platform::xvfb::VirtualDisplay::start(w, h, (!s.is_empty()).then_some(s))?;
-            log!("virtual display {} ({w}x{h}) started", d.display_name());
-            Some(d)
+            let s = cli.session.clone().unwrap_or_else(|| platform::xvfb::default_session(w, h));
+            Some(platform::xvfb::VirtualDisplay::start(w, h, (!s.is_empty()).then_some(s.as_str()))?)
         }
         None => None,
     };
@@ -227,6 +225,7 @@ fn host_cmd(args: &[String]) -> Result<()> {
         });
     }
     let listener = host::bind(&cli.opts)?;
+    platform::stop_on_signals(&STOP);
     host::serve(listener, cli.opts, key, &STOP)
 }
 

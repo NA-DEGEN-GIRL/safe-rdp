@@ -13,6 +13,8 @@ pub mod viewer;
 mod x11;
 pub mod xvfb;
 
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
 mod libc {
     use std::ffi::{c_char, c_int, c_long};
 
@@ -37,7 +39,13 @@ mod libc {
         pub fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
         pub fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
         pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
+        pub fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+        pub fn _exit(code: c_int) -> !;
     }
+
+    pub const SIGHUP: c_int = 1;
+    pub const SIGINT: c_int = 2;
+    pub const SIGTERM: c_int = 15;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -62,6 +70,25 @@ mod libc {
 /// so screen contents and keys cannot be scraped from this process's memory that way.
 pub fn init_process() {
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+}
+
+static STOP_FLAG: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn on_signal(_sig: std::ffi::c_int) {
+    let flag = STOP_FLAG.load(Ordering::SeqCst);
+    // A second signal while shutting down means "now".
+    if flag.is_null() || unsafe { (*flag).swap(true, Ordering::SeqCst) } {
+        unsafe { libc::_exit(130) };
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP set `stop` instead of killing the process, so it can shut down
+/// cleanly (release held keys, stop a virtual display). A second signal exits at once.
+pub fn stop_on_signals(stop: &'static AtomicBool) {
+    STOP_FLAG.store(stop as *const AtomicBool as *mut AtomicBool, Ordering::SeqCst);
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(sig, on_signal) };
+    }
 }
 
 /// Local wall-clock time: [year, month, day, hour, minute, second].
