@@ -10,6 +10,7 @@ pub mod keystore;
 pub mod mem;
 pub mod privacy;
 pub mod service;
+pub mod toolbar;
 pub mod viewer;
 
 /// Per-process setup before any window or capture: work in physical pixels.
