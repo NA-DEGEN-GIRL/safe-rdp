@@ -254,12 +254,13 @@ impl Encoder {
     }
 }
 
-/// Packs encoded rects into one or more `S_TILES` payloads (without the type byte).
+/// Packs encoded rects into one or more complete `S_TILES` messages (type byte included).
 pub fn pack(frame: u32, width: usize, height: usize, rects: &[EncodedRect]) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
     let mut i = 0;
     loop {
         let mut cur = Vec::with_capacity(64);
+        cur.push(crate::proto::S_TILES);
         cur.extend_from_slice(&frame.to_le_bytes());
         cur.push(0);
         cur.extend_from_slice(&(width as u16).to_le_bytes());
@@ -277,10 +278,10 @@ pub fn pack(frame: u32, width: usize, height: usize, rects: &[EncodedRect]) -> V
             count += 1;
             i += 1;
         }
-        cur[9..11].copy_from_slice(&count.to_le_bytes());
+        cur[10..12].copy_from_slice(&count.to_le_bytes());
         let last = i >= rects.len();
         if last {
-            cur[4] = FLAG_LAST;
+            cur[5] = FLAG_LAST;
         }
         msgs.push(cur);
         if last {
@@ -421,10 +422,10 @@ mod tests {
         let rects = enc.encode(cur, w, h);
         let msgs = pack(id, w, h, &rects);
         for (i, m) in msgs.iter().enumerate() {
-            let hdr = parse_header(m).unwrap();
+            let hdr = parse_header(&m[1..]).unwrap();
             assert_eq!((hdr.frame, hdr.width, hdr.height), (id, w, h));
             assert_eq!(hdr.last, i == msgs.len() - 1);
-            dec.apply(m, fb, w, h).unwrap();
+            dec.apply(&m[1..], fb, w, h).unwrap();
         }
         assert!(fb == cur, "decoded frame differs");
         rects.len()
@@ -447,7 +448,7 @@ mod tests {
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].rect, Rect { x: 256, y: 192, w: 64, h: 58 });
         let msgs = pack(2, w, h, &rects);
-        dec.apply(&msgs[0], &mut fb, w, h).unwrap();
+        dec.apply(&msgs[0][1..], &mut fb, w, h).unwrap();
         assert!(fb == f2);
         // Full refresh re-sends everything.
         enc.request_full();
@@ -474,7 +475,7 @@ mod tests {
         assert!(msgs.len() > 1, "incompressible frame should span several chunks");
         for m in &msgs {
             assert!(m.len() <= CHUNK_BYTES + w * TILE * 3 + 64);
-            dec.apply(m, &mut fb, w, h).unwrap();
+            dec.apply(&m[1..], &mut fb, w, h).unwrap();
         }
         assert!(fb == expect);
     }
@@ -484,11 +485,11 @@ mod tests {
         let mut dec = Decoder::new().unwrap();
         let mut fb = vec![0u8; 16 * 16 * 4];
         let r = EncodedRect { rect: Rect { x: 10, y: 10, w: 10, h: 10 }, enc: ENC_SOLID, data: vec![1, 2, 3] };
-        assert!(dec.apply(&pack(1, 16, 16, &[r])[0], &mut fb, 16, 16).is_err());
+        assert!(dec.apply(&pack(1, 16, 16, &[r])[0][1..], &mut fb, 16, 16).is_err());
         let r = EncodedRect { rect: Rect { x: 0, y: 0, w: 4, h: 4 }, enc: ENC_XPRESS, data: vec![9; 20] };
-        assert!(dec.apply(&pack(1, 16, 16, &[r])[0], &mut fb, 16, 16).is_err());
+        assert!(dec.apply(&pack(1, 16, 16, &[r])[0][1..], &mut fb, 16, 16).is_err());
         let r = EncodedRect { rect: Rect { x: 0, y: 0, w: 4, h: 4 }, enc: ENC_RAW, data: vec![9; 47] };
-        assert!(dec.apply(&pack(1, 16, 16, &[r])[0], &mut fb, 16, 16).is_err());
+        assert!(dec.apply(&pack(1, 16, 16, &[r])[0][1..], &mut fb, 16, 16).is_err());
         assert!(dec.apply(&[0; 5], &mut fb, 16, 16).is_err());
     }
 }
