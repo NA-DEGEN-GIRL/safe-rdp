@@ -145,7 +145,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
         }
     });
 
-    let mut send = |w: &mut crate::channel::RecordWriter<std::net::TcpStream>, m: ClientMsg| -> Result<()> {
+    let send = |w: &mut crate::channel::RecordWriter<std::net::TcpStream>, m: ClientMsg| -> Result<()> {
         let mut b = Vec::new();
         m.encode(&mut b);
         w.send(&b)

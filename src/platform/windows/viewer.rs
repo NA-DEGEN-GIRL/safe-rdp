@@ -43,25 +43,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-/// Stand-in for `crate::audio::AdpcmDecoder`, which is developed in parallel. Once that
-/// module is part of the build, delete this and `use crate::audio::AdpcmDecoder;` instead.
-mod adpcm {
-    use crate::bail;
-    use crate::util::Result;
-
-    pub struct AdpcmDecoder;
-
-    impl AdpcmDecoder {
-        pub fn new() -> AdpcmDecoder {
-            AdpcmDecoder
-        }
-
-        pub fn decode(&mut self, _data: &[u8], _channels: u8, _out: &mut Vec<i16>) -> Result<()> {
-            bail!("IMA ADPCM decoding is not part of this build")
-        }
-    }
-}
-use adpcm::AdpcmDecoder;
+use crate::audio::AdpcmDecoder;
 
 const WM_APP_FRAME: u32 = WM_APP + 1;
 const WM_APP_CURSOR: u32 = WM_APP + 2;

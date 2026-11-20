@@ -274,6 +274,7 @@ impl Encoder {
     }
 
     /// The quality mode in effect (`proto::QUALITY_*`).
+    #[cfg(test)]
     pub fn quality(&self) -> u32 {
         self.quality
     }

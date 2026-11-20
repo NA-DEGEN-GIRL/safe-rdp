@@ -25,7 +25,7 @@ use crate::proto::*;
 use crate::screen::{Area, MonitorSel};
 use crate::util::{Result, Secret};
 use crate::{bail, log};
-use adpcm_stub::AdpcmEncoder;
+use crate::audio::AdpcmEncoder;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -100,21 +100,6 @@ const MAX_AUDIO_CHANNELS: u8 = 8;
 const MAX_AUDIO_RATE: u32 = 384_000;
 /// Decode limit for `Notice` and `FileResult` text.
 const MAX_TEXT: usize = 4096;
-
-/// Stand-in for `crate::audio::AdpcmEncoder`, which is written in parallel.
-/// INTEGRATION: delete this module and `use crate::audio::AdpcmEncoder;` instead.
-mod adpcm_stub {
-    pub struct AdpcmEncoder;
-
-    impl AdpcmEncoder {
-        pub fn new(_channels: u8) -> AdpcmEncoder {
-            AdpcmEncoder
-        }
-
-        /// Produces nothing, so no audio goes out until the real encoder is in place.
-        pub fn encode(&mut self, _pcm: &[i16], _out: &mut Vec<u8>) {}
-    }
-}
 
 /// Locks `m` even if a thread panicked while holding it: nothing guarded here can be left
 /// half-updated in a harmful way (a torn record fails authentication and ends the session).
@@ -1016,6 +1001,10 @@ fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, st
         };
         if stop.load(Ordering::SeqCst) || ctl.stopped() {
             return;
+        }
+        // The ADPCM encoder takes mono or stereo only; silence is not worth sending.
+        if !(1..=2).contains(&p.channels) || p.pcm.iter().all(|&s| s == 0) {
+            continue;
         }
         if enc.as_ref().is_some_and(|(ch, _)| *ch != p.channels) {
             enc = None;

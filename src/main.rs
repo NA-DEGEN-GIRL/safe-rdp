@@ -1,16 +1,19 @@
 //! safe-rdp: a small, auditable remote desktop for Windows and Linux, meant to run over Tailscale.
 
+mod audio;
 mod channel;
 mod codec;
 mod crypto;
 mod files;
 mod host;
+mod json;
 mod keys;
 mod net;
 mod platform;
 mod probe;
 mod proto;
 mod screen;
+mod tailscale;
 mod util;
 mod viewer;
 
@@ -18,12 +21,15 @@ use platform::{capture, keystore};
 use screen::MonitorSel;
 use net::PeerPolicy;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use util::{Error, Result, Secret};
 
 const USAGE: &str = "\
-safe-rdp - remote desktop for Windows over Tailscale
+safe-rdp - remote desktop for Windows and Linux over Tailscale
 
 USAGE:
+  safe-rdp gui                       (Windows) Open the launcher window; also what a
+                                     double-click on safe-rdp.exe does
   safe-rdp keygen [--force]          Create a new key, store it for this user, print it once
   safe-rdp key import                Store a key (paste it at the prompt) for this user
   safe-rdp key show                  Print the stored key (to set up the other machine)
@@ -31,9 +37,10 @@ USAGE:
 
   safe-rdp host [HOST OPTIONS]       Share this screen (runs in the current session)
   safe-rdp connect <host[:port]> [VIEWER OPTIONS]
+  safe-rdp devices                   List the devices on your tailnet
 
-  safe-rdp service install [HOST OPTIONS] [--enable-sas]   (elevated) run as a SYSTEM
-                                     service: works on the lock/sign-in screen and UAC
+  safe-rdp service install [HOST OPTIONS] [--enable-sas]   (Windows, elevated) run as a
+                                     SYSTEM service: works on the lock/sign-in screen and UAC
   safe-rdp service uninstall | status
 
   safe-rdp monitors                  List monitors
@@ -49,8 +56,15 @@ HOST OPTIONS:
   --allow-non-tailscale    Permit binding/peers outside Tailscale ranges (not recommended)
   --monitor <n|all>        Monitor to share, 1 = primary (default), or 'all'
   --fps <n>                Frame rate cap (default 30)
+  --quality <q>            Picture quality for viewers that do not ask: lossless | balanced | low
   --clipboard              Allow text clipboard sharing (viewer must opt in too)
+  --files                  Allow file transfer (uploads to Downloads/safe-rdp, pulling copied files)
+  --transfer-dir <path>    Save uploads here instead
+  --audio                  Allow viewers to listen to this machine's sound
+  --privacy                Allow viewers to blank this screen and lock local input while connected
   --view-only              Ignore keyboard and mouse from viewers
+  --virtual <WxH>          (Linux) Run in a new headless X display (Xvfb) of this size
+  --session <cmd>          (Linux, with --virtual) Program to run in it (default: a terminal)
   --key-file <path>        Read the key from a text file instead of the user key store
 
 VIEWER OPTIONS:
@@ -65,8 +79,13 @@ VIEWER OPTIONS:
   --privacy                Blank the host's screen and block its local input while connected
   --key-file <path>        Read the key from a text file
 
-Hotkeys in the viewer: Ctrl+Alt+Enter full screen, Ctrl+Alt+End sends Ctrl+Alt+Del.
+In the viewer: the connection bar (top edge in full screen) switches monitor, quality, scale,
+sound, clipboard and privacy; drop files on the window to send them; received files go to
+Downloads/safe-rdp. Hotkeys: Ctrl+Alt+Enter full screen, Ctrl+Alt+End sends Ctrl+Alt+Del.
 ";
+
+/// Set when the host should stop (launcher closed our stdin).
+static STOP: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,38 +97,51 @@ fn main() {
 
 fn dispatch(args: &[String]) -> Result<()> {
     let Some(cmd) = args.first() else {
+        #[cfg(windows)]
+        if platform::launcher::started_from_explorer() {
+            return platform::launcher::run();
+        }
         print!("{USAGE}");
         return Ok(());
     };
     let rest = &args[1..];
     match cmd.as_str() {
+        #[cfg(windows)]
+        "gui" => platform::launcher::run(),
+        "devices" => {
+            let st = tailscale::status().map_err(|p| Error::msg(p.to_string()))?;
+            print!("{}", tailscale::devices_table(&st));
+            Ok(())
+        }
         "keygen" => keygen(rest),
         "key" => key_cmd(rest),
-        "host" => {
-            let (opts, key_file) = parse_host(rest, false)?;
-            let key = load_key(key_file.as_deref())?;
-            platform::init_process();
-            host::run(opts, key)
-        }
+        "host" => host_cmd(rest),
         #[cfg(windows)]
         "agent" => {
             // Started by the service as SYSTEM inside the console session.
             util::set_log_file(&keystore::service_dir().join("host.log"))?;
-            let (opts, _) = parse_host(rest, true)?;
+            let mut cli = parse_host(rest, true)?;
+            if cli.opts.files && cli.opts.transfer_dir.is_none() {
+                // SYSTEM's own Downloads folder is no place for uploads: keep them in the
+                // service's admin-only directory unless --transfer-dir says otherwise.
+                let dir = keystore::service_dir().join("incoming");
+                std::fs::create_dir_all(&dir)?;
+                cli.opts.transfer_dir = Some(dir);
+            }
             let key = keystore::load_service_key()?;
             platform::init_process();
-            host::run(opts, key)
+            host::run(cli.opts, key)
         }
         "connect" => connect(rest),
         "probe" => probe_cmd(rest),
         #[cfg(windows)]
         "service" => match rest.first().map(String::as_str) {
             Some("install") => {
-                let (opts, key_file) = parse_host(&rest[1..], true)?;
-                if key_file.is_some() {
+                let cli = parse_host(&rest[1..], true)?;
+                if cli.key_file.is_some() {
                     bail!("--key-file is not supported for the service; it uses this user's stored key");
                 }
-                platform::service::install(&rest[1..], opts.port, opts.sas)
+                platform::service::install(&rest[1..], cli.opts.port, cli.opts.sas)
             }
             Some("uninstall") => platform::service::uninstall(),
             Some("status") => {
@@ -157,7 +189,56 @@ fn parse_monitor(s: &str) -> Result<MonitorSel> {
     })
 }
 
-fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Option<String>)> {
+struct HostCli {
+    opts: host::HostOptions,
+    key_file: Option<String>,
+    /// Stop cleanly when stdin reaches end of file (used by the launcher).
+    stop_on_eof: bool,
+    virtual_size: Option<(u32, u32)>,
+    session: Option<String>,
+}
+
+fn host_cmd(args: &[String]) -> Result<()> {
+    let cli = parse_host(args, false)?;
+    let key = load_key(cli.key_file.as_deref())?;
+    // Must come before any thread starts: it sets DISPLAY/XAUTHORITY for this process.
+    #[cfg(target_os = "linux")]
+    let _display = match cli.virtual_size {
+        Some((w, h)) => {
+            let s = cli.session.as_deref().unwrap_or(platform::xvfb::DEFAULT_SESSION);
+            let d = platform::xvfb::VirtualDisplay::start(w, h, (!s.is_empty()).then_some(s))?;
+            log!("virtual display {} ({w}x{h}) started", d.display_name());
+            Some(d)
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    if cli.virtual_size.is_some() || cli.session.is_some() {
+        bail!("--virtual and --session are only available on Linux");
+    }
+    platform::init_process();
+    if cli.stop_on_eof {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut buf = [0u8; 64];
+            let mut stdin = std::io::stdin();
+            while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+            STOP.store(true, Ordering::SeqCst);
+        });
+    }
+    let listener = host::bind(&cli.opts)?;
+    host::serve(listener, cli.opts, key, &STOP)
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X']).ok_or("--virtual expects WIDTHxHEIGHT, e.g. 1920x1080")?;
+    match (w.parse(), h.parse()) {
+        (Ok(w), Ok(h)) => Ok((w, h)),
+        _ => bail!("--virtual expects WIDTHxHEIGHT, e.g. 1920x1080"),
+    }
+}
+
+fn parse_host(args: &[String], service: bool) -> Result<HostCli> {
     let mut o = host::HostOptions {
         bind: None,
         port: proto::DEFAULT_PORT,
@@ -167,8 +248,13 @@ fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Opti
         clipboard: false,
         view_only: false,
         sas: false,
+        // Everything beyond screen, keyboard and mouse is opt-in.
+        files: false,
+        audio: false,
+        privacy: false,
         ..host::HostOptions::default()
     };
+    let mut cli = HostCli { opts: host::HostOptions::default(), key_file: None, stop_on_eof: false, virtual_size: None, session: None };
     let mut key_file = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -184,12 +270,23 @@ fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Opti
             "--allow-non-tailscale" => o.policy.allow_non_tailscale = true,
             "--monitor" => o.monitor = parse_monitor(next(&mut it, a)?)?,
             "--fps" => o.max_fps = next(&mut it, a)?.parse().ok().filter(|f| (1..=120).contains(f)).ok_or("--fps expects 1-120")?,
+            "--quality" => o.default_quality = parse_quality(next(&mut it, a)?)? as u32,
             "--clipboard" => o.clipboard = true,
+            "--files" => o.files = true,
+            "--transfer-dir" => o.transfer_dir = Some(next(&mut it, a)?.into()),
+            "--audio" => o.audio = true,
+            "--privacy" => o.privacy = true,
             "--view-only" => o.view_only = true,
             "--enable-sas" if service => o.sas = true,
             "--key-file" => key_file = Some(next(&mut it, a)?.to_string()),
+            "--stop-on-eof" if !service => cli.stop_on_eof = true,
+            "--virtual" if !service => cli.virtual_size = Some(parse_size(next(&mut it, a)?)?),
+            "--session" if !service => cli.session = Some(next(&mut it, a)?.to_string()),
             other => bail!("unknown host option '{other}'"),
         }
+    }
+    if cli.session.is_some() && cli.virtual_size.is_none() {
+        bail!("--session needs --virtual");
     }
     if let Some(ip) = o.bind {
         o.policy.loopback_ok = ip.is_loopback();
@@ -199,7 +296,9 @@ fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Opti
             bail!("--allow {ip} is outside Tailscale; add --allow-non-tailscale if you really mean it");
         }
     }
-    Ok((o, key_file))
+    cli.opts = o;
+    cli.key_file = key_file;
+    Ok(cli)
 }
 
 fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
@@ -260,7 +359,8 @@ fn connect(args: &[String]) -> Result<()> {
             s if target.is_none() => target = Some(s.to_string()),
             s => bail!("unexpected argument '{s}'"),
         }
-    }    let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
+    }
+    let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
     let key = load_key(key_file.as_deref())?;
     platform::init_process();
     platform::viewer::run(&target, o, key)
@@ -312,6 +412,7 @@ fn probe_cmd(args: &[String]) -> Result<()> {
     let key = load_key(key_file.as_deref())?;
     probe::run(&target, o, key)
 }
+
 fn keygen(args: &[String]) -> Result<()> {
     let force = args.iter().any(|a| a == "--force");
     if let Some(a) = args.iter().find(|a| *a != "--force") {
@@ -396,24 +497,29 @@ fn bench(args: &[String]) -> Result<()> {
     println!("capture:       {name}, first frame {first:.1} ms, {frames} frames delivered in 1 s");
     let mut frame = cap.pixels().to_vec();
     drop(cap);
-    let mut enc = codec::Encoder::new()?;
-    let mut dec = codec::Decoder::new()?;
-    let t = Instant::now();
-    let rects = enc.encode(&frame, w, h);
-    let enc_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let msgs = codec::pack(1, w, h, &rects);
-    let bytes: usize = msgs.iter().map(Vec::len).sum();
     let mut fb = vec![0u8; w * h * 4];
-    let t = Instant::now();
-    for m in &msgs {
-        dec.apply(&m[1..], &mut fb, w, h)?;
+    for (q, label) in [(proto::QUALITY_LOSSLESS, "lossless"), (proto::QUALITY_BALANCED, "balanced"), (proto::QUALITY_LOW, "low")] {
+        let mut enc = codec::Encoder::new()?;
+        enc.set_quality(q);
+        let mut dec = codec::Decoder::new()?;
+        let t = Instant::now();
+        let rects = enc.encode(&frame, w, h);
+        let enc_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let msgs = codec::pack(1, w, h, &rects);
+        let bytes: usize = msgs.iter().map(Vec::len).sum();
+        let t = Instant::now();
+        for m in &msgs {
+            dec.apply(&m[1..], &mut fb, w, h)?;
+        }
+        let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{label:<9} encode {enc_ms:.1} ms, decode {dec_ms:.1} ms, {:.0} KiB ({:.1}x smaller than 24-bit raw)",
+            bytes as f64 / 1024.0,
+            (w * h * 3) as f64 / bytes.max(1) as f64
+        );
     }
-    let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "full frame:    encode {enc_ms:.1} ms, decode {dec_ms:.1} ms, {:.0} KiB ({:.1}x smaller than 24-bit raw)",
-        bytes as f64 / 1024.0,
-        (w * h * 3) as f64 / bytes as f64
-    );
+    let mut enc = codec::Encoder::new()?;
+    enc.encode(&frame, w, h);
     let t = Instant::now();
     for _ in 0..10 {
         enc.encode(&frame, w, h);
