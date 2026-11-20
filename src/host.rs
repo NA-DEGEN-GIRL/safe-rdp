@@ -26,8 +26,10 @@ use crate::screen::{Area, MonitorSel};
 use crate::util::{Result, Secret};
 use crate::{bail, log};
 use crate::audio::AdpcmEncoder;
+#[cfg(windows)]
+use crate::platform::clipboard::FileUser;
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -55,7 +57,8 @@ pub struct HostOptions {
     pub default_quality: u32,
     /// Where uploads are saved (default: `files::transfer_dir()`).
     pub transfer_dir: Option<PathBuf>,
-    /// The files a `FilePull` sends: the platform clipboard (replaceable for tests).
+    /// The files a `FilePull` sends: the platform clipboard (replaceable for tests). Called on
+    /// the file-pull thread.
     pub copied_files: fn() -> Vec<PathBuf>,
 }
 
@@ -80,12 +83,25 @@ impl Default for HostOptions {
     }
 }
 
+/// Longest a handshake may take in all, however the peer paces its bytes.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_PENDING: usize = 4;
+/// Handshakes in progress at once, in all and per source address.
+const MAX_PENDING: usize = 8;
+const MAX_PENDING_PER_ADDR: usize = 2;
+/// How long a failed handshake keeps its address's slot (slows down guessing).
+const FAILURE_PENALTY: Duration = Duration::from_secs(1);
 const MAX_IN_FLIGHT: u32 = 2;
 /// How often the accept loop looks at its stop flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// How often `bind` looks for a Tailscale address.
+const TAILSCALE_POLL: Duration = Duration::from_secs(5);
+/// Lines about connections that did not authenticate: logged per window, per address and in all.
+const QUIET_WINDOW: Duration = Duration::from_secs(60);
+const QUIET_PER_ADDR: u32 = 3;
+const QUIET_TOTAL: u32 = 20;
+/// Lines a viewer can cause at will (refusals) that one session logs.
+const SESSION_LOG_LINES: u32 = 20;
 /// Lossless refinement sent per idle capture tick.
 const REFINE_BUDGET: usize = 256 * 1024;
 /// Uploads a viewer may have open at once.
@@ -163,7 +179,8 @@ struct Host {
     opts: HostOptions,
     psk: Secret<32>,
     current: Mutex<Option<Arc<SessionCtl>>>,
-    pending: AtomicUsize,
+    pending: Mutex<Pending>,
+    quiet: Mutex<Quiet>,
     /// `serve` was told to stop: no new session may start.
     stopping: AtomicBool,
 }
@@ -178,32 +195,202 @@ impl Host {
             c.wait_finished(Duration::from_secs(10));
         }
     }
+
+    /// Logs a line about a connection that has not authenticated, unless `Quiet` holds it back.
+    fn log_unauthenticated(&self, ip: IpAddr, line: std::fmt::Arguments) {
+        let (dropped, show) = {
+            let mut q = lock(&self.quiet);
+            (q.roll(Instant::now()), q.allow(ip))
+        };
+        report_dropped(dropped);
+        if show {
+            log!("{line}");
+        }
+    }
+
+    /// Sums up the lines `Quiet` held back once their window is over.
+    fn flush_quiet(&self) {
+        let dropped = lock(&self.quiet).roll(Instant::now());
+        report_dropped(dropped);
+    }
+}
+
+fn report_dropped(n: u64) {
+    if n > 0 {
+        log!("{n} more refused or failed connection attempts in the last minute were not logged");
+    }
+}
+
+/// Handshakes in progress: at most `MAX_PENDING` in all and `MAX_PENDING_PER_ADDR` from one
+/// address, so one peer without the key cannot keep everybody else out.
+#[derive(Default)]
+struct Pending {
+    total: usize,
+    per_addr: HashMap<IpAddr, usize>,
+}
+
+impl Pending {
+    fn admit(&mut self, ip: IpAddr) -> std::result::Result<(), &'static str> {
+        let n = self.per_addr.get(&ip).copied().unwrap_or(0);
+        if n >= MAX_PENDING_PER_ADDR {
+            return Err("too many pending handshakes from this address");
+        }
+        if self.total >= MAX_PENDING {
+            return Err("too many pending handshakes");
+        }
+        self.total += 1;
+        self.per_addr.insert(ip, n + 1);
+        Ok(())
+    }
+
+    fn leave_total(&mut self) {
+        self.total = self.total.saturating_sub(1);
+    }
+
+    fn leave_addr(&mut self, ip: IpAddr) {
+        if let Some(n) = self.per_addr.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_addr.remove(&ip);
+            }
+        }
+    }
+}
+
+/// A handshake's place in `Host::pending`, given back when dropped.
+struct Slot {
+    host: Arc<Host>,
+    ip: IpAddr,
+    /// Still counted against `MAX_PENDING`.
+    counted: bool,
+}
+
+impl Slot {
+    /// Gives back the place in the total but keeps the address's own (the failure penalty).
+    fn uncount(&mut self) {
+        if std::mem::take(&mut self.counted) {
+            lock(&self.host.pending).leave_total();
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut p = lock(&self.host.pending);
+        if self.counted {
+            p.leave_total();
+        }
+        p.leave_addr(self.ip);
+    }
+}
+
+/// Keeps lines about connections that never authenticated from flooding the log (anyone who
+/// reaches the port causes them, as fast as it can connect): per `QUIET_WINDOW` at most
+/// `QUIET_PER_ADDR` per address and `QUIET_TOTAL` in all, then one line counting the rest.
+struct Quiet {
+    since: Instant,
+    shown: u32,
+    per_addr: HashMap<IpAddr, u32>,
+    dropped: u64,
+}
+
+impl Quiet {
+    fn new(now: Instant) -> Quiet {
+        Quiet { since: now, shown: 0, per_addr: HashMap::new(), dropped: 0 }
+    }
+
+    /// Starts a new window once the current one is over; returns how many lines the old one held back.
+    fn roll(&mut self, now: Instant) -> u64 {
+        if now.saturating_duration_since(self.since) < QUIET_WINDOW {
+            return 0;
+        }
+        (self.since, self.shown) = (now, 0);
+        self.per_addr.clear();
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Whether a line about `ip` may be logged in the current window.
+    fn allow(&mut self, ip: IpAddr) -> bool {
+        let n = self.per_addr.get(&ip).copied().unwrap_or(0);
+        if self.shown >= QUIET_TOTAL || n >= QUIET_PER_ADDR {
+            self.dropped += 1;
+            return false;
+        }
+        self.shown += 1;
+        self.per_addr.insert(ip, n + 1);
+        true
+    }
+}
+
+/// Lets the first lines of a kind through, then one saying that the rest are not logged.
+struct LogBudget(u32);
+
+impl LogBudget {
+    fn line(&mut self, line: String) -> Option<String> {
+        match self.0 {
+            0 => None,
+            1 => {
+                self.0 = 0;
+                Some(format!("{line} (more like this in this session are not logged)"))
+            }
+            _ => {
+                self.0 -= 1;
+                Some(line)
+            }
+        }
+    }
+}
+
+/// The handshake socket with an absolute deadline: each read and write gets only the time that
+/// is left. The socket's own timeouts restart with every byte, so a peer trickling its hello
+/// could otherwise hold a handshake slot for many minutes.
+struct Deadline<'a> {
+    s: &'a TcpStream,
+    until: Instant,
+}
+
+impl Deadline<'_> {
+    fn left(&self) -> std::io::Result<Duration> {
+        match self.until.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => Ok(d),
+            _ => Err(ErrorKind::TimedOut.into()),
+        }
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.s.set_read_timeout(Some(self.left()?))?;
+        let mut s = self.s;
+        s.read(buf)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.s.set_write_timeout(Some(self.left()?))?;
+        let mut s = self.s;
+        s.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Listens on the configured address and serves viewers until the process ends.
 pub fn run(opts: HostOptions, psk: Secret<32>) -> Result<()> {
-    let listener = bind(&opts)?;
-    serve(listener, opts, psk, &AtomicBool::new(false))
+    let stop = AtomicBool::new(false);
+    let listener = bind(&opts, &stop)?;
+    serve(listener, opts, psk, &stop)
 }
 
 /// Opens the listening socket on `opts.bind`, or on this machine's Tailscale address once
-/// Tailscale is up.
-pub fn bind(opts: &HostOptions) -> Result<TcpListener> {
+/// Tailscale is up. Fails promptly if `stop` is set while it waits.
+pub fn bind(opts: &HostOptions, stop: &AtomicBool) -> Result<TcpListener> {
     let ip = match opts.bind {
         Some(ip) => ip,
-        None => {
-            let mut warned = false;
-            loop {
-                if let Some(ip) = net::tailscale_ipv4() {
-                    break IpAddr::V4(ip);
-                }
-                if !warned {
-                    log!("waiting for Tailscale to come up (no 100.64.0.0/10 address yet)...");
-                    warned = true;
-                }
-                std::thread::sleep(Duration::from_secs(5));
-            }
-        }
+        None => wait_for_address(|| net::tailscale_ipv4().map(IpAddr::V4), stop, TAILSCALE_POLL)?,
     };
     if !net::is_tailscale(ip) && !ip.is_loopback() && !opts.policy.allow_non_tailscale {
         bail!("{ip} is not a Tailscale address; pass --allow-non-tailscale to bind it anyway");
@@ -221,15 +408,44 @@ pub fn bind(opts: &HostOptions) -> Result<TcpListener> {
     Ok(listener)
 }
 
+/// Polls `find` every `every` until it yields an address; fails as soon as `stop` is set.
+fn wait_for_address(find: impl Fn() -> Option<IpAddr>, stop: &AtomicBool, every: Duration) -> Result<IpAddr> {
+    let mut warned = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            bail!("stopped while waiting for Tailscale");
+        }
+        if let Some(ip) = find() {
+            return Ok(ip);
+        }
+        if !warned {
+            log!("waiting for Tailscale to come up (no 100.64.0.0/10 address yet)...");
+            warned = true;
+        }
+        let t = Instant::now();
+        while t.elapsed() < every && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(ACCEPT_POLL);
+        }
+    }
+}
+
 /// Accepts and serves viewers on `listener` until `stop` is set, then ends the current session.
 pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &AtomicBool) -> Result<()> {
     // Non-blocking accepts let the loop notice `stop`.
     listener.set_nonblocking(true)?;
-    let host = Arc::new(Host { opts, psk, current: Mutex::new(None), pending: AtomicUsize::new(0), stopping: AtomicBool::new(false) });
+    let host = Arc::new(Host {
+        opts,
+        psk,
+        current: Mutex::new(None),
+        pending: Mutex::new(Pending::default()),
+        quiet: Mutex::new(Quiet::new(Instant::now())),
+        stopping: AtomicBool::new(false),
+    });
     while !stop.load(Ordering::SeqCst) {
         let (stream, peer) = match listener.accept() {
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                host.flush_quiet();
                 std::thread::sleep(ACCEPT_POLL);
                 continue;
             }
@@ -244,25 +460,33 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
             continue;
         }
         if !host.opts.policy.allows(peer.ip()) {
-            log!("refused {peer}: address not allowed");
+            host.log_unauthenticated(peer.ip(), format_args!("refused {peer}: address not allowed"));
             continue;
         }
-        if host.pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
-            host.pending.fetch_sub(1, Ordering::SeqCst);
-            log!("refused {peer}: too many pending handshakes");
+        let admitted = lock(&host.pending).admit(peer.ip());
+        if let Err(why) = admitted {
+            host.log_unauthenticated(peer.ip(), format_args!("refused {peer}: {why}"));
             continue;
         }
+        let mut slot = Slot { host: host.clone(), ip: peer.ip(), counted: true };
         let h = host.clone();
+        // If the thread cannot start, dropping the closure gives the slot back.
         let spawned = std::thread::Builder::new().name("session".into()).spawn(move || {
-            let authed = authenticate(&h, &stream, peer);
-            h.pending.fetch_sub(1, Ordering::SeqCst);
-            if let Some(keys) = authed {
-                serve_session(&h, stream, peer, keys);
+            match authenticate(&h, &stream, peer) {
+                Some(keys) => {
+                    drop(slot);
+                    serve_session(&h, stream, peer, keys);
+                }
+                None => {
+                    // Slow down guessing from this address without holding up anybody else.
+                    slot.uncount();
+                    drop(stream);
+                    std::thread::sleep(FAILURE_PENALTY);
+                }
             }
         });
         if let Err(e) = spawned {
-            host.pending.fetch_sub(1, Ordering::SeqCst);
-            log!("refused {peer}: {e}");
+            host.log_unauthenticated(peer.ip(), format_args!("refused {peer}: {e}"));
         }
     }
     host.shutdown();
@@ -271,17 +495,18 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
 
 fn authenticate(host: &Host, stream: &TcpStream, peer: SocketAddr) -> Option<channel::SessionKeys> {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
-    match channel::server_handshake(&mut &*stream, &host.psk.0) {
+    match handshake(stream, &host.psk.0, Instant::now() + HANDSHAKE_TIMEOUT) {
         Ok(k) => Some(k),
         Err(e) => {
-            log!("authentication failed for {peer}: {e}");
-            // Slow down guessing; the slot stays occupied meanwhile.
-            std::thread::sleep(Duration::from_secs(1));
+            host.log_unauthenticated(peer.ip(), format_args!("authentication failed for {peer}: {e}"));
             None
         }
     }
+}
+
+/// The host's side of the handshake, over by `until` however slowly the peer sends.
+fn handshake(stream: &TcpStream, psk: &[u8; 32], until: Instant) -> Result<channel::SessionKeys> {
+    channel::server_handshake(&mut Deadline { s: stream, until }, psk)
 }
 
 fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys) {
@@ -378,6 +603,8 @@ struct Shared {
 #[derive(Debug, PartialEq)]
 struct Start {
     sel: MonitorSel,
+    /// The host's own monitor (`HostOptions::monitor`) is not connected: `sel` is the primary one.
+    monitor_missing: bool,
     downscale: usize,
     quality: u32,
     audio: bool,
@@ -386,8 +613,15 @@ struct Start {
 
 fn negotiate(opts: &HostOptions, downscale: u8, quality: u8, monitor: u8, flags: u8, exists: impl Fn(MonitorSel) -> bool) -> Start {
     let fallback = if opts.default_quality <= QUALITY_LOW { opts.default_quality } else { QUALITY_BALANCED };
+    // What the viewer asked for, else the host's choice, else (unplugged) the primary monitor.
+    let (sel, monitor_missing) = match monitor_sel(monitor as u32, opts.monitor).filter(|&s| exists(s)) {
+        Some(s) => (s, false),
+        None if exists(opts.monitor) => (opts.monitor, false),
+        None => (MonitorSel::Primary, opts.monitor != MonitorSel::Primary),
+    };
     Start {
-        sel: monitor_sel(monitor as u32, opts.monitor).filter(|&s| exists(s)).unwrap_or(opts.monitor),
+        sel,
+        monitor_missing,
         downscale: downscale.clamp(1, 4) as usize,
         quality: if quality as u32 <= QUALITY_LOW { quality as u32 } else { fallback },
         audio: flags & HELLO_AUDIO != 0,
@@ -443,6 +677,12 @@ fn host_flags(opts: &HostOptions, audio_available: bool, privacy_available: bool
     flags
 }
 
+/// Whether clipboard text from the viewer may replace the host's: not in view-only sessions,
+/// which must not change anything on the host. The host's clipboard still reaches the viewer.
+fn accepts_clipboard(opts: &HostOptions) -> bool {
+    opts.clipboard && !opts.view_only
+}
+
 fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, ctl: &Arc<SessionCtl>) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -471,6 +711,10 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         monitors,
         name: crate::platform::hostname(),
     })?;
+    if start.monitor_missing {
+        log!("the configured monitor is not connected; sharing the primary monitor");
+        out.notice("the monitor this host is set to share is not connected; showing the primary monitor".into())?;
+    }
 
     let shared = Arc::new(Shared {
         acked: AtomicU32::new(0),
@@ -533,7 +777,10 @@ struct Input {
     uploads: HashMap<u32, Incoming>,
     upload_dir: Option<PathBuf>,
     pulling: Arc<AtomicBool>,
-    next_pull_id: u32,
+    /// The id of the next file pulled.
+    pull_ids: Arc<AtomicU32>,
+    /// Refusals the viewer causes are logged up to `SESSION_LOG_LINES`.
+    refusals: LogBudget,
     audio: Toggle<AudioStream>,
     privacy: Toggle<Held>,
 }
@@ -562,7 +809,8 @@ impl Input {
             uploads: HashMap::new(),
             upload_dir: None,
             pulling: Arc::new(AtomicBool::new(false)),
-            next_pull_id: 1,
+            pull_ids: Arc::new(AtomicU32::new(1)),
+            refusals: LogBudget(SESSION_LOG_LINES),
             audio: Toggle::new("audio", flags & F_AUDIO != 0),
             privacy: Toggle::new("privacy mode", flags & F_PRIVACY != 0),
         }
@@ -605,14 +853,15 @@ impl Input {
             ClientMsg::FileData { id, data } => self.upload_data(id, &data)?,
             ClientMsg::FileEnd { id, sha256 } => self.upload_end(id, &sha256)?,
             ClientMsg::FilePull => self.pull()?,
-            ClientMsg::Clipboard(text) => {
+            ClientMsg::Clipboard(text) if accepts_clipboard(&self.host.opts) => {
                 if let Some(c) = &self.clip {
                     c.set(text);
                 }
             }
+            ClientMsg::Clipboard(_) => {}
             ClientMsg::Sas if !self.host.opts.view_only => {
                 if !self.host.opts.sas || !crate::platform::request_sas() {
-                    log!("Ctrl+Alt+Del requested but SAS forwarding is unavailable (run as service with --enable-sas)");
+                    self.log_refusal("Ctrl+Alt+Del requested but SAS forwarding is unavailable (run as service with --enable-sas)".into());
                 }
             }
             ClientMsg::Sas => {}
@@ -668,6 +917,12 @@ impl Input {
         self.out.send(&ServerMsg::FileResult { id, ok, message: short(message) })
     }
 
+    fn log_refusal(&mut self, line: String) {
+        if let Some(line) = self.refusals.line(line) {
+            log!("{line}");
+        }
+    }
+
     fn refusal(&self) -> String {
         if self.host.opts.view_only {
             "file transfer is not available in a view-only session".into()
@@ -709,7 +964,7 @@ impl Input {
                 Ok(())
             }
             Err(e) => {
-                log!("refused upload of {name} ({size} bytes): {e}");
+                self.log_refusal(format!("refused upload of {name} ({size} bytes): {e}"));
                 self.file_result(id, false, e.to_string())
             }
         }
@@ -745,19 +1000,13 @@ impl Input {
         if !self.files {
             return self.out.notice(self.refusal());
         }
-        if self.pulling.load(Ordering::SeqCst) {
+        if self.pulling.swap(true, Ordering::SeqCst) {
             return self.out.notice("files are already being sent".into());
         }
-        let paths = (self.host.opts.copied_files)();
-        if paths.is_empty() {
-            return self.out.notice("no files are copied on the host".into());
-        }
-        let first_id = self.next_pull_id;
-        self.next_pull_id = self.next_pull_id.wrapping_add(paths.len() as u32);
-        self.pulling.store(true, Ordering::SeqCst);
-        let (out, ctl, busy) = (self.out.clone(), self.ctl.clone(), self.pulling.clone());
+        let (out, ctl, busy, ids) = (self.out.clone(), self.ctl.clone(), self.pulling.clone(), self.pull_ids.clone());
+        let copied = self.host.opts.copied_files;
         let spawned = std::thread::Builder::new().name("file-pull".into()).spawn(move || {
-            send_files(&paths, first_id, &out, &ctl);
+            pull_files(copied, &ids, &out, &ctl);
             busy.store(false, Ordering::SeqCst);
         });
         if let Err(e) = spawned {
@@ -768,14 +1017,48 @@ impl Input {
     }
 }
 
+/// Elsewhere the host runs as the user whose screen it shares: files are read as itself.
+#[cfg(not(windows))]
+struct FileUser;
+
+#[cfg(not(windows))]
+impl FileUser {
+    fn get() -> Result<FileUser> {
+        Ok(FileUser)
+    }
+
+    fn act<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        Ok(f())
+    }
+}
+
+/// Sends the files copied on the host, each opened as the user the host's session belongs to
+/// (`FileUser`: the host may be SYSTEM).
+fn pull_files(copied: fn() -> Vec<PathBuf>, ids: &AtomicU32, out: &Out, ctl: &SessionCtl) {
+    let user = match FileUser::get() {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = out.notice(format!("cannot send copied files: {e}"));
+            return;
+        }
+    };
+    let paths = copied();
+    if paths.is_empty() {
+        let _ = out.notice("no files are copied on the host".into());
+        return;
+    }
+    let first_id = ids.fetch_add(paths.len() as u32, Ordering::SeqCst);
+    send_files(&paths, first_id, &user, out, ctl);
+}
+
 /// Sends `paths` one after another as `S_FILE_BEGIN` / `S_FILE_DATA`... / `S_FILE_END`.
-fn send_files(paths: &[PathBuf], first_id: u32, out: &Out, ctl: &SessionCtl) {
+fn send_files(paths: &[PathBuf], first_id: u32, user: &FileUser, out: &Out, ctl: &SessionCtl) {
     let mut buf = Vec::new();
     for (i, path) in paths.iter().enumerate() {
         if ctl.stopped() {
             return;
         }
-        if let Err(e) = send_file(path, first_id.wrapping_add(i as u32), out, ctl, &mut buf) {
+        if let Err(e) = send_file(path, first_id.wrapping_add(i as u32), user, out, ctl, &mut buf) {
             if ctl.stopped() {
                 return;
             }
@@ -788,8 +1071,9 @@ fn send_files(paths: &[PathBuf], first_id: u32, out: &Out, ctl: &SessionCtl) {
     }
 }
 
-fn send_file(path: &Path, id: u32, out: &Out, ctl: &SessionCtl, buf: &mut Vec<u8>) -> Result<()> {
-    let mut file = Outgoing::open(path, id)?;
+fn send_file(path: &Path, id: u32, user: &FileUser, out: &Out, ctl: &SessionCtl, buf: &mut Vec<u8>) -> Result<()> {
+    // Opened as the user; reading through the open handle needs no further rights.
+    let mut file = user.act(|| Outgoing::open(path, id))??;
     let (name, size) = (file.name.clone(), file.size);
     log!("sending file {name} ({size} bytes)");
     out.send_bulk(&ServerMsg::FileBegin { id, size, name })?;
@@ -1248,13 +1532,27 @@ mod tests {
         let o = opts();
         let all = |_| true;
         let s = negotiate(&o, 2, QUALITY_LOW as u8, MONITOR_DEFAULT, HELLO_AUDIO | HELLO_PRIVACY, all);
-        assert_eq!(s, Start { sel: MonitorSel::Index(1), downscale: 2, quality: QUALITY_LOW, audio: true, privacy: true });
+        let sel = MonitorSel::Index(1);
+        assert_eq!(s, Start { sel, monitor_missing: false, downscale: 2, quality: QUALITY_LOW, audio: true, privacy: true });
         let s = negotiate(&o, 0, 9, MONITOR_ALL, 0, all);
-        assert_eq!(s, Start { sel: MonitorSel::All, downscale: 1, quality: QUALITY_BALANCED, audio: false, privacy: false });
+        let sel = MonitorSel::All;
+        assert_eq!(s, Start { sel, monitor_missing: false, downscale: 1, quality: QUALITY_BALANCED, audio: false, privacy: false });
         assert_eq!(negotiate(&o, 200, 0, 0, 0, all).downscale, 4);
         assert_eq!(negotiate(&o, 1, 0, 3, 0, all).sel, MonitorSel::Index(3));
         // An unknown monitor falls back to the host's choice.
         assert_eq!(negotiate(&o, 1, 0, 3, 0, |s| s != MonitorSel::Index(3)).sel, MonitorSel::Index(1));
+        // The host's own monitor was unplugged: the primary one, and the viewer is told.
+        let unplugged = |s| s != MonitorSel::Index(1) && s != MonitorSel::Index(3);
+        for m in [MONITOR_DEFAULT, 3] {
+            let s = negotiate(&o, 1, 0, m, 0, unplugged);
+            assert_eq!((s.sel, s.monitor_missing), (MonitorSel::Primary, true));
+        }
+        let s = negotiate(&o, 1, 0, 2, 0, unplugged);
+        assert_eq!((s.sel, s.monitor_missing), (MonitorSel::Index(2), false));
+        // Nothing to fall back to: the primary monitor, which then fails to open.
+        let o = HostOptions { monitor: MonitorSel::Primary, ..opts() };
+        let s = negotiate(&o, 1, 0, MONITOR_DEFAULT, 0, |_| false);
+        assert_eq!((s.sel, s.monitor_missing), (MonitorSel::Primary, false));
         // The host default applies to unknown qualities only, and only if it is a valid one.
         let o = HostOptions { default_quality: QUALITY_LOSSLESS, ..opts() };
         assert_eq!(negotiate(&o, 1, 0xff, 0, 0, all).quality, QUALITY_LOSSLESS);
@@ -1296,6 +1594,183 @@ mod tests {
         assert_eq!(host_flags(&o, true, true), F_VIEW_ONLY | F_SAS | F_AUDIO);
         let o = HostOptions { files: false, audio: false, privacy: false, ..HostOptions::default() };
         assert_eq!(host_flags(&o, true, true), 0);
+    }
+
+    #[test]
+    fn view_only_viewers_cannot_set_the_clipboard() {
+        let o = |clipboard, view_only| HostOptions { clipboard, view_only, ..HostOptions::default() };
+        assert!(accepts_clipboard(&o(true, false)));
+        assert!(!accepts_clipboard(&o(true, true)));
+        assert!(!accepts_clipboard(&o(false, false)));
+        // The host's clipboard is still offered to view-only viewers.
+        assert_ne!(host_flags(&o(true, true), false, false) & F_CLIPBOARD, 0);
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([100, 64, 0, last])
+    }
+
+    #[test]
+    fn pending_handshakes_are_capped_in_all_and_per_address() {
+        let mut p = Pending::default();
+        for _ in 0..MAX_PENDING_PER_ADDR {
+            p.admit(ip(1)).unwrap();
+        }
+        assert!(p.admit(ip(1)).unwrap_err().contains("this address"));
+        // Others still get in, up to the total.
+        let mut n = MAX_PENDING_PER_ADDR;
+        let mut last = 2;
+        while n < MAX_PENDING {
+            p.admit(ip(last)).unwrap();
+            n += 1;
+            if n % MAX_PENDING_PER_ADDR == 0 {
+                last += 1;
+            }
+        }
+        assert_eq!(p.admit(ip(200)), Err("too many pending handshakes"));
+        // A failed handshake leaves the total at once but keeps its address's place.
+        p.leave_total();
+        assert!(p.admit(ip(1)).is_err());
+        p.admit(ip(200)).unwrap();
+        p.leave_addr(ip(1));
+        p.leave_total();
+        p.admit(ip(1)).unwrap();
+        // Nothing is kept for addresses without handshakes.
+        let mut p = Pending::default();
+        p.admit(ip(7)).unwrap();
+        assert!(p.admit(ip(7)).is_ok() && p.admit(ip(7)).is_err());
+        for _ in 0..2 {
+            p.leave_total();
+            p.leave_addr(ip(7));
+        }
+        p.leave_addr(ip(7));
+        assert!(p.per_addr.is_empty() && p.total == 0);
+    }
+
+    #[test]
+    fn unauthenticated_lines_are_rate_limited() {
+        let t0 = Instant::now();
+        let mut q = Quiet::new(t0);
+        let shown = (0..10).filter(|_| q.allow(ip(1))).count();
+        assert_eq!(shown, QUIET_PER_ADDR as usize);
+        assert_eq!(q.roll(t0 + Duration::from_secs(30)), 0);
+        // Many addresses: no more than the total per window.
+        let shown = (0..200u8).filter(|&i| q.allow(ip(i.max(2)))).count();
+        assert_eq!(shown + QUIET_PER_ADDR as usize, QUIET_TOTAL as usize);
+        let dropped = (10 - QUIET_PER_ADDR as u64) + (200 - shown as u64);
+        // The next window reports what the last one held back, and lets lines through again.
+        assert_eq!(q.roll(t0 + QUIET_WINDOW), dropped);
+        assert_eq!(q.roll(t0 + QUIET_WINDOW + Duration::from_secs(1)), 0);
+        assert!(q.allow(ip(1)));
+        assert_eq!(q.roll(t0 + 3 * QUIET_WINDOW), 0);
+    }
+
+    #[test]
+    fn session_refusals_are_logged_up_to_a_budget() {
+        let mut b = LogBudget(3);
+        let lines: Vec<_> = (0..6).map(|i| b.line(format!("refused {i}"))).collect();
+        assert_eq!(lines[..2], [Some("refused 0".to_string()), Some("refused 1".to_string())]);
+        assert!(lines[2].as_ref().is_some_and(|l| l.starts_with("refused 2 (") && l.contains("not logged")));
+        assert!(lines[3..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn waiting_for_tailscale_ends_when_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            s.store(true, Ordering::SeqCst);
+        });
+        let t = Instant::now();
+        let r = wait_for_address(|| None, &stop, Duration::from_secs(60));
+        setter.join().unwrap();
+        assert!(r.unwrap_err().to_string().contains("stopped"));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // Already stopped: not even one look.
+        assert!(wait_for_address(|| panic!("looked"), &stop, Duration::from_secs(60)).is_err());
+        // Found on the third look.
+        let looks = AtomicU32::new(0);
+        let find = || (looks.fetch_add(1, Ordering::SeqCst) == 2).then(|| ip(9));
+        assert_eq!(wait_for_address(find, &AtomicBool::new(false), Duration::from_millis(1)).unwrap(), ip(9));
+    }
+
+    #[test]
+    fn handshake_works_through_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let viewer = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            channel::client_handshake(&mut s, &[3; 32]).is_ok()
+        });
+        let (s, _) = l.accept().unwrap();
+        assert!(handshake(&s, &[3; 32], Instant::now() + Duration::from_secs(10)).is_ok());
+        assert!(viewer.join().unwrap());
+    }
+
+    #[test]
+    fn a_trickling_handshake_is_cut_off_at_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let trickle = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut s = TcpStream::connect(addr).unwrap();
+                // A byte every 50 ms: never quiet long enough for a per-read timeout to fire.
+                while !done.load(Ordering::SeqCst) && s.write_all(&[0x53]).is_ok() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+        let (s, _) = l.accept().unwrap();
+        let t = Instant::now();
+        let r = handshake(&s, &[1; 32], t + Duration::from_millis(800));
+        let took = t.elapsed();
+        done.store(true, Ordering::SeqCst);
+        drop(s);
+        trickle.join().unwrap();
+        let e = r.err().expect("a trickled handshake succeeded").to_string();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(took >= Duration::from_millis(700) && took < Duration::from_secs(3), "{took:?}");
+    }
+
+    /// Whether the host keeps `s` open (a pending handshake) rather than closing it at once.
+    fn held_open(s: &TcpStream) -> bool {
+        s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        match (&mut &*s).read(&mut [0u8; 1]) {
+            Err(e) => matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            Ok(_) => false,
+        }
+    }
+
+    #[test]
+    fn one_address_cannot_take_every_handshake_slot() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let policy = PeerPolicy { allow: vec![], allow_non_tailscale: false, loopback_ok: true };
+        let opts = HostOptions { policy, copied_files: Vec::new, ..HostOptions::default() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let host = {
+            let stop = stop.clone();
+            std::thread::spawn(move || serve(l, opts, Secret([9; 32]), &stop))
+        };
+        let a = TcpStream::connect(addr).unwrap();
+        let b = TcpStream::connect(addr).unwrap();
+        assert!(held_open(&a) && held_open(&b));
+        // A third silent connection from the same address is turned away at once.
+        let c = TcpStream::connect(addr).unwrap();
+        assert!(!held_open(&c));
+        // A failed handshake keeps its address's slot for the penalty, then gives it back.
+        drop(a);
+        let d = TcpStream::connect(addr).unwrap();
+        assert!(!held_open(&d));
+        std::thread::sleep(FAILURE_PENALTY + Duration::from_secs(1));
+        let e = TcpStream::connect(addr).unwrap();
+        assert!(held_open(&e));
+        stop.store(true, Ordering::SeqCst);
+        host.join().unwrap().unwrap();
+        drop((b, e));
     }
 
     #[test]
@@ -1477,7 +1952,7 @@ mod session_tests {
                 ..HostOptions::default()
             };
             configure(&mut opts);
-            let listener = bind(&opts).unwrap();
+            let listener = bind(&opts, &AtomicBool::new(false)).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let s = stop.clone();
             let thread = std::thread::spawn(move || serve(listener, opts, Secret(PSK), &s));

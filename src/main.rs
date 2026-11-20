@@ -224,7 +224,7 @@ fn host_cmd(args: &[String]) -> Result<()> {
             STOP.store(true, Ordering::SeqCst);
         });
     }
-    let listener = host::bind(&cli.opts)?;
+    let listener = host::bind(&cli.opts, &STOP)?;
     platform::stop_on_signals(&STOP);
     host::serve(listener, cli.opts, key, &STOP)
 }

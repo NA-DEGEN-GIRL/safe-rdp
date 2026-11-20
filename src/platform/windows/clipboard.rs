@@ -1,4 +1,4 @@
-//! Optional text-only clipboard bridge.
+//! Optional text-only clipboard bridge, and the files copied in Explorer for `FilePull`.
 //!
 //! Runs a message-only window on its own thread that reports local clipboard changes and
 //! applies remote ones. Text written from the remote side is flagged so Windows keeps it out
@@ -8,16 +8,32 @@ use crate::proto::MAX_CLIPBOARD;
 use crate::util::{Error, Result, wide};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Security::{
+    GetTokenInformation, ImpersonateLoggedOnUser, IsWellKnownSid, RevertToSelf, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+};
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+// In windows-sys behind the Win32_Storage_FileSystem feature, which nothing else needs.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetDriveTypeW(root: *const u16) -> u32;
+}
+
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_CDROM: u32 = 5;
+const DRIVE_RAMDISK: u32 = 6;
 
 const WM_APP_SET: u32 = WM_APP + 1;
 
@@ -216,8 +232,9 @@ pub fn write_text(hwnd: HWND, text: &str) -> bool {
 /// Upper bound on the files taken from one clipboard file list.
 const MAX_COPIED_FILES: u32 = 1000;
 
-/// Regular files currently copied in Explorer (CF_HDROP), as canonical paths without duplicates.
-/// Directories, missing files and relative paths are left out.
+/// Regular files on local drives currently copied in Explorer (CF_HDROP), as canonical paths
+/// without duplicates, checked as the `FileUser` who will open them. Network, device and
+/// relative paths, directories and missing files are left out.
 pub fn copied_files() -> Vec<PathBuf> {
     let names = unsafe {
         if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 || !open(null_mut()) {
@@ -229,7 +246,81 @@ pub fn copied_files() -> Vec<PathBuf> {
         CloseClipboard();
         names
     };
-    regular_files(names)
+    FileUser::get().and_then(|u| u.act(|| regular_files(names))).unwrap_or_default()
+}
+
+/// The identity copied files are checked and opened with. A host running as SYSTEM (the
+/// service's agent) acts as the user signed in on its console session, so a viewer can pull no
+/// file that user could not open; any other host already is that user.
+pub struct FileUser {
+    /// The console user's token, or null for the host's own identity.
+    token: HANDLE,
+}
+
+impl FileUser {
+    /// Fails when the host runs as SYSTEM and nobody is signed in on its session.
+    pub fn get() -> Result<FileUser> {
+        if !running_as_system() {
+            return Ok(FileUser { token: null_mut() });
+        }
+        unsafe {
+            let (console, mut own) = (WTSGetActiveConsoleSessionId(), u32::MAX);
+            if ProcessIdToSessionId(GetCurrentProcessId(), &mut own) == 0 || own != console {
+                return Err(Error::msg("the host is not running in the console session"));
+            }
+            let mut token = null_mut();
+            if WTSQueryUserToken(console, &mut token) == 0 {
+                return Err(Error::msg("nobody is signed in on the host"));
+            }
+            Ok(FileUser { token })
+        }
+    }
+
+    /// Runs `f` on this thread as the user.
+    pub fn act<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        if self.token.is_null() {
+            return Ok(f());
+        }
+        if unsafe { ImpersonateLoggedOnUser(self.token) } == 0 {
+            return Err(Error::last_os("ImpersonateLoggedOnUser"));
+        }
+        let _revert = Revert;
+        Ok(f())
+    }
+}
+
+impl Drop for FileUser {
+    fn drop(&mut self) {
+        if !self.token.is_null() {
+            unsafe { CloseHandle(self.token) };
+        }
+    }
+}
+
+/// Ends the thread's impersonation, also when the impersonated code panics.
+struct Revert;
+
+impl Drop for Revert {
+    fn drop(&mut self) {
+        unsafe { RevertToSelf() };
+    }
+}
+
+/// Whether this process runs as LocalSystem (S-1-5-18). If that cannot be told it is assumed,
+/// so files are never read with more rights than the signed-in user has.
+fn running_as_system() -> bool {
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return true;
+        }
+        // TOKEN_USER and the SID it points to (at most 68 bytes); u64s keep it aligned.
+        let mut buf = [0u64; 16];
+        let mut len = 0;
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &mut len);
+        CloseHandle(token);
+        ok == 0 || IsWellKnownSid((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid, WinLocalSystemSid) != 0
+    }
 }
 
 /// The paths in a CF_HDROP block.
@@ -254,13 +345,44 @@ unsafe fn drop_list(h: HDROP) -> Vec<PathBuf> {
 
 fn regular_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for p in paths.into_iter().filter(|p| p.is_absolute()) {
+    for p in paths {
+        // Checked before anything opens it: canonicalize alone already reaches a network path.
+        if !drive_letter(&p, false).is_some_and(local_drive) {
+            continue;
+        }
         let Ok(c) = std::fs::canonicalize(&p) else { continue };
+        // A link may lead elsewhere.
+        if !drive_letter(&c, true).is_some_and(local_drive) {
+            continue;
+        }
         if std::fs::metadata(&c).is_ok_and(|m| m.is_file()) && !out.contains(&c) {
             out.push(c);
         }
     }
     out
+}
+
+/// The drive letter of an `X:\...` path, or with `verbatim` of a `\\?\X:\...` one (as
+/// `canonicalize` returns them). Every other form is refused: UNC (`\\server\share`,
+/// `\\?\UNC\...`), device (`\\.\...`) and object-manager (`\\?\GLOBALROOT\...`) paths reach
+/// the network or devices as soon as they are opened, and relative ones depend on the
+/// current directory.
+fn drive_letter(p: &Path, verbatim: bool) -> Option<u8> {
+    let mut c = p.components();
+    match (c.next(), c.next()) {
+        (Some(Component::Prefix(pre)), Some(Component::RootDir)) => match pre.kind() {
+            Prefix::Disk(d) if !verbatim => Some(d),
+            Prefix::VerbatimDisk(d) if verbatim => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether drive `d` is a local volume, not a network share (mapped drives included).
+fn local_drive(d: u8) -> bool {
+    let root = [d as u16, b':' as u16, b'\\' as u16, 0];
+    matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_CDROM | DRIVE_RAMDISK)
 }
 
 #[cfg(test)]
@@ -307,10 +429,55 @@ mod tests {
         let names = unsafe { drop_list(h) };
         unsafe { GlobalFree(h) };
         assert_eq!(names, listed);
+        let a = std::fs::canonicalize(dir.join("a.txt")).unwrap();
+        // Existing files, but named by verbatim paths: refused before they are opened.
+        let mut names = names;
+        names.push(a.clone());
+        names.push(PathBuf::from(format!(r"\\?\GLOBALROOT\??\{}", dir.join("a.txt").display())));
         let files = regular_files(names);
-        let expect = [std::fs::canonicalize(dir.join("a.txt")).unwrap(), std::fs::canonicalize(dir.join("파일 b.bin")).unwrap()];
+        let expect = [a, std::fs::canonicalize(dir.join("파일 b.bin")).unwrap()];
         assert_eq!(files, expect);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_drive_letter_paths_are_opened() {
+        for p in [r"C:\Users\x\a.txt", r"c:\a", r"D:\", r"C:\dir\..\..\b.txt"] {
+            assert!(drive_letter(Path::new(p), false).is_some(), "{p}");
+        }
+        for p in [
+            r"\\server\share\a.txt",
+            r"//server/share/a.txt",
+            r"\\?\UNC\server\share\a.txt",
+            r"\\?\C:\a.txt",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\a.txt",
+            r"\\.\pipe\x",
+            r"\\.\C:\a.txt",
+            r"\??\UNC\server\share\a.txt",
+            r"\a.txt",
+            r"C:a.txt",
+            r"a.txt",
+            "",
+        ] {
+            assert_eq!(drive_letter(Path::new(p), false), None, "{p}");
+        }
+        // Canonical paths are verbatim; only a drive letter may follow.
+        assert_eq!(drive_letter(Path::new(r"\\?\C:\a.txt"), true), Some(b'C'));
+        for p in [r"C:\a.txt", r"\\?\UNC\server\share\a.txt", r"\\?\Volume{0}\a.txt", r"\\?\GLOBALROOT\Device\x"] {
+            assert_eq!(drive_letter(Path::new(p), true), None, "{p}");
+        }
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(drive_letter(&temp, true).is_some_and(local_drive));
+    }
+
+    #[test]
+    fn a_user_host_reads_files_as_itself() {
+        // Tests never run as SYSTEM: no impersonation, and `act` runs on this thread.
+        assert!(!running_as_system());
+        let user = FileUser::get().unwrap();
+        assert!(user.token.is_null());
+        let here = std::thread::current().id();
+        assert_eq!(user.act(|| std::thread::current().id()).unwrap(), here);
     }
 
     #[test]
