@@ -67,11 +67,10 @@ const PING_EVERY: Duration = Duration::from_secs(2);
 const QUIET_WARN_MS: u64 = 6000;
 /// Files from the host are accepted only after asking for them: the first must start
 /// within this time of the click, each next one within this time of progress on the files
-/// accepted for that click. So a host cannot push files nobody asked for.
+/// accepted so far. So a host cannot push files nobody asked for.
 const PULL_WINDOW_MS: u64 = 30_000;
-/// Most files, and longest time, one click on "Get copied files" accepts new files for.
+/// Most files one click on "Get copied files" accepts (the host sends at most this many).
 const PULL_MAX_FILES: u32 = 1000;
-const PULL_MAX_MS: u64 = 60 * 60 * 1000;
 const MAX_DOWNLOADS: usize = 8;
 /// Events waiting for the UI thread beyond which host-driven ones (notices, settings,
 /// toasts) are dropped; notices and settings are merged into a queued one first.
@@ -294,43 +293,53 @@ impl Session {
 }
 
 /// Which files from the host the user asked for. A click on "Get copied files" lets the
-/// first file start within `PULL_WINDOW_MS`; after that only progress on files accepted for
-/// that click keeps the window open (a new file alone never does), for at most
-/// `PULL_MAX_FILES` files and never later than `PULL_MAX_MS` after the click.
+/// first file start within `PULL_WINDOW_MS`; after that only progress on files already
+/// accepted keeps the window open (a new file alone never does), for at most
+/// `PULL_MAX_FILES` files per click. The host sends one batch at a time, so a second click
+/// during a long batch must not cut the first one off.
 #[derive(Default)]
 struct Pull {
     /// Number of the latest click (0: never asked).
     request: u32,
     /// New files are accepted while `now < until`; 0 means nothing was requested.
     until: u64,
-    /// The click's absolute limit for new files.
-    deadline: u64,
     files_left: u32,
+    /// The click for which the user was last told that files came too late.
+    warned: u32,
 }
 
 impl Pull {
     /// The user asked for the host's copied files at session time `now` (ms).
     fn request(&mut self, now: u64) {
         self.request = self.request.wrapping_add(1).max(1);
-        self.until = now + PULL_WINDOW_MS;
-        self.deadline = now + PULL_MAX_MS;
+        self.until = self.until.max(now + PULL_WINDOW_MS);
         self.files_left = PULL_MAX_FILES;
     }
 
     /// The host starts a file: the request it is accepted for, or `None` if nobody asked.
     fn begin(&mut self, now: u64) -> Option<u32> {
-        if self.until == 0 || now >= self.until || now >= self.deadline || self.files_left == 0 {
+        if self.until == 0 || now >= self.until || self.files_left == 0 {
             return None;
         }
         self.files_left -= 1;
         Some(self.request)
     }
 
-    /// Data or the end of a file accepted for `request` arrived: the next file may follow.
-    fn progress(&mut self, request: u32, now: u64) {
-        if request == self.request && self.until != 0 {
-            self.until = self.until.max((now + PULL_WINDOW_MS).min(self.deadline));
+    /// Data or the end of an accepted file arrived: the next file may follow.
+    fn progress(&mut self, now: u64) {
+        if self.until != 0 {
+            self.until = self.until.max(now + PULL_WINDOW_MS);
         }
+    }
+
+    /// A file was refused: whether to tell the user (once per click, and only when they did
+    /// ask at some point, i.e. it came too late rather than unasked).
+    fn tell_refused(&mut self) -> bool {
+        if self.request == 0 || self.warned == self.request {
+            return false;
+        }
+        self.warned = self.request;
+        true
     }
 }
 
@@ -795,8 +804,12 @@ impl Downloads {
             log!("ignored a file from the host: not allowed, or too many transfers at once");
             return;
         }
-        let Some(request) = lock(&s.pull).begin(s.ms()) else {
+        let accepted = lock(&s.pull).begin(s.ms());
+        let Some(request) = accepted else {
             log!("ignored a file the host sent without being asked");
+            if lock(&s.pull).tell_refused() {
+                s.toast(Tone::Warning, tr(Txt::PullExpired).to_string(), tr(Txt::PullExpiredHint).to_string(), None);
+            }
             return;
         };
         // Saved and shown under a name without bidi tricks (`a\u{202e}fdp.exe`).
@@ -811,8 +824,8 @@ impl Downloads {
     }
 
     fn data(&mut self, s: &Session, id: u32, data: &[u8]) {
-        let Some((inc, request)) = self.active.get_mut(&id) else { return };
-        lock(&s.pull).progress(*request, s.ms());
+        let Some((inc, _)) = self.active.get_mut(&id) else { return };
+        lock(&s.pull).progress(s.ms());
         if let Err(e) = inc.write(data) {
             let name = inc.name.clone();
             self.active.remove(&id);
@@ -822,8 +835,8 @@ impl Downloads {
     }
 
     fn end(&mut self, s: &Session, id: u32, sha256: &[u8; 32]) {
-        let Some((inc, request)) = self.active.remove(&id) else { return };
-        lock(&s.pull).progress(request, s.ms());
+        let Some((inc, _)) = self.active.remove(&id) else { return };
+        lock(&s.pull).progress(s.ms());
         let name = inc.name.clone();
         match inc.finish(sha256) {
             Ok(path) => {
@@ -2311,23 +2324,43 @@ mod tests {
     #[test]
     fn files_arrive_only_when_asked() {
         let mut p = Pull::default();
-        // Nothing requested: refused even in the session's first millisecond.
+        // Nothing requested: refused even in the session's first millisecond, and no toast
+        // (nobody asked, so nothing was missed).
         assert_eq!(p.begin(0), None);
         assert_eq!(p.begin(5), None);
-        p.progress(0, 5);
+        p.progress(5);
         assert_eq!(p.begin(6), None);
+        assert!(!p.tell_refused());
         p.request(1000);
-        let r = p.begin(1000 + PULL_WINDOW_MS - 1).expect("first file within the window");
+        p.begin(1000 + PULL_WINDOW_MS - 1).expect("first file within the window");
         // A new file alone never keeps the window open...
         assert_eq!(p.begin(1000 + PULL_WINDOW_MS), None);
-        // ...progress on a file accepted for the click does.
-        p.progress(r, 40_000);
+        // ...progress on an accepted file does.
+        p.progress(40_000);
         assert!(p.begin(40_000 + PULL_WINDOW_MS - 1).is_some());
         assert_eq!(p.begin(40_000 + PULL_WINDOW_MS), None);
-        // Files of an earlier click do not extend a new click's window.
+        // Too late after a request: told once per click.
+        assert!(p.tell_refused() && !p.tell_refused());
         p.request(100_000);
-        p.progress(r, 125_000);
-        assert_eq!(p.begin(100_000 + PULL_WINDOW_MS), None);
+        assert!(p.tell_refused());
+    }
+
+    #[test]
+    fn a_second_click_does_not_cut_off_the_first_batch() {
+        // The host sends one batch at a time and answers a second click with a notice only.
+        let mut p = Pull::default();
+        p.request(0);
+        assert!(p.begin(10).is_some()); // a large file A
+        p.request(20_000); // clicked again while A is still arriving
+        for t in (20_000..200_000).step_by(10_000) {
+            p.progress(t); // A's data keeps coming
+        }
+        assert!(p.begin(200_001).is_some(), "B, the next file of the first batch, was refused");
+        // Long pulls keep going as long as data flows, with no overall time limit.
+        for t in (200_000..10_000_000).step_by(20_000) {
+            p.progress(t);
+        }
+        assert!(p.begin(10_000_001).is_some());
     }
 
     #[test]
@@ -2336,20 +2369,14 @@ mod tests {
         p.request(0);
         for i in 0..PULL_MAX_FILES as u64 {
             assert!(p.begin(i).is_some(), "file {i}");
+            p.progress(i);
         }
         assert_eq!(p.begin(PULL_MAX_FILES as u64), None);
-        // Busy transfers keep the window open, but never past the click's ceiling.
-        let mut p = Pull::default();
-        p.request(0);
-        let r = p.begin(0).unwrap();
-        p.progress(r, PULL_MAX_MS - 10);
-        assert!(p.begin(PULL_MAX_MS - 1).is_some());
-        p.progress(r, PULL_MAX_MS + 5);
-        assert_eq!(p.begin(PULL_MAX_MS), None);
-        assert_eq!(p.begin(PULL_MAX_MS + 6), None);
         // A new click starts a new budget.
-        p.request(PULL_MAX_MS + 10);
-        assert!(p.begin(PULL_MAX_MS + 11).is_some());
+        p.request(2000);
+        assert!(p.begin(2001).is_some());
+        // Without progress the window closes again.
+        assert_eq!(p.begin(2000 + PULL_WINDOW_MS + 5_000), None);
     }
 
     #[test]

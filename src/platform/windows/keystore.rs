@@ -27,14 +27,15 @@ use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetSecurityDescriptorOwner, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetFileSecurityW, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetFileSecurityW, UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL,
 };
-use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
 const ENTROPY: &[u8] = b"safe-rdp/1 psk";
 /// Owner Administrators; SYSTEM and Administrators only, not inherited from the parent.
@@ -185,9 +186,17 @@ struct Access {
     admin_owner: bool,
     /// Every ACE allows access to SYSTEM or Administrators, and nothing else is there.
     admin_aces: bool,
+    /// Somebody other than SYSTEM and Administrators may change, add or delete something
+    /// (reading alone does not count: Explorer's "Continue" grants an admin's account that).
+    others_write: bool,
     /// The ACL does not inherit from the parent.
     protected: bool,
 }
+
+/// Rights that let an account change an object or what is in it, directly or by rewriting its
+/// security: write/append data (add file/subdirectory), write EA or attributes, delete child,
+/// DELETE, WRITE_DAC, WRITE_OWNER, ACCESS_SYSTEM_SECURITY, MAXIMUM_ALLOWED, GENERIC_ALL/WRITE.
+const WRITE_RIGHTS: u32 = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x100_0000 | 0x200_0000 | 0x1000_0000 | 0x4000_0000;
 
 fn access(sd: PSECURITY_DESCRIPTOR) -> Access {
     unsafe {
@@ -198,17 +207,32 @@ fn access(sd: PSECURITY_DESCRIPTOR) -> Access {
         let (mut control, mut revision) = (0u16, 0u32);
         GetSecurityDescriptorControl(sd, &mut control, &mut revision);
         // No DACL at all means full access for everybody.
-        let admin_aces = present != 0
-            && !dacl.is_null()
-            && (0..(*dacl).AceCount as u32).all(|i| {
+        let has_dacl = present != 0 && !dacl.is_null();
+        let (mut admin_aces, mut others_write) = (has_dacl, !has_dacl);
+        if has_dacl {
+            for i in 0..(*dacl).AceCount as u32 {
                 let mut ace: *mut c_void = null_mut();
                 if GetAce(dacl, i, &mut ace) == 0 {
-                    return false;
+                    (admin_aces, others_write) = (false, true);
+                    break;
                 }
+                // Allowed and denied ACEs share this layout; anything else (object or callback
+                // ACEs) is not understood here and treated as the worst case.
                 let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
-                ace.Header.AceType as u32 == ACCESS_ALLOWED_ACE_TYPE && is_admin_sid(&ace.SidStart as *const u32 as PSID)
-            });
-        Access { admin_owner: is_admin_sid(owner), admin_aces, protected: control & SE_DACL_PROTECTED != 0 }
+                let kind = ace.Header.AceType as u32;
+                let admin = is_admin_sid(&ace.SidStart as *const u32 as PSID);
+                if kind != ACCESS_ALLOWED_ACE_TYPE || !admin {
+                    admin_aces = false;
+                }
+                if kind == ACCESS_DENIED_ACE_TYPE {
+                    continue;
+                }
+                if kind != ACCESS_ALLOWED_ACE_TYPE || (!admin && ace.Mask & WRITE_RIGHTS != 0) {
+                    others_write = true;
+                }
+            }
+        }
+        Access { admin_owner: is_admin_sid(owner), admin_aces, others_write, protected: control & SE_DACL_PROTECTED != 0 }
     }
 }
 
@@ -269,7 +293,8 @@ fn entry_facts(path: &Path) -> Result<Facts> {
     facts(&f)
 }
 
-/// Checks that `dir` is a plain directory owned by SYSTEM or Administrators that admits only them.
+/// Checks that `dir` is a plain directory owned by SYSTEM or Administrators that only they can
+/// change (others may at most read, e.g. an admin's account Explorer added).
 fn check_dir(dir: &Path) -> Result<()> {
     let fx = entry_facts(dir)?;
     if !fx.dir || fx.reparse {
@@ -278,13 +303,14 @@ fn check_dir(dir: &Path) -> Result<()> {
     if !fx.access.admin_owner {
         bail!("{} is not owned by SYSTEM or Administrators", dir.display());
     }
-    if !fx.access.protected || !fx.access.admin_aces {
-        bail!("{} admits accounts other than SYSTEM and Administrators", dir.display());
+    if !fx.access.protected || fx.access.others_write {
+        bail!("{} lets accounts other than SYSTEM and Administrators change it", dir.display());
     }
     Ok(())
 }
 
-/// Checks the files the service keeps in `dir`, where present.
+/// Checks the files the service keeps in `dir`, where present. The key admits nobody else at
+/// all; the logs and the upload folder may be readable by others, never changeable.
 fn check_entries(dir: &Path) -> Result<()> {
     for name in SERVICE_FILES {
         let path = dir.join(name);
@@ -296,7 +322,7 @@ fn check_entries(dir: &Path) -> Result<()> {
         if !fx.ours() {
             bail!("{} was not created by SYSTEM or an administrator, or is a link", path.display());
         }
-        if !fx.access.admin_aces {
+        if if name == KEY_FILE { !fx.access.admin_aces } else { fx.access.others_write } {
             bail!("{} admits accounts other than SYSTEM and Administrators", path.display());
         }
     }
@@ -344,10 +370,34 @@ fn purge_foreign(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Gives every entry below `dir` the ACL it inherits from `dir` and nothing else, dropping
+/// explicit grants (such as the one Explorer's "Continue" adds). Run after `purge_foreign`, so
+/// no link is left through which this could reach another file.
+fn reset_to_inherited(dir: &Path) -> Result<()> {
+    let empty = Sd::parse("D:")?;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let fx = entry_facts(&path)?;
+        if !fx.ours() {
+            bail!("{} appeared while the folder was being secured; try again", path.display());
+        }
+        let (w, what) = (wide_path(&path), DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION);
+        let r = unsafe { SetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, what, null_mut(), null_mut(), empty.dacl(), null()) };
+        if r != 0 {
+            bail!("cannot reset permissions on {}: {}", path.display(), std::io::Error::from_raw_os_error(r as i32));
+        }
+        if fx.dir {
+            reset_to_inherited(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Creates `dir` owned by Administrators with the admin-only ACL, or takes over an existing
-/// directory that SYSTEM or Administrators own: the ACL is applied to it and to everything
-/// inside, then whatever SYSTEM or Administrators did not create is removed. A directory owned
-/// by anybody else is refused, since its owner could change its ACL again at any time.
+/// directory that SYSTEM or Administrators own: the ACL is applied to the directory itself,
+/// whatever SYSTEM or Administrators did not create inside (and every link) is removed, and
+/// what remains gets the directory's ACL by inheritance only. A directory owned by anybody else
+/// is refused, since its owner could change its ACL again at any time.
 fn secure_dir(dir: &Path) -> Result<()> {
     let sd = Sd::parse(ADMIN_ONLY_SDDL)?;
     let w = wide_path(dir);
@@ -370,13 +420,12 @@ fn secure_dir(dir: &Path) -> Result<()> {
             dir.display()
         );
     }
-    // Setting the ACL by name also re-applies inheritance to everything inside.
-    let what = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-    let r = unsafe { SetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, what, null_mut(), null_mut(), sd.dacl(), null()) };
-    if r != 0 {
-        bail!("cannot set permissions on {}: {}", dir.display(), std::io::Error::from_raw_os_error(r as i32));
-    }
+    // The directory alone first (SetFileSecurityW does not propagate): from here on nobody else
+    // can add entries. Only after the links are gone does anything inside get touched, so the
+    // new ACL can never be pushed onto a file elsewhere through a hard link.
+    restrict_to_admins(dir)?;
     purge_foreign(dir)?;
+    reset_to_inherited(dir)?;
     drop(pin);
     Ok(())
 }
@@ -455,7 +504,7 @@ mod tests {
 
     #[test]
     fn only_system_and_administrators_count() {
-        let all = Access { admin_owner: true, admin_aces: true, protected: true };
+        let all = Access { admin_owner: true, admin_aces: true, others_write: false, protected: true };
         assert_eq!(sddl_access(ADMIN_ONLY_SDDL), all);
         assert_eq!(sddl_access(KEY_SDDL), all);
         assert_eq!(sddl_access("O:SYD:P(A;OICI;FA;;;SY)"), all);
@@ -473,6 +522,42 @@ mod tests {
         // Deny entries are never ours either; a missing DACL admits everybody.
         assert!(!sddl_access("O:BAD:P(D;;FA;;;BU)(A;;FA;;;BA)").admin_aces);
         assert!(!sddl_access("O:BAD:NO_ACCESS_CONTROL").admin_aces);
+    }
+
+    #[test]
+    fn reading_is_not_changing() {
+        let writes = |sddl: &str| sddl_access(&format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){sddl}")).others_write;
+        assert!(!writes(""));
+        // What Explorer's "Continue" or a backup tool may add: read and execute, read attributes.
+        assert!(!writes("(A;OICI;0x1200a9;;;S-1-5-21-1-2-3-1001)"));
+        assert!(!writes("(A;;0x80;;;AU)"));
+        assert!(!writes("(D;;FA;;;BU)"), "a deny entry grants nothing");
+        // Anything that can add, change, delete or re-permission is still refused.
+        for grant in ["(A;CI;0x2;;;BU)", "(A;;0x4;;;BU)", "(A;;0x40;;;BU)", "(A;;SD;;;BU)", "(A;;WD;;;BU)", "(A;;WO;;;BU)", "(A;;GW;;;BU)"] {
+            assert!(writes(grant), "{grant}");
+        }
+        assert!(writes("(A;;FA;;;CO)") && writes("(A;OICIIO;FA;;;BU)"), "inherit-only grants count too");
+        assert!(sddl_access("O:BAD:NO_ACCESS_CONTROL").others_write);
+    }
+
+    #[test]
+    fn securing_drops_explicit_grants_inside() {
+        // Needs an elevated run: ordinary users cannot own what `secure_dir` accepts.
+        let t = TempDir::new("reset");
+        if !running_elevated(&t) {
+            eprintln!("not elevated; skipped");
+            return;
+        }
+        let incoming = t.0.join("incoming");
+        std::fs::create_dir(&incoming).unwrap();
+        let read = Sd::parse("D:(A;OICI;0x1200a9;;;BU)").unwrap();
+        let (w, what) = (wide_path(&incoming), DACL_SECURITY_INFORMATION);
+        assert_eq!(unsafe { SetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, what, null_mut(), null_mut(), read.dacl(), null()) }, 0);
+        secure_dir(&t.0).unwrap();
+        let a = entry_facts(&incoming).unwrap().access;
+        assert!(a.admin_aces && !a.protected, "{a:?}");
+        check_dir(&t.0).unwrap();
+        check_entries(&t.0).unwrap();
     }
 
     fn running_elevated(t: &TempDir) -> bool {
@@ -547,7 +632,7 @@ mod tests {
 
     /// `fx` as if SYSTEM or Administrators had created it, which needs no elevation to test.
     fn admin_owned(fx: Facts) -> Facts {
-        Facts { access: Access { admin_owner: true, admin_aces: true, protected: true }, ..fx }
+        Facts { access: Access { admin_owner: true, admin_aces: true, others_write: false, protected: true }, ..fx }
     }
 
     #[test]

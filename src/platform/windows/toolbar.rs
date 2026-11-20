@@ -125,6 +125,9 @@ texts! {
     SavedOnHost => "Saved on the host: {}", "호스트 저장 위치: {}";
     SendFailed => "Could not send {}", "{} 파일을 보내지 못했습니다";
     ReceiveFailed => "Could not receive {}", "{} 파일을 받지 못했습니다";
+    PullExpired => "Some copied files were not received", "복사한 파일 일부를 받지 못했습니다";
+    PullExpiredHint => "They arrived after the request had expired. Click Get copied files again.",
+        "요청 시간이 지난 뒤에 도착했습니다. '복사한 파일 받기'를 다시 누르세요.";
     Interrupted => "The connection dropped during the transfer.", "전송 중에 연결이 끊어졌습니다.";
     FoldersNotSupported => "Folders cannot be sent", "폴더는 보낼 수 없습니다";
     RequestedFiles => "Asked the host for its copied files", "호스트에 복사된 파일을 요청했습니다";

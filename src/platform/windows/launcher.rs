@@ -3227,7 +3227,7 @@ impl App {
             st.svc = match r.as_deref() {
                 Ok("not installed") => Svc::NotInstalled,
                 Ok("running") => Svc::Running,
-                Ok("stopped") => Svc::Stopped,
+                Ok(s) if s.starts_with("stopped") => Svc::Stopped,
                 Ok("starting" | "stopping") => Svc::Changing,
                 _ => Svc::Unknown,
             };

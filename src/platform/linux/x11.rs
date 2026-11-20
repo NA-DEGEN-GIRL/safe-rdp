@@ -828,9 +828,9 @@ fn connect_checked(addr: &std::os::unix::net::SocketAddr, pid: u32, what: &str) 
 
 /// Connects to local display `number` through its socket file, else its abstract name, and
 /// checks who serves it before anything is sent: X server process `pinned` when given, else a
-/// server run by root or by `euid`. A server failing the check is never passed over for the
-/// other name.
-fn connect_local(number: u32, pinned: Option<u32>, euid: u32) -> Result<UnixStream> {
+/// server run by root or by one of the `trusted` users. A server failing the check is never
+/// passed over for the other name.
+fn connect_local(number: u32, pinned: Option<u32>, trusted: &[u32]) -> Result<UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::SocketAddr;
     if pinned == Some(RETIRED) {
@@ -851,7 +851,9 @@ fn connect_local(number: u32, pinned: Option<u32>, euid: u32) -> Result<UnixStre
             Some(pid) if !is_process(&peer, pid) => {
                 bail!("X display :{number} is served by another process (pid {}) than its virtual display", peer.pid)
             }
-            None if peer.uid != 0 && peer.uid != euid => bail!("X display :{number} is served by another user (uid {})", peer.uid),
+            None if peer.uid != 0 && !trusted.contains(&peer.uid) => {
+                bail!("X display :{number} is served by another user (uid {})", peer.uid)
+            }
             _ => return Ok(s),
         }
     }
@@ -859,9 +861,19 @@ fn connect_local(number: u32, pinned: Option<u32>, euid: u32) -> Result<UnixStre
     bail!("cannot connect to X display :{number}: {why}")
 }
 
-fn connect_socket(name: &DisplayName, pinned: Option<u32>) -> Result<(Sock, u16, Vec<u8>)> {
+/// The owner of the Xauthority file we would authenticate with, if only they can change it:
+/// the user whose X server we mean to reach (a host run as root on a user's rootless Xorg).
+fn auth_owner(target: &Target) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(target.auth_file()?).ok()?;
+    (m.is_file() && m.mode() & 0o022 == 0).then_some(m.uid())
+}
+
+fn connect_socket(name: &DisplayName, pinned: Option<u32>, auth_owner: Option<u32>) -> Result<(Sock, u16, Vec<u8>)> {
     if name.host.is_empty() {
-        let sock = connect_local(name.number, pinned, unsafe { geteuid() })?;
+        let euid = unsafe { geteuid() };
+        let trusted: Vec<u32> = std::iter::once(euid).chain(auth_owner).collect();
+        let sock = connect_local(name.number, pinned, &trusted)?;
         return Ok((Sock::Unix(sock), FAMILY_LOCAL, super::hostname().into_bytes()));
     }
     if pinned.is_some() {
@@ -899,7 +911,7 @@ impl Conn {
     /// Connects to `target`, authenticating with its MIT-MAGIC-COOKIE-1 when there is one.
     pub fn connect(target: &Target) -> Result<Conn> {
         let name = parse_display(&target.display)?;
-        let (sock, family, address) = connect_socket(&name, pinned_server())?;
+        let (sock, family, address) = connect_socket(&name, pinned_server(), auth_owner(target))?;
         Conn::handshake(sock, family, &address, &name, target)
     }
 
@@ -1903,6 +1915,20 @@ mod tests {
         assert!(Conn::connect_to_server(&tcp, me).err().expect("TCP display").to_string().contains("not a local display"));
     }
 
+    #[test]
+    fn the_cookie_files_owner_is_trusted_only_if_nobody_else_can_change_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("srdp-xauth-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let target = Target { display: ":0".into(), xauthority: Some(path.clone()) };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(auth_owner(&target), Some(unsafe { geteuid() }));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(auth_owner(&target), None, "a world-writable cookie file vouches for nobody");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(auth_owner(&target), None);
+    }
+
     /// Every local connection checks who serves the display before sending anything, also
     /// when only the abstract name is left (as after the server we trusted died).
     #[test]
@@ -1916,13 +1942,13 @@ mod tests {
         let abs = SocketAddr::from_abstract_name(local_socket_path(n).as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&abs).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let err = connect_local(n, Some(me + 1), euid).err().expect("accepted a server other than the pinned one");
+        let err = connect_local(n, Some(me + 1), &[euid]).err().expect("accepted a server other than the pinned one");
         assert!(err.to_string().contains("another process"), "{err}");
         if euid != 0 {
-            let err = connect_local(n, None, euid + 1).err().expect("accepted another user's server");
+            let err = connect_local(n, None, &[euid + 1]).err().expect("accepted another user's server");
             assert!(err.to_string().contains("another user"), "{err}");
         }
-        assert!(connect_local(n, Some(RETIRED), euid).is_err());
+        assert!(connect_local(n, Some(RETIRED), &[euid]).is_err());
         let mut sent = 0;
         while let Ok((mut s, _)) = listener.accept() {
             s.set_nonblocking(false).unwrap();
@@ -1930,14 +1956,16 @@ mod tests {
             sent += s.read(&mut b).unwrap();
         }
         assert_eq!(sent, 0, "bytes were sent");
-        assert!(connect_local(n, Some(me), euid).is_ok());
-        assert!(connect_local(n, None, euid).is_ok());
+        assert!(connect_local(n, Some(me), &[euid]).is_ok());
+        assert!(connect_local(n, None, &[euid]).is_ok());
+        // The owner of the cookie file we use is trusted as well (a root host on a user's Xorg).
+        assert!(connect_local(n, None, &[euid + 1, euid]).is_ok());
         drop(listener);
-        let err = when_closed(|| connect_local(n, Some(me), euid));
+        let err = when_closed(|| connect_local(n, Some(me), &[euid]));
         assert!(err.to_string().contains("cannot connect"), "{err}");
 
         let tcp = parse_display("localhost:1").unwrap();
-        let err = connect_socket(&tcp, Some(me)).err().expect("left the pinned server");
+        let err = connect_socket(&tcp, Some(me), None).err().expect("left the pinned server");
         assert!(err.to_string().contains("only the virtual display"), "{err}");
     }
 

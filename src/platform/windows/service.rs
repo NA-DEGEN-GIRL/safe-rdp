@@ -631,14 +631,29 @@ pub fn status() -> Result<String> {
             return Err(Error::last_os("QueryServiceStatus"));
         }
         Ok(match st.dwCurrentState {
-            SERVICE_RUNNING => "running",
-            SERVICE_STOPPED => "stopped",
-            SERVICE_START_PENDING => "starting",
-            SERVICE_STOP_PENDING => "stopping",
-            _ => "unknown",
-        }
-        .into())
+            SERVICE_RUNNING => "running".into(),
+            // The service could not log why (it only logs into a folder it trusts): say it here.
+            SERVICE_STOPPED if st.dwWin32ExitCode == ERROR_ACCESS_DENIED => refused_folder(),
+            SERVICE_STOPPED => "stopped".into(),
+            SERVICE_START_PENDING => "starting".into(),
+            SERVICE_STOP_PENDING => "stopping".into(),
+            _ => "unknown".into(),
+        })
     }
+}
+
+fn refused_folder() -> String {
+    let dir = keystore::service_dir();
+    let detail = match keystore::check_service_dir() {
+        // Unreadable without elevation; anything else is the actual reason.
+        Err(e) if !e.to_string().starts_with("cannot open") => format!(" ({e})"),
+        _ => String::new(),
+    };
+    format!(
+        "stopped: it refused to use {} because its permissions changed{detail}; \
+         run `safe-rdp service install` again from an elevated terminal",
+        dir.display()
+    )
 }
 
 #[cfg(test)]

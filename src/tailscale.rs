@@ -147,7 +147,19 @@ impl fmt::Display for Problem {
 
 /// System directories the Tailscale packages install the CLI into.
 #[cfg(not(windows))]
-const CLI_DIRS: [&str; 7] = ["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin", "/opt/tailscale"];
+/// Directories only root can write to; the last three are snap (Ubuntu, then Fedora/Arch) and NixOS.
+const CLI_DIRS: [&str; 10] = [
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/bin",
+    "/sbin",
+    "/opt/tailscale",
+    "/snap/bin",
+    "/var/lib/snapd/snap/bin",
+    "/run/current-system/sw/bin",
+];
 
 /// Where the CLI may be: the standard install locations only, never `PATH`.
 fn cli_candidates() -> Vec<PathBuf> {
