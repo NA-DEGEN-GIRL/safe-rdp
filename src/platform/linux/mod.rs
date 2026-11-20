@@ -5,10 +5,13 @@ pub mod capture;
 pub mod clipboard;
 pub mod desktop;
 pub mod input;
+mod keymap;
 pub mod keystore;
 pub mod mem;
 pub mod privacy;
 pub mod viewer;
+mod x11;
+pub mod xvfb;
 
 mod libc {
     use std::ffi::{c_char, c_int, c_long};
