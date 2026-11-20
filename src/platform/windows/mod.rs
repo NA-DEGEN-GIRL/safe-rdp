@@ -7,6 +7,7 @@ pub mod desktop;
 mod dxgi;
 pub mod input;
 pub mod keystore;
+pub mod launcher;
 pub mod mem;
 pub mod privacy;
 pub mod service;
