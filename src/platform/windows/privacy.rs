@@ -7,10 +7,13 @@
 //!   sees the desktop beneath them. They follow monitor changes and re-assert their topmost
 //!   position a few times per second.
 //! * Low-level keyboard and mouse hooks swallow every event that our `input::Injector` did not
-//!   send (an injected event whose `dwExtraInfo` is `input::inject_tag()`, random per process):
-//!   physical input as well as input synthesised by other programs. Windows silently drops a
-//!   low-level hook that once misses its time limit, so the hooks are re-installed every few
-//!   seconds.
+//!   send: physical input as well as input synthesised by other programs. The injector gives
+//!   each event a fresh random `dwExtraInfo` tag (`input::new_tag`), and a tag lets one injected
+//!   event through, once. Hooks that run after ours and the window that receives the event only
+//!   ever see used tags. A program whose own low-level hook runs before ours (Windows calls the
+//!   most recently installed first) can still see our events and swallow one to replay its tag
+//!   with input of its own. Windows silently drops a low-level hook that once misses its time
+//!   limit, so the hooks are re-installed every few seconds.
 //!
 //! Everything lives on one thread with its own message loop. Dropping `Privacy` removes the
 //! hooks and windows before it returns; if the thread or the process dies, Windows removes
@@ -30,7 +33,7 @@
 //! running as SYSTEM, has no such gap. Needs Windows 10 version 2004 (build 19041) or later for
 //! `WDA_EXCLUDEFROMCAPTURE`.
 
-use super::input::inject_tag;
+use super::input::take_tag;
 use crate::bail;
 use crate::screen::Area;
 use crate::util::{Error, Result, wide};
@@ -330,8 +333,6 @@ struct Hooks {
 
 impl Hooks {
     fn install() -> Result<Hooks> {
-        // Pick the tag now rather than inside the first hook call.
-        inject_tag();
         unsafe {
             let module = GetModuleHandleW(null());
             let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
@@ -358,9 +359,10 @@ impl Drop for Hooks {
     }
 }
 
-/// Whether an input event may pass while privacy mode is on: only what our injector sent.
+/// Whether an input event may pass while privacy mode is on: only what our injector sent, and
+/// each of its events once.
 fn passes(injected: bool, extra_info: usize) -> bool {
-    injected && extra_info == inject_tag()
+    injected && take_tag(extra_info)
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -509,21 +511,26 @@ fn paint(hwnd: HWND) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::input::new_tag;
     use super::*;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
     #[test]
-    fn only_our_injected_events_pass() {
-        let tag = inject_tag();
-        assert!(passes(true, tag));
+    fn only_our_injected_events_pass_and_each_once() {
+        let tag = new_tag();
         assert!(!passes(false, tag)); // a device driver claiming our tag is still physical
+        assert!(passes(true, tag));
+        assert!(!passes(true, tag), "a replayed tag passed");
+        let next = new_tag();
+        assert_ne!(next, tag);
         assert!(!passes(true, 0));
-        assert!(!passes(true, tag + 1));
-        assert!(!passes(true, tag ^ (1 << 40)));
+        assert!(!passes(true, next ^ 2));
+        assert!(!passes(true, next ^ (1 << 40)));
         assert!(!passes(true, 0x5344_5250)); // the fixed tag of earlier versions
         assert!(!passes(false, 0));
+        assert!(passes(true, next));
     }
 
     #[test]
@@ -614,13 +621,16 @@ mod tests {
     }
 
     static SEEN: Mutex<Vec<(bool, usize)>> = Mutex::new(Vec::new());
-    /// A tag some other program might use.
-    fn foreign() -> usize {
-        inject_tag() ^ 0x5a5a
+    /// Tags of the test's own events, ours or not.
+    static SENT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// Tags some other program might use.
+    fn foreign() -> [usize; 2] {
+        [new_tag() ^ 0x5a5a, new_tag() ^ 0x5a5a]
     }
 
     fn ours_or_foreign(tag: usize) -> bool {
-        tag == inject_tag() || tag == foreign()
+        SENT.lock().unwrap().contains(&tag)
     }
 
     /// Records our test events (keyboard?, tag) and swallows them so no application sees them.
@@ -646,18 +656,24 @@ mod tests {
         }
     }
 
-    fn inject(tag: usize, keyboard: bool) {
-        let key = |flags| INPUT {
+    /// Presses and releases F24, or nudges the mouse, with these two tags.
+    fn inject(tags: [usize; 2], keyboard: bool) {
+        SENT.lock().unwrap().extend(tags);
+        let key = |flags, tag| INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_F24, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: tag } },
         };
         // One pixel right and back (Windows drops moves by zero). The watcher swallows both, so
         // the pointer does not actually move.
-        let nudge = |dx| INPUT {
+        let nudge = |dx, tag| INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: tag } },
         };
-        let inputs = if keyboard { vec![key(0), key(KEYEVENTF_KEYUP)] } else { vec![nudge(1), nudge(-1)] };
+        let inputs = if keyboard {
+            [key(0, tags[0]), key(KEYEVENTF_KEYUP, tags[1])]
+        } else {
+            [nudge(1, tags[0]), nudge(-1, tags[1])]
+        };
         unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
     }
 
@@ -695,16 +711,20 @@ mod tests {
             PostThreadMessageW(p.thread_id, WM_QUIT, 0, 0);
             PostThreadMessageW(p.thread_id, WM_APP_STOP, 0, 0);
             pump(20);
-            let (ours, foreign) = (inject_tag(), foreign());
-            for tag in [foreign, ours] {
-                inject(tag, true);
-                inject(tag, false);
-            }
+            let (keys, moves) = ([new_tag(), new_tag()], [new_tag(), new_tag()]);
+            inject(foreign(), true);
+            inject(foreign(), false);
+            inject(keys, true);
+            inject(moves, false);
+            // Somebody who saw them sends their tags again.
+            inject(keys, true);
+            inject(moves, false);
             pump(150);
             let during = std::mem::take(&mut *SEEN.lock().unwrap());
             drop(p);
-            inject(foreign, true);
-            inject(foreign, false);
+            let (fk, fm) = (foreign(), foreign());
+            inject(fk, true);
+            inject(fm, false);
             pump(100);
             let after = std::mem::take(&mut *SEEN.lock().unwrap());
             UnhookWindowsHookEx(ms);
@@ -714,8 +734,8 @@ mod tests {
             if (now.x, now.y) != (cursor.x, cursor.y) {
                 SetCursorPos(cursor.x, cursor.y);
             }
-            assert_eq!(during, [(true, ours), (true, ours), (false, ours), (false, ours)]);
-            assert_eq!(after, [(true, foreign), (true, foreign), (false, foreign), (false, foreign)]);
+            assert_eq!(during, [(true, keys[0]), (true, keys[1]), (false, moves[0]), (false, moves[1])]);
+            assert_eq!(after, [(true, fk[0]), (true, fk[1]), (false, fm[0]), (false, fm[1])]);
         }
     }
 }
