@@ -254,6 +254,29 @@ impl Encoder {
     }
 }
 
+/// Box-filters `src` (BGRA, `w*h`) down by `d` into `dst` (`(w/d)*(h/d)*4` bytes).
+pub fn downscale(src: &[u8], w: usize, h: usize, d: usize, dst: &mut [u8]) {
+    let (dw, dh) = (w / d, h / d);
+    assert_eq!(dst.len(), dw * dh * 4);
+    let n = (d * d) as u32;
+    for (y, out_row) in dst.chunks_exact_mut(dw * 4).enumerate() {
+        let mut acc = vec![[0u32; 3]; dw];
+        for sy in y * d..y * d + d {
+            let row = &src[sy * w * 4..(sy * w + dw * d) * 4];
+            for (x, a) in acc.iter_mut().enumerate() {
+                for px in row[x * d * 4..(x + 1) * d * 4].chunks_exact(4) {
+                    a[0] += px[0] as u32;
+                    a[1] += px[1] as u32;
+                    a[2] += px[2] as u32;
+                }
+            }
+        }
+        for (px, a) in out_row.chunks_exact_mut(4).zip(&acc) {
+            px.copy_from_slice(&[((a[0] + n / 2) / n) as u8, ((a[1] + n / 2) / n) as u8, ((a[2] + n / 2) / n) as u8, 255]);
+        }
+    }
+}
+
 /// Packs encoded rects into one or more complete `S_TILES` messages (type byte included).
 pub fn pack(frame: u32, width: usize, height: usize, rects: &[EncodedRect]) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
@@ -478,6 +501,16 @@ mod tests {
             dec.apply(&m[1..], &mut fb, w, h).unwrap();
         }
         assert!(fb == expect);
+    }
+
+    #[test]
+    fn downscale_box_filter() {
+        // 5x2 -> 2x1 with d=2 (odd column dropped)
+        let px = |v: u8| [v, v, v, 0];
+        let src: Vec<u8> = [10, 20, 30, 40, 99, 30, 40, 50, 60, 99].iter().flat_map(|&v| px(v)).collect();
+        let mut dst = vec![0u8; 2 * 4];
+        downscale(&src, 5, 2, 2, &mut dst);
+        assert_eq!(dst, [25, 25, 25, 255, 45, 45, 45, 255]);
     }
 
     #[test]

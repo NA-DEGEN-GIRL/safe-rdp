@@ -15,6 +15,7 @@ pub const S_PING: u8 = 0x05;
 pub const S_NOTICE: u8 = 0x06;
 
 // Client -> server
+pub const C_HELLO: u8 = 0x80;
 pub const C_ACK: u8 = 0x81;
 pub const C_MOUSE_MOVE: u8 = 0x82;
 pub const C_MOUSE_BUTTON: u8 = 0x83;
@@ -88,6 +89,8 @@ impl Cursor {
 
 #[derive(Debug, PartialEq)]
 pub enum ClientMsg {
+    /// First message of a session. downscale = N asks the host to send 1/N resolution.
+    Hello { downscale: u8 },
     Ack(u32),
     MouseMove { x: u16, y: u16 },
     MouseButton { button: u8, down: bool },
@@ -150,6 +153,7 @@ fn text(b: &[u8]) -> Result<String> {
 impl ClientMsg {
     pub fn encode(&self, o: &mut Vec<u8>) {
         match self {
+            ClientMsg::Hello { downscale } => o.extend_from_slice(&[C_HELLO, *downscale]),
             ClientMsg::Ack(id) => {
                 o.push(C_ACK);
                 o.extend_from_slice(&id.to_le_bytes());
@@ -185,6 +189,7 @@ impl ClientMsg {
     pub fn decode(b: &[u8]) -> Result<ClientMsg> {
         let mut r = Rd(b);
         let m = match r.u8()? {
+            C_HELLO => ClientMsg::Hello { downscale: r.u8()? },
             C_ACK => ClientMsg::Ack(r.u32()?),
             C_MOUSE_MOVE => ClientMsg::MouseMove { x: r.u16()?, y: r.u16()? },
             C_MOUSE_BUTTON => ClientMsg::MouseButton { button: r.u8()?, down: r.u8()? != 0 },
@@ -251,6 +256,7 @@ mod tests {
     #[test]
     fn client_roundtrip() {
         let msgs = [
+            ClientMsg::Hello { downscale: 2 },
             ClientMsg::Ack(7),
             ClientMsg::MouseMove { x: 1919, y: 1079 },
             ClientMsg::MouseButton { button: BTN_X2, down: true },

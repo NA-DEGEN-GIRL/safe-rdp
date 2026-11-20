@@ -57,6 +57,7 @@ VIEWER OPTIONS:
   --clipboard              Share text clipboard (host must allow it)
   --view-only              Do not send keyboard or mouse input
   --allow-capture          Let local screenshot/recording tools capture the viewer window
+  --downscale <2|3|4>      Ask the host for 1/N resolution (e.g. 4K host on a laptop or slow link)
   --key-file <path>        Read the key from a text file
 
 Hotkeys in the viewer: Ctrl+Alt+Enter full screen, Ctrl+Alt+End sends Ctrl+Alt+Del.
@@ -206,7 +207,7 @@ fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
 fn connect(args: &[String]) -> Result<()> {
     let mut target = None;
     let mut key_file = None;
-    let mut o = client::ViewerOptions { fullscreen: false, clipboard: false, view_only: false, allow_capture: false };
+    let mut o = client::ViewerOptions { fullscreen: false, clipboard: false, view_only: false, allow_capture: false, downscale: 1 };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -214,6 +215,7 @@ fn connect(args: &[String]) -> Result<()> {
             "--clipboard" => o.clipboard = true,
             "--view-only" => o.view_only = true,
             "--allow-capture" => o.allow_capture = true,
+            "--downscale" => o.downscale = next(&mut it, a)?.parse().ok().filter(|d| (1..=4).contains(d)).ok_or("--downscale expects 1-4")?,
             "--key-file" => key_file = Some(next(&mut it, a)?.to_string()),
             s if s.starts_with("--") => bail!("unknown viewer option '{s}'"),
             s if target.is_none() => target = Some(s.to_string()),
@@ -223,7 +225,25 @@ fn connect(args: &[String]) -> Result<()> {
     let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
     let key = load_key(key_file.as_deref())?;
     dpi_aware();
-    client::run(&target, o, key)
+    // Started from a shortcut or Explorer: the console exists only for us, so hide it and
+    // report errors in a message box instead.
+    let own_console = unsafe {
+        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+        let mut pids = [0u32; 4];
+        let own = GetConsoleProcessList(pids.as_mut_ptr(), 4) == 1;
+        if own {
+            FreeConsole();
+        }
+        own
+    };
+    let r = client::run(&target, o, key);
+    // Errors after the window appeared were already shown by the viewer itself.
+    if let (true, false, Err(e)) = (own_console, client::window_shown(), &r) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        let (text, title) = (util::wide(&e.to_string()), util::wide("safe-rdp"));
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_ICONERROR | MB_OK) };
+    }
+    r
 }
 
 fn read_secret(prompt: &str) -> Result<String> {

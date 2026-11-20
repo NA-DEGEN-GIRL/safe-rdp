@@ -30,6 +30,8 @@ pub struct ViewerOptions {
     pub view_only: bool,
     /// Allow local screenshot/recording tools to capture the viewer window.
     pub allow_capture: bool,
+    /// Ask the host for 1/N resolution (1 = full).
+    pub downscale: u8,
 }
 
 const WM_APP_FRAME: u32 = WM_APP + 1;
@@ -74,6 +76,11 @@ struct App {
 unsafe impl Send for Saved {}
 
 static APP: OnceLock<App> = OnceLock::new();
+
+/// True once the viewer window exists (later errors are reported in the window).
+pub fn window_shown() -> bool {
+    APP.get().is_some_and(|a| a.hwnd.load(Ordering::SeqCst) != 0)
+}
 
 impl App {
     fn hwnd(&self) -> HWND {
@@ -132,6 +139,9 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
 
     let mut reader = RecordReader::new(stream.try_clone()?, keys.recv);
     let mut writer = RecordWriter::new(stream.try_clone()?, keys.send);
+    let mut hello = Vec::new();
+    ClientMsg::Hello { downscale: opts.downscale }.encode(&mut hello);
+    writer.send(&hello)?;
     let (w, h, flags) = match ServerMsg::decode(reader.recv()?)? {
         ServerMsg::Hello { width, height, flags } => (width as usize, height as usize, flags),
         _ => bail!("unexpected first message from host"),

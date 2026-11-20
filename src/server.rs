@@ -6,6 +6,7 @@ use crate::clipboard::Clipboard;
 use crate::codec::{self, Encoder};
 use crate::desktop::DesktopFollower;
 use crate::input::Injector;
+use crate::mem::LockedBuf;
 use crate::net::{self, PeerPolicy};
 use crate::proto::*;
 use crate::util::{Result, Secret};
@@ -170,14 +171,20 @@ struct Shared {
     last_input_ms: AtomicU64,
     area: Mutex<Area>,
     start: Instant,
+    /// The viewer asked for 1/downscale resolution.
+    downscale: usize,
 }
 
 fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: &Arc<SessionCtl>) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let writer: Writer = Arc::new(Mutex::new(RecordWriter::new(stream.try_clone()?, keys.send)));
-    let reader = RecordReader::new(stream, keys.recv);
+    let mut reader = RecordReader::new(stream, keys.recv);
     let opts = &host.opts;
+    let downscale = match ClientMsg::decode(reader.recv()?)? {
+        ClientMsg::Hello { downscale } => downscale.clamp(1, 4) as usize,
+        _ => bail!("protocol error: viewer did not start with a hello"),
+    };
 
     let area = capture::resolve(opts.monitor).ok_or("selected monitor not found")?;
     let mut flags = 0;
@@ -190,7 +197,8 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
     if opts.sas {
         flags |= F_SAS;
     }
-    send(&writer, &ServerMsg::Hello { width: area.width as u16, height: area.height as u16, flags })?;
+    let (w, h) = (area.width as usize / downscale, area.height as usize / downscale);
+    send(&writer, &ServerMsg::Hello { width: w as u16, height: h as u16, flags })?;
 
     let shared = Arc::new(Shared {
         acked: AtomicU32::new(0),
@@ -198,6 +206,7 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
         last_input_ms: AtomicU64::new(0),
         area: Mutex::new(area),
         start: Instant::now(),
+        downscale,
     });
 
     let clip = if opts.clipboard {
@@ -248,18 +257,18 @@ fn input_loop(
         match m {
             ClientMsg::Ack(id) => shared.acked.store(id, Ordering::SeqCst),
             ClientMsg::Refresh => shared.refresh.store(true, Ordering::SeqCst),
-            ClientMsg::Ping => {}
+            ClientMsg::Ping | ClientMsg::Hello { .. } => {}
             ClientMsg::Clipboard(text) => {
                 if let Some(c) = clip {
                     c.set(text);
                 }
             }
-            ClientMsg::Sas => {
-                if view_only {
-                } else if !sas || !crate::service::request_sas() {
+            ClientMsg::Sas if !view_only => {
+                if !sas || !crate::service::request_sas() {
                     log!("Ctrl+Alt+Del requested but SAS forwarding is unavailable (run as service with --enable-sas)");
                 }
             }
+            ClientMsg::Sas => {}
             ClientMsg::MouseMove { .. }
             | ClientMsg::MouseButton { .. }
             | ClientMsg::Wheel { .. }
@@ -273,6 +282,15 @@ fn input_loop(
                     last_sync = Instant::now();
                 }
                 inj.set_area(*shared.area.lock().unwrap());
+                let d = shared.downscale as u32;
+                let m = match m {
+                    // Aim at the centre of the d*d block the viewer pointed at.
+                    ClientMsg::MouseMove { x, y } if d > 1 => ClientMsg::MouseMove {
+                        x: (x as u32 * d + d / 2).min(u16::MAX as u32) as u16,
+                        y: (y as u32 * d + d / 2).min(u16::MAX as u32) as u16,
+                    },
+                    m => m,
+                };
                 inj.handle(&m);
                 shared.last_input_ms.store(shared.start.elapsed().as_millis() as u64, Ordering::SeqCst);
             }
@@ -293,6 +311,7 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
     let mut last_change = Instant::now();
     let mut last_send = Instant::now();
     let mut capture_failures = 0u32;
+    let mut scaled = LockedBuf::new(0);
     let mut last_dxgi_try = Instant::now();
     let multi_all = opts.monitor == MonitorSel::All && capture::monitors().len() > 1;
 
@@ -369,8 +388,19 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
                 }
                 if changed || refresh {
                     let area = cap.area();
-                    let (w, h) = (area.width as usize, area.height as usize);
-                    let rects = encoder.encode(cap.pixels(), w, h);
+                    let (mut w, mut h) = (area.width as usize, area.height as usize);
+                    let d = shared.downscale;
+                    let rects = if d > 1 {
+                        let (sw, sh) = (w / d, h / d);
+                        if scaled.len() != sw * sh * 4 {
+                            scaled = LockedBuf::new(sw * sh * 4);
+                        }
+                        codec::downscale(cap.pixels(), w, h, d, scaled.as_mut_slice());
+                        (w, h) = (sw, sh);
+                        encoder.encode(scaled.as_slice(), w, h)
+                    } else {
+                        encoder.encode(cap.pixels(), w, h)
+                    };
                     if !rects.is_empty() {
                         frame = frame.wrapping_add(1);
                         for msg in codec::pack(frame, w, h, &rects) {
