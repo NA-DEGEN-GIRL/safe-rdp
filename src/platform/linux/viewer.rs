@@ -9,6 +9,7 @@ use super::clipboard::Clipboard;
 use super::keymap::{self, KEY_END, KEY_ENTER, KEY_KPENTER, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, X_KEYCODE_OFFSET};
 use super::mem::LockedBuf;
 use super::x11::{self, Conn, Event, Ext, ShmSegment, Target, Wake, Waker};
+use crate::audio::AudioReceiver;
 use crate::channel::{self, RecordReader};
 use crate::codec::{self, Decoder, Rect};
 use crate::log;
@@ -104,8 +105,32 @@ fn union(a: Option<Rect>, b: Rect) -> Rect {
     }
 }
 
+/// Plays the host's sound (when it was asked for). Problems are reported once and never end
+/// the session.
+#[derive(Default)]
+struct Sound {
+    rx: AudioReceiver,
+    warned: bool,
+}
+
+impl Sound {
+    fn play(&mut self, rate: u32, channels: u8, codec: u8, data: &[u8]) {
+        if let Err(e) = self.rx.play(rate, channels, codec, data) {
+            if !std::mem::replace(&mut self.warned, true) {
+                log!("cannot play the host's sound: {e}");
+            }
+        }
+    }
+}
+
 /// Applies one message from the host; returns the acknowledgement to send, if any.
-fn on_server_msg(shared: &Shared, dec: &mut Decoder, msg: ServerMsg, clip: Option<&Clipboard>) -> Result<Option<ClientMsg>> {
+fn on_server_msg(
+    shared: &Shared,
+    dec: &mut Decoder,
+    msg: ServerMsg,
+    clip: Option<&Clipboard>,
+    sound: Option<&mut Sound>,
+) -> Result<Option<ClientMsg>> {
     match msg {
         ServerMsg::Tiles(p) => {
             let hdr = codec::parse_header(p)?;
@@ -138,16 +163,32 @@ fn on_server_msg(shared: &Shared, dec: &mut Decoder, msg: ServerMsg, clip: Optio
             }
         }
         ServerMsg::Notice(t) => log!("host: {}", t.chars().filter(|c| !c.is_control()).collect::<String>()),
+        ServerMsg::Audio { rate, channels, codec, data, .. } => {
+            if let Some(s) = sound {
+                s.play(rate, channels, codec, data);
+            }
+        }
+        ServerMsg::State { key, value: STATE_UNAVAILABLE } => match key {
+            SET_AUDIO => log!("the host does not share its sound"),
+            SET_PRIVACY => log!("the host does not offer privacy mode"),
+            _ => {}
+        },
         _ => {}
     }
     Ok(None)
 }
 
-fn net_loop(reader: &mut RecordReader<TcpStream>, shared: &Shared, out: &mpsc::Sender<ClientMsg>, clip: Option<&Clipboard>) -> Result<()> {
+fn net_loop(
+    reader: &mut RecordReader<TcpStream>,
+    shared: &Shared,
+    out: &mpsc::Sender<ClientMsg>,
+    clip: Option<&Clipboard>,
+    mut sound: Option<Sound>,
+) -> Result<()> {
     let mut dec = Decoder::new()?;
     loop {
         let rec = reader.recv()?;
-        if let Some(reply) = on_server_msg(shared, &mut dec, ServerMsg::decode(rec)?, clip)? {
+        if let Some(reply) = on_server_msg(shared, &mut dec, ServerMsg::decode(rec)?, clip, sound.as_mut())? {
             let _ = out.send(reply);
         }
     }
@@ -849,8 +890,10 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
             None
         };
         let net_tx = tx.clone();
+        // Played on the network thread; the player stops when the connection ends.
+        let sound = opts.audio.then(Sound::default);
         s.spawn(move || {
-            let r = net_loop(&mut reader, shared, &net_tx, clip.as_ref());
+            let r = net_loop(&mut reader, shared, &net_tx, clip.as_ref(), sound);
             shared.close(match r {
                 Err(e) if e.to_string() != channel::CLOSED => format!("connection lost: {e}"),
                 _ => "the host closed the connection".into(),
@@ -950,12 +993,34 @@ mod tests {
         assert_eq!(title("pc\n\u{1b}[31m", "pc.tail"), "safe-rdp - pc[31m (pc.tail)");
     }
 
+    #[test]
+    fn sound_problems_never_end_the_session() {
+        let wake = Wake::new().unwrap();
+        let shared = Shared::new(8, 8, wake.waker().unwrap());
+        let mut dec = Decoder::new().unwrap();
+        let mut sound = Sound::default();
+        // Undecodable audio is reported once and skipped; no player is started for it.
+        for (seq, codec) in [(1, 99), (2, 99), (3, AUDIO_IMA_ADPCM)] {
+            let data: &[u8] = if codec == 99 { &[1, 2, 3, 4] } else { &[0xff; 3] };
+            let msg = ServerMsg::Audio { seq, rate: 48000, channels: 2, codec, data };
+            assert_eq!(on_server_msg(&shared, &mut dec, msg, None, Some(&mut sound)).unwrap(), None);
+        }
+        assert!(sound.warned);
+        // Audio nobody asked for is ignored.
+        let msg = ServerMsg::Audio { seq: 4, rate: 1, channels: 9, codec: 0, data: &[] };
+        assert_eq!(on_server_msg(&shared, &mut dec, msg, None, None).unwrap(), None);
+        for key in [SET_AUDIO, SET_PRIVACY] {
+            let msg = ServerMsg::State { key, value: STATE_UNAVAILABLE };
+            assert_eq!(on_server_msg(&shared, &mut dec, msg, None, None).unwrap(), None);
+        }
+    }
+
     /// Encodes `frame` the way a host does and feeds it to the viewer's message handler.
     fn deliver(shared: &Shared, codec: &mut (codec::Encoder, Decoder), frame: &[u8], w: usize, h: usize, id: u32) {
         let rects = codec.0.encode(frame, w, h);
         let msgs = codec::pack(id, w, h, &rects);
         for (i, m) in msgs.iter().enumerate() {
-            let ack = on_server_msg(shared, &mut codec.1, ServerMsg::decode(m).unwrap(), None).unwrap();
+            let ack = on_server_msg(shared, &mut codec.1, ServerMsg::decode(m).unwrap(), None, None).unwrap();
             assert_eq!(ack, (i + 1 == msgs.len()).then_some(ClientMsg::Ack(id)));
         }
     }

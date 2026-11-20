@@ -85,6 +85,22 @@ fn decode_text(kind: u32, string: u32, value: &[u8]) -> String {
     s.trim_end_matches('\0').to_string()
 }
 
+/// Cuts `text` to at most `MAX_CLIPBOARD` bytes (at a character boundary), the most the peer
+/// accepts; decoding can make text longer than the selection bytes it came from. True if cut.
+fn limit(text: &mut String) -> bool {
+    if text.len() <= MAX_CLIPBOARD {
+        return false;
+    }
+    let mut cut = MAX_CLIPBOARD;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // NUL bytes keep the string valid UTF-8 until it is truncated.
+    unsafe { wipe(&mut text.as_bytes_mut()[cut..]) };
+    text.truncate(cut);
+    true
+}
+
 struct Atoms {
     clipboard: u32,
     utf8: u32,
@@ -110,8 +126,12 @@ struct Bridge {
     atoms: Atoms,
     /// Text we serve while we own the selection.
     owned: Option<String>,
-    /// The clipboard text as last seen or set, so unchanged text is not echoed back.
+    /// The text the local clipboard holds as far as we know (`None`: unknown, empty or not
+    /// text), so text it already holds is not taken over again.
     last: Option<String>,
+    /// `last` came from the remote side and no local application has offered it since. The
+    /// first such offer (typically a clipboard manager copying it from us) is not sent back.
+    echo: bool,
     fetch: Option<Fetch>,
 }
 
@@ -139,7 +159,7 @@ impl Bridge {
         };
         conn.select_selection_input(xfixes, win, atoms.clipboard)?;
         conn.sync()?;
-        Ok(Bridge { conn, win, xfixes, atoms, owned: None, last: None, fetch: None })
+        Ok(Bridge { conn, win, xfixes, atoms, owned: None, last: None, echo: false, fetch: None })
     }
 
     fn run(&mut self, wake: &Wake, rx: &mpsc::Receiver<String>, on_change: &dyn Fn(String)) -> Result<()> {
@@ -180,17 +200,27 @@ impl Bridge {
 
     fn take_ownership(&mut self, text: String) -> Result<()> {
         if self.last.as_deref() == Some(text.as_str()) && self.owned.is_none() {
-            return Ok(()); // the local clipboard already holds this text
+            wipe_string(&mut Some(text));
+            return Ok(()); // a local application already offers this text
         }
         self.conn.set_selection_owner(self.win, self.atoms.clipboard, CURRENT_TIME)?;
         if self.conn.get_selection_owner(self.atoms.clipboard)? != self.win {
             log!("could not take the X clipboard");
+            wipe_string(&mut Some(text));
             return Ok(());
         }
         wipe_string(&mut self.owned);
+        wipe_string(&mut self.last);
         self.last = Some(text.clone());
         self.owned = Some(text);
+        self.echo = true;
         Ok(())
+    }
+
+    /// The local clipboard no longer holds text we know of.
+    fn forget(&mut self) {
+        wipe_string(&mut self.last);
+        self.echo = false;
     }
 
     fn on_event(&mut self, ev: Event, on_change: &dyn Fn(String)) -> Result<()> {
@@ -204,6 +234,9 @@ impl Bridge {
                     self.fetch = None;
                     if owner != NONE {
                         self.request(self.atoms.utf8)?;
+                    } else {
+                        // Released, or its owner went away: the clipboard is empty now.
+                        self.forget();
                     }
                 }
             }
@@ -218,6 +251,8 @@ impl Bridge {
                     // The owner cannot give UTF-8; try Latin-1 before giving up.
                     if target == self.atoms.utf8 {
                         self.request(ATOM_STRING)?;
+                    } else {
+                        self.forget(); // not text
                     }
                     return Ok(());
                 }
@@ -227,6 +262,7 @@ impl Bridge {
                     self.fetch = Some(Fetch::Incremental(target, Some(Vec::new())));
                 } else if p.bytes_after > 0 || p.value.len() > MAX_CLIPBOARD {
                     log!("local clipboard text is too large to share");
+                    self.forget();
                 } else {
                     self.report(decode_text(p.kind, ATOM_STRING, &p.value), on_change);
                 }
@@ -246,7 +282,10 @@ impl Bridge {
                             self.report(decode_text(kind, ATOM_STRING, &all), on_change);
                             wipe(&mut all);
                         }
-                        None => log!("local clipboard text is too large to share"),
+                        None => {
+                            log!("local clipboard text is too large to share");
+                            self.forget();
+                        }
                     }
                 } else if let Some(b) = buf {
                     if b.len() + p.value.len() > MAX_CLIPBOARD {
@@ -272,8 +311,20 @@ impl Bridge {
         self.conn.convert_selection(self.win, self.atoms.clipboard, target, self.atoms.property, CURRENT_TIME)
     }
 
-    fn report(&mut self, text: String, on_change: &dyn Fn(String)) {
-        if text.is_empty() || self.last.as_deref() == Some(text.as_str()) {
+    /// Passes on text a local application now offers. Text the remote side just sent is not
+    /// echoed back; text copied again locally is sent again (the remote clipboard may have
+    /// changed to something that is not text in the meantime).
+    fn report(&mut self, mut text: String, on_change: &dyn Fn(String)) {
+        let echo = std::mem::take(&mut self.echo);
+        if text.is_empty() {
+            self.forget();
+            return;
+        }
+        if limit(&mut text) {
+            log!("local clipboard text is too large to share whole; only its first {} KiB are sent", MAX_CLIPBOARD / 1024);
+        }
+        if echo && self.last.as_deref() == Some(text.as_str()) {
+            wipe_string(&mut Some(text));
             return;
         }
         wipe_string(&mut self.last);
@@ -332,6 +383,97 @@ mod tests {
         assert_eq!(decode_text(31, 31, b"caf\xe9\0"), "café");
         assert_eq!(decode_text(99, 31, "안녕\0".as_bytes()), "안녕");
         assert_eq!(decode_text(99, 31, b"bad \xff utf8"), "bad \u{fffd} utf8");
+    }
+
+    #[test]
+    fn shared_text_never_exceeds_the_limit() {
+        // Latin-1 grows when decoded: within the limit as selection bytes, beyond it as text.
+        let mut t = decode_text(31, 31, &vec![0xe9; MAX_CLIPBOARD * 3 / 4]);
+        assert!(t.len() > MAX_CLIPBOARD);
+        assert!(limit(&mut t));
+        assert_eq!(t.len(), MAX_CLIPBOARD);
+        assert!(t.chars().all(|c| c == 'é'));
+        // Each invalid UTF-8 byte becomes U+FFFD (3 bytes); the cut lands between characters.
+        let mut t = decode_text(99, 31, &vec![0xff; MAX_CLIPBOARD / 2]);
+        assert!(limit(&mut t));
+        assert_eq!(t.len(), MAX_CLIPBOARD / 3 * 3);
+        assert!(t.chars().all(|c| c == '\u{fffd}'));
+        let mut t = "a".repeat(MAX_CLIPBOARD);
+        assert!(!limit(&mut t));
+        assert_eq!(t.len(), MAX_CLIPBOARD);
+    }
+
+    /// Makes window `win` of `c` the CLIPBOARD owner and turns down the next `n` conversions
+    /// asked of it, like an application holding an image.
+    fn refuse_conversions(c: &mut Conn, win: u32, clipboard: u32, n: usize) {
+        c.set_selection_owner(win, clipboard, CURRENT_TIME).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut refused = 0;
+        while refused < n {
+            assert!(Instant::now() < deadline, "no conversion was asked for");
+            let ev = c.wait_event(Duration::from_millis(50)).unwrap();
+            if let Some(Event::SelectionRequest { time, requestor, selection, target, .. }) = ev {
+                let mut ev = [0u8; 32];
+                ev[0] = 31; // SelectionNotify
+                for (i, v) in [time, requestor, selection, target, NONE].iter().enumerate() {
+                    ev[4 + 4 * i..8 + 4 * i].copy_from_slice(&v.to_le_bytes());
+                }
+                c.send_event(requestor, 0, &ev).unwrap();
+                refused += 1;
+            }
+        }
+    }
+
+    /// The same text sent or copied again after the clipboard changed in ways that are not
+    /// shared (its owner left, or it held something that is not text) gets through.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn same_text_again_after_unshared_changes() {
+        let vd = VirtualDisplay::spawn(Some(81), 200, 200, None).unwrap();
+        let t = vd.target();
+        let (atx, arx) = mpsc::channel();
+        let a = Clipboard::spawn_on(t.clone(), move |s| atx.send(s).unwrap()).unwrap();
+        let mut c = Conn::connect(&t).unwrap();
+        let clipboard = c.atom("CLIPBOARD").unwrap();
+        let root = c.root();
+        let win = c.create_window(root, 0, 0, 1, 1, 2, 0, &[]).unwrap();
+        let wait_owner = |c: &mut Conn, want: &dyn Fn(u32) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !want(c.get_selection_owner(clipboard).unwrap()) {
+                assert!(Instant::now() < deadline, "clipboard owner did not change");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let text = "make deploy";
+
+        // A local application copies the text and exits: nobody owns the clipboard.
+        let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
+        app.set(text.into());
+        assert_eq!(wait_for(&arx), text);
+        drop(app);
+        wait_owner(&mut c, &|o| o == NONE);
+        std::thread::sleep(Duration::from_millis(300));
+        // The remote side sends the same text again: it is offered locally.
+        a.set(text.into());
+        wait_owner(&mut c, &|o| o != NONE);
+        let a_win = c.get_selection_owner(clipboard).unwrap();
+
+        // An application that offers no text (UTF8_STRING, then STRING refused) takes the
+        // clipboard, and the remote side sends the same text again.
+        refuse_conversions(&mut c, win, clipboard, 2);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(arx.try_recv().is_err());
+        a.set(text.into());
+        wait_owner(&mut c, &|o| o == a_win);
+
+        // The first local offer of text the remote side sent is its echo; a second is a copy.
+        let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
+        app.set(text.into());
+        assert!(arx.recv_timeout(Duration::from_millis(700)).is_err(), "echoed the remote text");
+        app.set(text.into());
+        assert_eq!(wait_for(&arx), text);
+        drop(app);
+        drop(a);
     }
 
     fn wait_for(rx: &mpsc::Receiver<String>) -> String {

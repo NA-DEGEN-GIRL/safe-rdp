@@ -739,9 +739,53 @@ fn io_error(e: std::io::Error) -> Error {
     }
 }
 
+/// The socket file of local display `number`. Servers also listen on the same name in the
+/// abstract namespace, which libxcb clients try first.
+pub fn local_socket_path(number: u32) -> String {
+    format!("/tmp/.X11-unix/X{number}")
+}
+
+const SOL_SOCKET: c_int = 1;
+const SO_PEERCRED: c_int = 17;
+
+#[repr(C)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// Process id at the other end of a connected Unix socket (for a server, the process that
+/// called `listen`).
+pub fn peer_pid(s: &UnixStream) -> Result<u32> {
+    let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<Ucred>() as u32;
+    let r = unsafe { getsockopt(s.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, (&mut cred as *mut Ucred).cast(), &mut len) };
+    if r != 0 || len as usize != std::mem::size_of::<Ucred>() || cred.pid <= 0 {
+        bail!("cannot tell which process serves an X socket: {}", std::io::Error::last_os_error());
+    }
+    Ok(cred.pid as u32)
+}
+
+/// Connects to `addr` and checks that process `pid` is the one listening there. Nothing is sent.
+fn connect_checked(addr: &std::os::unix::net::SocketAddr, pid: u32, what: &str) -> Result<UnixStream> {
+    let s = loop {
+        match UnixStream::connect_addr(addr) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => bail!("cannot connect to {what}: {e}"),
+        }
+    };
+    let peer = peer_pid(&s)?;
+    if peer != pid {
+        bail!("{what} is served by another process (pid {peer})");
+    }
+    Ok(s)
+}
+
 fn connect_socket(name: &DisplayName) -> Result<(Sock, u16, Vec<u8>)> {
     if name.host.is_empty() {
-        let path = format!("/tmp/.X11-unix/X{}", name.number);
+        let path = local_socket_path(name.number);
         let sock = match UnixStream::connect(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -784,12 +828,33 @@ impl Conn {
     /// Connects to `target`, authenticating with its MIT-MAGIC-COOKIE-1 when there is one.
     pub fn connect(target: &Target) -> Result<Conn> {
         let name = parse_display(&target.display)?;
-        let (mut sock, family, address) = connect_socket(&name)?;
+        let (sock, family, address) = connect_socket(&name)?;
+        Conn::handshake(sock, family, &address, &name, target)
+    }
+
+    /// Like `connect`, for a local display that process `pid` must be serving: both of its
+    /// socket names (the file and the abstract twin) must belong to `pid`, or nothing, the
+    /// cookie included, is sent. The file is used, never the abstract name as a fallback.
+    pub fn connect_to_server(target: &Target, pid: u32) -> Result<Conn> {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+        let name = parse_display(&target.display)?;
+        if !name.host.is_empty() {
+            bail!("{} is not a local display", target.display);
+        }
+        let path = local_socket_path(name.number);
+        let n = name.number;
+        drop(connect_checked(&SocketAddr::from_abstract_name(path.as_bytes())?, pid, &format!("the abstract socket of display :{n}"))?);
+        let sock = connect_checked(&SocketAddr::from_pathname(&path)?, pid, &format!("the socket file of display :{n}"))?;
+        Conn::handshake(Sock::Unix(sock), FAMILY_LOCAL, super::hostname().as_bytes(), &name, target)
+    }
+
+    fn handshake(mut sock: Sock, family: u16, address: &[u8], name: &DisplayName, target: &Target) -> Result<Conn> {
         sock.set_timeouts(Some(IO_TIMEOUT))?;
         let cookie = target.auth_file().and_then(|p| std::fs::read(p).ok()).and_then(|mut raw| {
             let entries = parse_xauthority(&raw);
             wipe(&mut raw);
-            find_cookie(&entries, family, &address, name.number)
+            find_cookie(&entries, family, address, name.number)
         });
 
         let (auth_name, auth_data): (&[u8], &[u8]) = match &cookie {
@@ -1532,9 +1597,11 @@ impl Conn {
         Ok(le32(&r, 24))
     }
 
-    /// Asks for XFIXES notifications when `selection` changes owner.
+    /// Asks for XFIXES notifications when `selection` changes owner, including when its owner
+    /// goes away (window destroyed or client gone; these report owner `NONE`).
     pub fn select_selection_input(&mut self, xfixes: Ext, window: u32, selection: u32) -> Result<()> {
-        self.send(Req::new(xfixes.opcode, 2).u32(window).u32(selection).u32(1)).map(|_| ())
+        // SetSelectionOwner | SelectionWindowDestroy | SelectionClientClose
+        self.send(Req::new(xfixes.opcode, 2).u32(window).u32(selection).u32(7)).map(|_| ())
     }
 
     /// Stops key auto-repeat from producing release/press pairs (XKB detectable auto-repeat).
@@ -1589,6 +1656,7 @@ unsafe extern "C" {
     fn shmdt(addr: *const c_void) -> c_int;
     fn shmctl(id: c_int, cmd: c_int, buf: *mut c_void) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *mut c_void, len: *mut u32) -> c_int;
 }
 
 /// Waits until one of `fds` is readable (or hung up); `timeout_ms < 0` waits forever.
@@ -1710,6 +1778,36 @@ impl Drop for ShmSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_who_serves_a_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        let me = std::process::id();
+        let abs = SocketAddr::from_abstract_name(format!("safe-rdp-test-peer-{me}").as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&abs).unwrap();
+        // This process listens, so any other pid is turned away before anything is sent.
+        let err = connect_checked(&abs, me + 1, "the test socket").err().expect("accepted another process");
+        assert!(err.to_string().contains("another process"), "{err}");
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut b = [0u8; 8];
+        assert_eq!(peer.read(&mut b).unwrap(), 0, "bytes were sent");
+        assert!(connect_checked(&abs, me, "the test socket").is_ok());
+        drop(listener);
+        assert!(connect_checked(&abs, me, "the test socket").is_err(), "nobody listens");
+
+        let dir = std::env::temp_dir().join(format!("safe-rdp-peer-{me}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("X0");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let file = SocketAddr::from_pathname(&path).unwrap();
+        assert!(connect_checked(&file, me + 1, "the test socket").is_err());
+        assert!(connect_checked(&file, me, "the test socket").is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let tcp = Target { display: "localhost:1".into(), xauthority: None };
+        assert!(Conn::connect_to_server(&tcp, me).err().expect("TCP display").to_string().contains("not a local display"));
+    }
 
     #[test]
     fn display_names() {
