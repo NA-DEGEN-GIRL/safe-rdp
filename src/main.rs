@@ -118,19 +118,32 @@ fn dispatch(args: &[String]) -> Result<()> {
         "host" => host_cmd(rest),
         #[cfg(windows)]
         "agent" => {
-            // Started by the service as SYSTEM inside the console session.
-            util::set_log_file(&keystore::service_dir().join("host.log"))?;
+            // Started by the service as SYSTEM inside the console session. The service
+            // directory must already exist and be the administrators' alone: never create it,
+            // and check it before logging there or reading the key.
+            let dir = keystore::check_service_dir()?;
+            util::set_log_file(&dir.join("host.log"))?;
             let mut cli = parse_host(rest, true)?;
             if cli.opts.files && cli.opts.transfer_dir.is_none() {
                 // SYSTEM's own Downloads folder is no place for uploads: keep them in the
                 // service's admin-only directory unless --transfer-dir says otherwise.
-                let dir = keystore::service_dir().join("incoming");
+                let dir = dir.join("incoming");
                 std::fs::create_dir_all(&dir)?;
                 cli.opts.transfer_dir = Some(dir);
             }
             let key = keystore::load_service_key()?;
             platform::init_process();
-            host::run(cli.opts, key)
+            // The service closes our stdin to stop us: end the session cleanly (release held
+            // keys and buttons, end privacy mode) instead of being killed.
+            std::thread::spawn(|| {
+                use std::io::Read;
+                let mut buf = [0u8; 64];
+                let mut stdin = std::io::stdin();
+                while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+                STOP.store(true, Ordering::SeqCst);
+            });
+            let listener = host::bind(&cli.opts)?;
+            host::serve(listener, cli.opts, key, &STOP)
         }
         "connect" => connect(rest),
         "probe" => probe_cmd(rest),

@@ -4,11 +4,25 @@ use super::capture::virtual_screen;
 use crate::screen::Area;
 use crate::proto::*;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-/// Marker in `dwExtraInfo` so injected events can be recognised.
-pub const INJECT_TAG: usize = 0x5344_5250; // "SRDP"
+/// Marker in `dwExtraInfo` by which the privacy hooks recognise the events we inject. It is
+/// random per process, so that other programs cannot simply copy it from the binary.
+pub fn inject_tag() -> usize {
+    static TAG: OnceLock<usize> = OnceLock::new();
+    *TAG.get_or_init(|| {
+        let mut b = [0u8; size_of::<usize>()];
+        if crate::crypto::random(&mut b).is_err() {
+            // CNG does not fail in practice; std's hash keys come from the OS generator too.
+            use std::hash::{BuildHasher, RandomState};
+            b = (RandomState::new().hash_one(std::process::id()) as usize).to_ne_bytes();
+        }
+        // Never 0 (what other programs send) nor the pen/touch signature 0xFF5157xx.
+        (usize::from_ne_bytes(b) & !0x8000_0000) | 1
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct HeldKey {
@@ -32,7 +46,7 @@ fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: INJECT_TAG },
+            mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: inject_tag() },
         },
     }
 }
@@ -56,7 +70,7 @@ fn key(k: HeldKey, up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, wScan: k.scan, dwFlags: flags, time: 0, dwExtraInfo: INJECT_TAG },
+            ki: KEYBDINPUT { wVk: vk, wScan: k.scan, dwFlags: flags, time: 0, dwExtraInfo: inject_tag() },
         },
     }
 }
@@ -138,6 +152,20 @@ mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    #[test]
+    fn inject_tag_is_random_stable_and_never_zero() {
+        let t = inject_tag();
+        assert_eq!(t, inject_tag());
+        assert_ne!(t, 0);
+        assert_ne!(t, 0x5344_5250, "the old fixed tag");
+        assert_ne!(t & 0xFFFF_FF00, 0xFF51_5700);
+        // Both builders carry it.
+        let k = key(HeldKey { vk: 0x41, scan: 0x1e, extended: false }, false);
+        let m = mouse(0, 0, 0, MOUSEEVENTF_MOVE);
+        let extra = unsafe { (k.Anonymous.ki.dwExtraInfo, m.Anonymous.mi.dwExtraInfo) };
+        assert_eq!(extra, (t, t));
+    }
 
     #[test]
     #[ignore = "moves the real mouse cursor; run with --ignored"]
