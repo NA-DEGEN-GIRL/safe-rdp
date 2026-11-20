@@ -1,9 +1,10 @@
 //! Tailscale device discovery (portable): runs `tailscale status --json` and lists the
 //! devices of the tailnet, so people can pick a PC instead of typing an address.
 //!
-//! The CLI is looked up in its standard install locations first (directories only
-//! administrators can write to), then on `PATH` (absolute entries only). Names coming from
-//! the tailnet are shown to the user, so control and bidi-override characters are removed.
+//! The CLI is looked up only in its standard install locations (directories only
+//! administrators can write to), never on `PATH`, where another local user may have planted
+//! one. Names coming from the tailnet are shown to the user, so control and bidi-formatting
+//! characters are removed.
 
 use crate::json::{self, Value};
 use crate::util::Result;
@@ -142,25 +143,27 @@ impl fmt::Display for Problem {
     }
 }
 
+/// System directories the Tailscale packages install the CLI into.
+#[cfg(not(windows))]
+const CLI_DIRS: [&str; 7] = ["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin", "/opt/tailscale"];
+
+/// Where the CLI may be: the standard install locations only, never `PATH`.
+fn cli_candidates() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["ProgramFiles", "ProgramW6432"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|dir| Path::new(&dir).join("Tailscale").join("tailscale.exe"))
+        .filter(|p| p.is_absolute())
+        .collect();
+    #[cfg(not(windows))]
+    let candidates = CLI_DIRS.iter().map(|d| Path::new(d).join("tailscale")).collect();
+    candidates
+}
+
 /// Locates the Tailscale CLI.
 pub fn cli_path() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    for var in ["ProgramFiles", "ProgramW6432"] {
-        if let Some(dir) = std::env::var_os(var) {
-            candidates.push(Path::new(&dir).join("Tailscale").join("tailscale.exe"));
-        }
-    }
-    #[cfg(not(windows))]
-    for p in ["/usr/bin/tailscale", "/usr/local/bin/tailscale", "/usr/sbin/tailscale", "/snap/bin/tailscale"] {
-        candidates.push(PathBuf::from(p));
-    }
-    let exe = if cfg!(windows) { "tailscale.exe" } else { "tailscale" };
-    if let Some(path) = std::env::var_os("PATH") {
-        // Relative entries would resolve against the current directory.
-        candidates.extend(std::env::split_paths(&path).filter(|d| d.is_absolute()).map(|d| d.join(exe)));
-    }
-    candidates.into_iter().find(|p| p.is_file())
+    cli_candidates().into_iter().find(|p| p.is_file())
 }
 
 /// Asks the local Tailscale client for this device and its peers.
@@ -283,9 +286,10 @@ fn device(v: &Value, is_self: bool) -> Option<Device> {
     })
 }
 
-/// Drops control and bidirectional-formatting characters and limits the length.
+/// Drops control and bidirectional-formatting characters (and the BOM) and limits the length.
 fn clean(s: &str, max_chars: usize) -> String {
-    let bidi = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let bidi =
+        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
     s.chars().filter(|&c| !c.is_control() && !bidi(c)).take(max_chars).collect::<String>().trim().to_string()
 }
 
@@ -390,6 +394,7 @@ mod tests {
         let doc = "{\"Peer\":{\"x\":{\"HostName\":\"evil\\u202egnp.exe\\u0007\",\"TailscaleIPs\":[\"100.64.0.9\"]}}}";
         let st = parse_status(doc.as_bytes()).unwrap();
         assert_eq!(st.devices[0].name, "evilgnp.exe");
+        assert_eq!(clean("\u{feff}a\u{061c}b\u{2067}c\u{2069}", 10), "abc");
         let long = format!("{{\"Peer\":{{\"x\":{{\"HostName\":\"{}\",\"TailscaleIPs\":[\"100.64.0.9\"]}}}}}}", "a".repeat(500));
         assert_eq!(parse_status(long.as_bytes()).unwrap().devices[0].name.len(), MAX_NAME);
     }
@@ -432,6 +437,26 @@ mod tests {
         assert_eq!((b.as_slice(), over), (&b"0123"[..], true));
         let (b, over) = read_capped(&b"0123"[..], 4);
         assert_eq!((b.as_slice(), over), (&b"0123"[..], false));
+    }
+
+    #[test]
+    fn cli_is_looked_up_in_fixed_places_only() {
+        // Never on PATH, whose directories other users may be able to write to.
+        let c = cli_candidates();
+        assert!(c.iter().all(|p| p.is_absolute()));
+        #[cfg(windows)]
+        {
+            let pf = std::env::var_os("ProgramFiles").expect("ProgramFiles");
+            assert!((1..=2).contains(&c.len()));
+            assert_eq!(c[0], Path::new(&pf).join("Tailscale\\tailscale.exe"));
+            assert!(c.iter().all(|p| p.ends_with("Tailscale\\tailscale.exe")));
+        }
+        #[cfg(not(windows))]
+        {
+            let expected: Vec<PathBuf> = CLI_DIRS.iter().map(|d| Path::new(d).join("tailscale")).collect();
+            assert_eq!(c, expected);
+            assert_eq!(c[0], Path::new("/usr/bin/tailscale"));
+        }
     }
 
     #[test]
