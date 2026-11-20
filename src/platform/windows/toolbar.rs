@@ -173,6 +173,56 @@ fn fill(template: &str, args: &[&dyn Display]) -> String {
     out
 }
 
+/// Characters that change how the text around them is shown without being visible
+/// themselves: bidirectional marks, embeddings, overrides and isolates, and the BOM.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
+/// Text from the host made safe to show: control and bidi-formatting characters are dropped
+/// (so `a\u{202e}txt.exe` cannot pass for `aexe.txt`), tabs and, unless `multiline`, line
+/// breaks become spaces; at most `max_chars` characters, trimmed.
+pub fn clean_text(s: &str, multiline: bool, max_chars: usize) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' if multiline => Some('\n'),
+            '\t' | '\n' => Some(' '),
+            c if c.is_control() || is_format_char(c) => None,
+            c => Some(c),
+        })
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// At most `max_lines` lines (runs of blank lines count as one) and `max_chars` characters
+/// of `s`, ending in "…" where something was cut.
+fn shorten(s: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut cut = false;
+    for l in s.trim().lines().map(str::trim_end) {
+        if l.is_empty() && lines.last().is_some_and(|p| p.is_empty()) {
+            continue;
+        }
+        if lines.len() == max_lines {
+            cut = true;
+            break;
+        }
+        lines.push(l);
+    }
+    let mut out = lines.join("\n");
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
+        cut = true;
+    }
+    if cut {
+        out.truncate(out.trim_end().len());
+        out.push('…');
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------------------
 // Look
 
@@ -1424,6 +1474,14 @@ enum Part {
 
 const T_EXPIRE: usize = 1;
 const MAX_TOASTS: usize = 4;
+/// Toast and overlay text is cut to this many lines and characters before it is shown...
+const MAX_TITLE_LINES: usize = 2;
+const MAX_TITLE_CHARS: usize = 160;
+const MAX_TEXT_LINES: usize = 6;
+const MAX_TEXT_CHARS: usize = 400;
+/// ...and its wrapped height to this many lines (fewer in a small window).
+const MAX_TITLE_ROWS: i32 = 3;
+const MAX_TEXT_ROWS: i32 = 8;
 
 struct PanelState {
     kind: PanelKind,
@@ -1481,12 +1539,19 @@ fn layout_panel(hwnd: HWND, s: &mut PanelState) {
     let left = pad + if icon > 0 { icon + m.px(10) } else { 0 };
     let close = if s.kind == PanelKind::Toast { m.px(28) } else { 0 };
     let wrap = (max_w - left - pad - close).max(m.px(80));
-    let (tw, th, bw, bh, aw) = with_dc(hwnd, |dc| {
+    let (tw, mut th, bw, mut bh, aw, rows) = with_dc(hwnd, |dc| {
         let (tw, th) = text_size(dc, f.bold, &s.title, Some(wrap));
         let (bw, bh) = text_size(dc, f.text, &s.text, Some(wrap));
         let aw = s.action.as_ref().map_or(0, |a| text_size(dc, f.text, action_label(a), None).0 + m.px(24));
-        (tw.min(wrap), th, bw.min(wrap), bh, aw)
+        let rows = (text_size(dc, f.bold, "Ag", None).1.max(1), text_size(dc, f.text, "Ag", None).1.max(1));
+        (tw.min(wrap), th, bw.min(wrap), bh, aw, rows)
     });
+    if s.kind != PanelKind::Hint {
+        // Whole lines only: DT_EDITCONTROL leaves out a partly visible last line.
+        let (_, ph) = client_size(s.parent);
+        th = th.min(rows.0 * MAX_TITLE_ROWS);
+        bh = bh.min(rows.1 * (ph / 3 / rows.1).clamp(2, MAX_TEXT_ROWS));
+    }
     let content = tw.max(bw).max(aw).max(if s.kind == PanelKind::Hint { 0 } else { m.px(160) });
     let mut y = pad;
     s.title_rc = RECT { left, top: y, right: left + content, bottom: y + th };
@@ -1707,6 +1772,7 @@ impl Toasts {
         Toasts { parent, list: Vec::new() }
     }
 
+    /// Shows a toast. Its text may come from the host: it is cleaned and cut short here.
     pub fn show(&mut self, tone: Tone, title: &str, text: &str, action: Option<ToastAction>) {
         self.prune();
         while self.list.len() >= MAX_TOASTS {
@@ -1717,7 +1783,8 @@ impl Toasts {
             (Tone::Warning | Tone::Error, _) => 10_000,
             _ => 6_000,
         };
-        if let Some(h) = create_panel(self.parent, PanelKind::Toast, Some(tone), title, text, action) {
+        let (title, text) = panel_texts(title, text);
+        if let Some(h) = create_panel(self.parent, PanelKind::Toast, Some(tone), &title, &text, action) {
             unsafe { SetTimer(h, T_EXPIRE, lifetime, None) };
             self.list.push(h);
         }
@@ -1725,23 +1792,66 @@ impl Toasts {
     }
 
     /// Drops closed toasts and re-stacks the rest (after a resize, DPI change or close).
+    /// Older toasts that would reach the bar are closed, so they never cover it.
     pub fn relayout(&mut self) {
         self.prune();
+        if unsafe { IsIconic(self.parent) } != 0 {
+            return; // no room while minimised: keep them as they are
+        }
         let (pw, ph) = client_size(self.parent);
         let m = Metrics(dpi_of(self.parent));
-        let mut y = ph - m.px(24);
-        for &h in self.list.iter().rev() {
-            with_state(h, |s: &mut PanelState| layout_panel(h, s));
-            let (w, th) = panel_size(h);
-            y -= th;
+        let sizes: Vec<(i32, i32)> = self
+            .list
+            .iter()
+            .rev()
+            .map(|&h| {
+                with_state(h, |s: &mut PanelState| layout_panel(h, s));
+                panel_size(h)
+            })
+            .collect();
+        let heights: Vec<i32> = sizes.iter().map(|&(_, th)| th).collect();
+        let tops = stack(ph, m.px(24), m.px(8), m.px(BAR_HEIGHT + 8), &heights);
+        let gone = self.list.len() - tops.len();
+        for h in self.list.drain(..gone) {
+            unsafe { DestroyWindow(h) };
+        }
+        for ((&h, &(w, th)), &y) in self.list.iter().rev().zip(&sizes).zip(&tops) {
             unsafe { SetWindowPos(h, HWND_TOP, (pw - w) / 2, y, w, th, SWP_NOACTIVATE | SWP_SHOWWINDOW) };
-            y -= m.px(8);
         }
     }
 
     fn prune(&mut self) {
         self.list.retain(|&h| unsafe { IsWindow(h) } != 0);
     }
+}
+
+/// A toast's or the overlay's title and text, cleaned and cut short.
+fn panel_texts(title: &str, text: &str) -> (String, String) {
+    (
+        shorten(&clean_text(title, true, 4096), MAX_TITLE_LINES, MAX_TITLE_CHARS),
+        shorten(&clean_text(text, true, 4096), MAX_TEXT_LINES, MAX_TEXT_CHARS),
+    )
+}
+
+/// Tops of toasts stacked upwards from `margin` above the bottom of a `ph`-high parent,
+/// `gap` apart (heights newest first). Only toasts that stay below `min_top` get a place,
+/// except the newest: one too tall for that goes at `min_top`, or higher if it has to in
+/// order to end inside the parent (never above 0), so its close button stays visible.
+fn stack(ph: i32, margin: i32, gap: i32, min_top: i32, heights: &[i32]) -> Vec<i32> {
+    let mut tops = Vec::with_capacity(heights.len());
+    let mut y = ph - margin;
+    for &h in heights {
+        let top = y - h;
+        if top < min_top {
+            if tops.is_empty() {
+                tops.push((ph - h).min(min_top).max(0));
+            }
+            break;
+        }
+        tops.push(top);
+        y = top - gap;
+    }
+    tops
 }
 
 /// A status panel centred over the remote screen (e.g. "Reconnecting...").
@@ -1756,17 +1866,18 @@ impl Overlay {
     }
 
     pub fn show(&mut self, title: &str, text: &str) {
+        let (title, text) = panel_texts(title, text);
         match self.hwnd {
             Some(h) => {
                 with_state(h, |s: &mut PanelState| {
                     if s.title != title || s.text != text {
-                        s.title = title.to_string();
-                        s.text = text.to_string();
+                        s.title = title;
+                        s.text = text;
                         layout_panel(h, s);
                     }
                 });
             }
-            None => self.hwnd = create_panel(self.parent, PanelKind::Overlay, None, title, text, None),
+            None => self.hwnd = create_panel(self.parent, PanelKind::Overlay, None, &title, &text, None),
         }
         self.relayout();
     }
@@ -1922,6 +2033,42 @@ mod tests {
         assert!(!hint_text(&m, Item::Disconnect, false).1.contains(tr(Txt::WhileReconnecting)));
         assert_eq!(command(Item::Disconnect), Some(CMD_DISCONNECT));
         assert_eq!(command(Item::Quality), None);
+    }
+
+    #[test]
+    fn host_text_is_cleaned_and_cut() {
+        assert_eq!(clean_text("invoice\u{202e}fdp.exe", false, 255), "invoicefdp.exe");
+        let tricks = " a\u{200e}\u{200f}\u{061c}\u{feff}\u{2066}b\u{2069}\u{202a}c\u{202c}\u{2067}\u{2068} ";
+        assert_eq!(clean_text(tricks, false, 255), "abc");
+        assert_eq!(clean_text("one\ntwo\tthree\r\u{7}\u{1b}[2J", false, 255), "one two three[2J");
+        assert_eq!(clean_text("one\r\ntwo\n", true, 255), "one\ntwo");
+        assert_eq!(clean_text("호스트 이름", false, 3), "호스트");
+        // Joiners that emoji and some scripts need are kept.
+        assert_eq!(clean_text("a\u{200d}b", false, 10), "a\u{200d}b");
+
+        assert_eq!(shorten("short", 6, 400), "short");
+        assert_eq!(shorten(&("\n".repeat(4000) + "x"), 6, 400), "x");
+        assert_eq!(shorten(&format!("a{}b", "\n".repeat(4000)), 6, 400), "a\n\nb");
+        let many: String = (0..20).map(|i| format!("line {i}\n\n\n")).collect();
+        assert_eq!(shorten(&many, 6, 400), "line 0\n\nline 1\n\nline 2…");
+        let long = shorten(&"word ".repeat(200), 6, 400);
+        assert_eq!(long.chars().count(), 400);
+        assert!(long.ends_with("word…"));
+        let (title, text) = panel_texts(&"t".repeat(1000), &"x\n".repeat(1000));
+        assert!(title.chars().count() <= MAX_TITLE_CHARS + 1 && text.lines().count() <= MAX_TEXT_LINES);
+    }
+
+    #[test]
+    fn toasts_stack_below_the_bar() {
+        // 600 px tall parent, 24 px margin, 8 px gap, nothing above 42 px.
+        assert_eq!(stack(600, 24, 8, 42, &[100, 100]), [476, 368]);
+        // The third would reach the bar: no place for it (it is closed).
+        assert_eq!(stack(600, 24, 8, 42, &[200, 200, 200]), [376, 168]);
+        // A newest toast too tall for the room left still shows its top and close button.
+        assert_eq!(stack(600, 24, 8, 42, &[540]), [42]);
+        assert_eq!(stack(600, 24, 8, 42, &[580]), [20]);
+        assert_eq!(stack(100, 24, 8, 42, &[300]), [0]);
+        assert!(stack(600, 24, 8, 42, &[]).is_empty());
     }
 
     #[test]

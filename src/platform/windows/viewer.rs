@@ -59,14 +59,28 @@ const TICK_MS: u32 = 250;
 
 const MOD_CTRL: u8 = 1;
 const MOD_ALT: u8 = 2;
+const MOD_WIN: u8 = 4;
 
 const PING_EVERY: Duration = Duration::from_secs(2);
 /// Silence after which the bar warns that the host is not responding.
 const QUIET_WARN_MS: u64 = 6000;
-/// Files from the host are accepted only this long after asking for them (or after the
-/// last file activity), so a host cannot push files nobody asked for.
+/// Files from the host are accepted only after asking for them: the first must start
+/// within this time of the click, each next one within this time of progress on the files
+/// accepted for that click. So a host cannot push files nobody asked for.
 const PULL_WINDOW_MS: u64 = 30_000;
+/// Most files, and longest time, one click on "Get copied files" accepts new files for.
+const PULL_MAX_FILES: u32 = 1000;
+const PULL_MAX_MS: u64 = 60 * 60 * 1000;
 const MAX_DOWNLOADS: usize = 8;
+/// Events waiting for the UI thread beyond which host-driven ones (notices, settings,
+/// toasts) are dropped; notices and settings are merged into a queued one first.
+const MAX_EVENTS: usize = 64;
+/// Events handled per `WM_APP_EVENT`, so the message loop keeps running during a flood.
+const EVENTS_PER_WAKE: usize = 16;
+/// At most one toast per this time for messages from the host (the latest is shown).
+const NOTICE_GAP: Duration = Duration::from_secs(1);
+const MAX_HOST_NAME: usize = 64;
+const MAX_HOST_TEXT: usize = 4096;
 /// Largest remote screen accepted (keeps a hostile size from exhausting memory).
 const MAX_PIXELS: usize = 64 << 20;
 /// Most files queued from one selection or drop.
@@ -105,6 +119,8 @@ struct App {
     hook_active: AtomicBool,
     mods: AtomicU8,
     swallowed: Mutex<HashSet<u16>>,
+    /// Keys held down and whether their press went to the local desktop (see `stays_local`).
+    routes: Mutex<HashMap<u16, bool>>,
     fullscreen: Mutex<Option<Saved>>,
     /// A popup menu is open: keys belong to it, not to the host.
     local_keys: AtomicBool,
@@ -142,9 +158,30 @@ impl App {
 
     /// Queues an event for the UI thread.
     fn post(&self, ev: Event) {
-        lock(&self.events).push_back(ev);
-        unsafe { PostMessageW(self.hwnd(), WM_APP_EVENT, 0, 0) };
+        if enqueue(&mut lock(&self.events), ev) {
+            unsafe { PostMessageW(self.hwnd(), WM_APP_EVENT, 0, 0) };
+        }
     }
+}
+
+/// Adds `ev` to the UI queue, keeping it bounded however fast the host sends: a notice
+/// replaces a queued notice and a setting's state a queued state of the same setting, and
+/// host-driven events are dropped once `MAX_EVENTS` wait. True if a new entry was added.
+fn enqueue(q: &mut VecDeque<Event>, ev: Event) -> bool {
+    let same = |e: &Event| match (e, &ev) {
+        (Event::Notice { generation: a, .. }, Event::Notice { generation: b, .. }) => a == b,
+        (Event::State { generation: a, key: k, .. }, Event::State { generation: b, key: l, .. }) => a == b && k == l,
+        _ => false,
+    };
+    if let Some(i) = q.iter().position(same) {
+        q[i] = ev;
+        return false;
+    }
+    if q.len() >= MAX_EVENTS && matches!(ev, Event::Notice { .. } | Event::State { .. } | Event::Toast { .. }) {
+        return false;
+    }
+    q.push_back(ev);
+    true
 }
 
 enum Event {
@@ -194,7 +231,7 @@ struct Session {
     last_notice_ms: AtomicU64,
     /// Play incoming audio.
     sound: AtomicBool,
-    pull_until_ms: AtomicU64,
+    pull: Mutex<Pull>,
     clipboard: Mutex<Option<Clipboard>>,
     xfer: Mutex<Transfers>,
 }
@@ -240,6 +277,47 @@ impl Session {
 
     fn files_allowed(&self) -> bool {
         self.flags & F_FILES != 0
+    }
+}
+
+/// Which files from the host the user asked for. A click on "Get copied files" lets the
+/// first file start within `PULL_WINDOW_MS`; after that only progress on files accepted for
+/// that click keeps the window open (a new file alone never does), for at most
+/// `PULL_MAX_FILES` files and never later than `PULL_MAX_MS` after the click.
+#[derive(Default)]
+struct Pull {
+    /// Number of the latest click (0: never asked).
+    request: u32,
+    /// New files are accepted while `now < until`; 0 means nothing was requested.
+    until: u64,
+    /// The click's absolute limit for new files.
+    deadline: u64,
+    files_left: u32,
+}
+
+impl Pull {
+    /// The user asked for the host's copied files at session time `now` (ms).
+    fn request(&mut self, now: u64) {
+        self.request = self.request.wrapping_add(1).max(1);
+        self.until = now + PULL_WINDOW_MS;
+        self.deadline = now + PULL_MAX_MS;
+        self.files_left = PULL_MAX_FILES;
+    }
+
+    /// The host starts a file: the request it is accepted for, or `None` if nobody asked.
+    fn begin(&mut self, now: u64) -> Option<u32> {
+        if self.until == 0 || now >= self.until || now >= self.deadline || self.files_left == 0 {
+            return None;
+        }
+        self.files_left -= 1;
+        Some(self.request)
+    }
+
+    /// Data or the end of a file accepted for `request` arrived: the next file may follow.
+    fn progress(&mut self, request: u32, now: u64) {
+        if request == self.request && self.until != 0 {
+            self.until = self.until.max((now + PULL_WINDOW_MS).min(self.deadline));
+        }
     }
 }
 
@@ -292,6 +370,9 @@ struct Ui {
     reconnect: Option<Reconnect>,
     next_attempt: u64,
     last_notice: Option<String>,
+    /// `last_notice` still needs a toast, and when the latest such toast appeared.
+    notice_waiting: bool,
+    notice_shown: Option<Instant>,
     /// Set once the window is going away; later events are ignored.
     closing: bool,
     exit_error: Option<String>,
@@ -352,6 +433,7 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
         hook_active: AtomicBool::new(false),
         mods: AtomicU8::new(0),
         swallowed: Mutex::new(HashSet::new()),
+        routes: Mutex::new(HashMap::new()),
         fullscreen: Mutex::new(None),
         local_keys: AtomicBool::new(false),
         buttons: AtomicU8::new(0),
@@ -404,6 +486,8 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
         reconnect: None,
         next_attempt: 0,
         last_notice: None,
+        notice_waiting: false,
+        notice_shown: None,
         closing: false,
         exit_error: None,
         opts,
@@ -535,7 +619,8 @@ fn read_session(
                 }
             }
             ServerMsg::Notice(text) => {
-                log!("host: {text}");
+                let text = toolbar::clean_text(&text, true, MAX_HOST_TEXT);
+                log!("host: {}", text.replace('\n', " "));
                 s.last_notice_ms.store(s.ms(), Ordering::SeqCst);
                 app.post(Event::Notice { generation: s.generation, text });
             }
@@ -639,24 +724,25 @@ impl AudioSink {
 /// Files the host sends after `FilePull`. Partial files are deleted when dropped.
 #[derive(Default)]
 struct Downloads {
-    active: HashMap<u32, files::Incoming>,
+    /// Transfers in progress and the `Pull` request each was accepted for.
+    active: HashMap<u32, (files::Incoming, u32)>,
 }
 
 impl Downloads {
     fn begin(&mut self, s: &Session, id: u32, size: u64, name: &str) {
-        let now = s.ms();
-        if !s.files_allowed() || now > s.pull_until_ms.load(Ordering::SeqCst) {
+        if !s.files_allowed() || self.active.contains_key(&id) || self.active.len() >= MAX_DOWNLOADS {
+            log!("ignored a file from the host: not allowed, or too many transfers at once");
+            return;
+        }
+        let Some(request) = lock(&s.pull).begin(s.ms()) else {
             log!("ignored a file the host sent without being asked");
             return;
-        }
-        if self.active.contains_key(&id) || self.active.len() >= MAX_DOWNLOADS {
-            log!("ignored a file from the host: too many transfers at once");
-            return;
-        }
-        s.pull_until_ms.store(now + PULL_WINDOW_MS, Ordering::SeqCst);
-        match files::transfer_dir().and_then(|dir| files::Incoming::begin(&dir, id, size, name)) {
+        };
+        // Saved and shown under a name without bidi tricks (`a\u{202e}fdp.exe`).
+        let name = toolbar::clean_text(name, false, MAX_FILE_NAME);
+        match files::transfer_dir().and_then(|dir| files::Incoming::begin(&dir, id, size, &name)) {
             Ok(inc) => {
-                self.active.insert(id, inc);
+                self.active.insert(id, (inc, request));
                 self.progress(s);
             }
             Err(e) => s.toast(Tone::Error, trf(Txt::ReceiveFailed, &[&name]), e.to_string(), None),
@@ -664,8 +750,8 @@ impl Downloads {
     }
 
     fn data(&mut self, s: &Session, id: u32, data: &[u8]) {
-        let Some(inc) = self.active.get_mut(&id) else { return };
-        s.pull_until_ms.store(s.ms() + PULL_WINDOW_MS, Ordering::SeqCst);
+        let Some((inc, request)) = self.active.get_mut(&id) else { return };
+        lock(&s.pull).progress(*request, s.ms());
         if let Err(e) = inc.write(data) {
             let name = inc.name.clone();
             self.active.remove(&id);
@@ -675,8 +761,8 @@ impl Downloads {
     }
 
     fn end(&mut self, s: &Session, id: u32, sha256: &[u8; 32]) {
-        let Some(inc) = self.active.remove(&id) else { return };
-        s.pull_until_ms.store(s.ms() + PULL_WINDOW_MS, Ordering::SeqCst);
+        let Some((inc, request)) = self.active.remove(&id) else { return };
+        lock(&s.pull).progress(request, s.ms());
         let name = inc.name.clone();
         match inc.finish(sha256) {
             Ok(path) => {
@@ -696,7 +782,7 @@ impl Downloads {
 
     /// Publishes the progress of one active download for the bar.
     fn progress(&self, s: &Session) {
-        let p = self.active.values().next().map(|i| Progress { name: i.name.clone(), done: i.received(), total: i.size });
+        let p = self.active.values().next().map(|(i, _)| Progress { name: i.name.clone(), done: i.received(), total: i.size });
         lock(&s.xfer).down = p;
     }
 }
@@ -706,6 +792,7 @@ fn file_result(s: &Session, id: u32, ok: bool, message: String) {
         log!("file result for an unknown transfer {id}");
         return;
     };
+    let message = toolbar::clean_text(&message, false, MAX_HOST_TEXT);
     if ok {
         log!("sent {name}");
         s.toast(Tone::Success, trf(Txt::Sent, &[&name]), trf(Txt::SavedOnHost, &[&message]), None);
@@ -830,10 +917,12 @@ impl Ui {
             rtt_ms: AtomicU64::new(UNSET),
             last_notice_ms: AtomicU64::new(UNSET),
             sound: AtomicBool::new(self.prefs.audio && flags & F_AUDIO != 0),
-            pull_until_ms: AtomicU64::new(0),
+            pull: Mutex::new(Pull::default()),
             clipboard: Mutex::new(None),
             xfer: Mutex::new(Transfers::default()),
         });
+        // Shown in the title, the bar, toasts and message boxes: no bidi tricks, bounded.
+        let host_name = toolbar::clean_text(&host_name, false, MAX_HOST_NAME);
         self.host = if host_name.is_empty() { self.target.clone() } else { host_name };
         self.monitors = monitors;
         self.prefs.monitor = monitor;
@@ -843,6 +932,7 @@ impl Ui {
         self.pending = [false; 8];
         self.sound_local_failed = false;
         self.last_notice = None;
+        self.notice_waiting = false;
         self.meter = core::RateMeter::new(Instant::now());
         (self.fps, self.mbps) = (0.0, 0.0);
         if self.prefs.clipboard && flags & F_CLIPBOARD != 0 {
@@ -870,6 +960,7 @@ impl Ui {
         if let Some(s) = lock(&app.session).take() {
             s.shutdown();
         }
+        // `routes` stays: it follows keys held down here, whatever the session.
         app.mods.store(0, Ordering::SeqCst);
         lock(&app.swallowed).clear();
     }
@@ -905,8 +996,9 @@ impl Ui {
             }
             Event::Notice { generation, text } => {
                 if generation == self.generation {
-                    self.toasts.show(Tone::Info, tr(Txt::HostMessage), &text, None);
                     self.last_notice = Some(text);
+                    self.notice_waiting = true;
+                    self.show_notice();
                 }
                 After::Nothing
             }
@@ -929,6 +1021,19 @@ impl Ui {
                 }
                 After::Nothing
             }
+        }
+    }
+
+    /// Shows the latest message from the host, at most one toast per `NOTICE_GAP`; one that
+    /// arrives sooner waits for `tick` (and is replaced by any later one).
+    fn show_notice(&mut self) {
+        if !self.notice_waiting || self.notice_shown.is_some_and(|t| t.elapsed() < NOTICE_GAP) {
+            return;
+        }
+        self.notice_waiting = false;
+        if let Some(text) = &self.last_notice {
+            self.toasts.show(Tone::Info, tr(Txt::HostMessage), text, None);
+            self.notice_shown = Some(Instant::now());
         }
     }
 
@@ -1064,8 +1169,18 @@ impl Ui {
                 SET_QUALITY if value <= QUALITY_LOW => self.prefs.quality = value as u8,
                 SET_DOWNSCALE if (1..=4).contains(&value) => self.prefs.downscale = value as u8,
                 SET_MONITOR if value == MONITOR_ALL as u32 || (value as usize) < self.monitors.len() => self.prefs.monitor = value as u8,
-                SET_AUDIO => self.set_sound(value != 0, false),
-                SET_PRIVACY => self.prefs.privacy = value != 0,
+                SET_AUDIO | SET_PRIVACY => {
+                    let user_on = if key == SET_AUDIO { self.prefs.audio } else { self.prefs.privacy };
+                    let (on, refuse) = feature_from_host(user_on, value);
+                    if key == SET_AUDIO {
+                        self.set_sound(on, false);
+                    } else {
+                        self.prefs.privacy = on;
+                    }
+                    if refuse && let Some(s) = APP.get().unwrap().session() {
+                        s.send(ClientMsg::Set { key, value: 0 });
+                    }
+                }
                 _ => {}
             }
         }
@@ -1118,7 +1233,7 @@ impl Ui {
             toolbar::CMD_SEND_FILES => return After::ChooseFiles,
             toolbar::CMD_GET_FILES => {
                 if let Some(s) = session.filter(|s| s.files_allowed()) {
-                    s.pull_until_ms.store(s.ms() + PULL_WINDOW_MS, Ordering::SeqCst);
+                    lock(&s.pull).request(s.ms());
                     s.send(ClientMsg::FilePull);
                     self.toasts.show(Tone::Info, tr(Txt::RequestedFiles), tr(Txt::RequestedFilesHint), None);
                 }
@@ -1189,6 +1304,7 @@ impl Ui {
         if self.reconnect.is_some() {
             self.refresh_overlay();
         }
+        self.show_notice();
         self.refresh_bar();
     }
 
@@ -1294,6 +1410,15 @@ impl Ui {
     }
 }
 
+/// What the host's `State { SET_AUDIO | SET_PRIVACY, value }` does while the user has the
+/// feature `user_on`: it stays the user's choice (sound plays here only if asked for), so
+/// the host may confirm or end it but never start it. Returns whether the feature is on and
+/// whether to tell the host to turn it off again.
+fn feature_from_host(user_on: bool, value: u32) -> (bool, bool) {
+    let host_on = value != 0;
+    (user_on && host_on, host_on && !user_on)
+}
+
 /// A connect error without the "cannot connect to <address>: " prefix the overlay already implies.
 fn short_error(e: &str) -> String {
     match e.strip_prefix("cannot connect to ").and_then(|r| r.split_once(": ")) {
@@ -1342,11 +1467,17 @@ fn dim(px: &mut [u8]) {
     }
 }
 
+/// Handles a batch of queued events; the rest get another `WM_APP_EVENT`, so the message
+/// loop (and with it the keyboard hook) keeps running in between.
 fn dispatch_events(hwnd: HWND) {
-    loop {
-        let Some(ev) = lock(&APP.get().unwrap().events).pop_front() else { return };
+    let app = APP.get().unwrap();
+    for _ in 0..EVENTS_PER_WAKE {
+        let Some(ev) = lock(&app.events).pop_front() else { return };
         let after = with_ui(|ui| ui.handle(ev)).unwrap_or(After::Nothing);
         follow_up(hwnd, after);
+    }
+    if !lock(&app.events).is_empty() {
+        unsafe { PostMessageW(hwnd, WM_APP_EVENT, 0, 0) };
     }
 }
 
@@ -1715,6 +1846,7 @@ fn toggle_fullscreen(hwnd: HWND) {
 fn release_all(app: &App) {
     app.mods.store(0, Ordering::SeqCst);
     lock(&app.swallowed).clear();
+    lock(&app.routes).clear();
     if app.buttons.swap(0, Ordering::SeqCst) != 0 {
         unsafe { ReleaseCapture() };
     }
@@ -1732,6 +1864,7 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
     let bit = match vk {
         VK_CONTROL | VK_LCONTROL | VK_RCONTROL => MOD_CTRL,
         VK_MENU | VK_LMENU | VK_RMENU => MOD_ALT,
+        VK_LWIN | VK_RWIN => MOD_WIN,
         _ => 0,
     };
     if bit != 0 {
@@ -1758,16 +1891,11 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
         }
         return true;
     }
+    // Decided before the session check, so `routes` follows every press and release.
+    let local = stays_local(app.is_fullscreen(), mods, vk, up, &mut lock(&app.routes));
     let Some(s) = session.filter(|s| !s.view_only) else { return false };
-    // In a window, leave the Windows key and Alt+Tab / Alt+Esc / Ctrl+Esc to the local desktop
-    // (like mstsc's default); in full screen everything goes to the host.
-    if !app.is_fullscreen() {
-        let local = matches!(vk, VK_LWIN | VK_RWIN)
-            || (mods & MOD_ALT != 0 && matches!(vk, VK_TAB | VK_ESCAPE))
-            || (mods & MOD_CTRL != 0 && vk == VK_ESCAPE);
-        if local {
-            return false;
-        }
+    if local {
+        return false;
     }
     let mut flags = if up { KEY_UP } else { 0 };
     if extended {
@@ -1775,6 +1903,27 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
     }
     s.send(ClientMsg::Key { vk, scan, flags });
     true
+}
+
+/// Whether a key event goes to the local desktop instead of the host. In a window the
+/// Windows key with everything pressed while it is held (Win+D, Win+E, ...) and Alt+Tab /
+/// Alt+Esc / Ctrl+Esc stay local (like mstsc's default); in full screen everything goes to
+/// the host. Auto-repeats and the release of a key follow its first press (`routes`); a
+/// release whose press was not seen here (it went to another window or a menu) stays local.
+fn stays_local(fullscreen: bool, mods: u8, vk: u16, up: bool, routes: &mut HashMap<u16, bool>) -> bool {
+    if up {
+        return routes.remove(&vk).unwrap_or(true);
+    }
+    if let Some(&local) = routes.get(&vk) {
+        return local;
+    }
+    let local = !fullscreen
+        && (matches!(vk, VK_LWIN | VK_RWIN)
+            || mods & MOD_WIN != 0
+            || (mods & MOD_ALT != 0 && matches!(vk, VK_TAB | VK_ESCAPE))
+            || (mods & MOD_CTRL != 0 && vk == VK_ESCAPE));
+    routes.insert(vk, local);
+    local
 }
 
 unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1860,6 +2009,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 match wp {
                     T_TICK => {
                         with_ui(|ui| ui.tick());
+                        // In case a WM_APP_EVENT could not be posted (full message queue).
+                        dispatch_events(hwnd);
                     }
                     T_RECONNECT => {
                         with_ui(|ui| ui.launch_attempt());
@@ -2045,6 +2196,124 @@ mod tests {
         assert_eq!(reason_text(EndKind::Network, "os error 10054"), "os error 10054");
         assert_eq!(short_error("cannot connect to 127.0.0.1:47300: refused (os error 10061)"), "refused (os error 10061)");
         assert_eq!(short_error("cannot resolve x: no such host"), "cannot resolve x: no such host");
+    }
+
+    #[test]
+    fn files_arrive_only_when_asked() {
+        let mut p = Pull::default();
+        // Nothing requested: refused even in the session's first millisecond.
+        assert_eq!(p.begin(0), None);
+        assert_eq!(p.begin(5), None);
+        p.progress(0, 5);
+        assert_eq!(p.begin(6), None);
+        p.request(1000);
+        let r = p.begin(1000 + PULL_WINDOW_MS - 1).expect("first file within the window");
+        // A new file alone never keeps the window open...
+        assert_eq!(p.begin(1000 + PULL_WINDOW_MS), None);
+        // ...progress on a file accepted for the click does.
+        p.progress(r, 40_000);
+        assert!(p.begin(40_000 + PULL_WINDOW_MS - 1).is_some());
+        assert_eq!(p.begin(40_000 + PULL_WINDOW_MS), None);
+        // Files of an earlier click do not extend a new click's window.
+        p.request(100_000);
+        p.progress(r, 125_000);
+        assert_eq!(p.begin(100_000 + PULL_WINDOW_MS), None);
+    }
+
+    #[test]
+    fn one_click_accepts_a_bounded_pull() {
+        let mut p = Pull::default();
+        p.request(0);
+        for i in 0..PULL_MAX_FILES as u64 {
+            assert!(p.begin(i).is_some(), "file {i}");
+        }
+        assert_eq!(p.begin(PULL_MAX_FILES as u64), None);
+        // Busy transfers keep the window open, but never past the click's ceiling.
+        let mut p = Pull::default();
+        p.request(0);
+        let r = p.begin(0).unwrap();
+        p.progress(r, PULL_MAX_MS - 10);
+        assert!(p.begin(PULL_MAX_MS - 1).is_some());
+        p.progress(r, PULL_MAX_MS + 5);
+        assert_eq!(p.begin(PULL_MAX_MS), None);
+        assert_eq!(p.begin(PULL_MAX_MS + 6), None);
+        // A new click starts a new budget.
+        p.request(PULL_MAX_MS + 10);
+        assert!(p.begin(PULL_MAX_MS + 11).is_some());
+    }
+
+    #[test]
+    fn host_events_cannot_flood_the_ui() {
+        let mut q = VecDeque::new();
+        let notice = |g: u64, t: &str| Event::Notice { generation: g, text: t.into() };
+        let state = |key: u8, value: u32| Event::State { generation: 1, key, value };
+        assert!(enqueue(&mut q, notice(1, "a")));
+        assert!(!enqueue(&mut q, notice(1, "b")), "merged into the queued notice");
+        assert!(enqueue(&mut q, notice(2, "c")));
+        assert!(enqueue(&mut q, state(SET_AUDIO, 1)));
+        assert!(!enqueue(&mut q, state(SET_AUDIO, 0)));
+        assert!(enqueue(&mut q, state(SET_PRIVACY, 1)));
+        assert_eq!(q.len(), 4);
+        assert!(matches!(&q[0], Event::Notice { text, .. } if text == "b"));
+        assert!(matches!(q[2], Event::State { key: SET_AUDIO, value: 0, .. }));
+        let toast = |i: usize| Event::Toast { generation: 1, tone: Tone::Info, title: i.to_string(), text: String::new(), action: None };
+        for i in 0..1000 {
+            enqueue(&mut q, toast(i));
+        }
+        assert_eq!(q.len(), MAX_EVENTS);
+        assert!(!enqueue(&mut q, notice(3, "late")));
+        assert!(!enqueue(&mut q, state(SET_QUALITY, 1)));
+        // The end of a session is never dropped.
+        let ended =
+            Event::Ended { generation: 1, kind: EndKind::Closed, reason: String::new(), lifetime: Duration::ZERO, since_notice: None };
+        assert!(enqueue(&mut q, ended));
+        assert_eq!(q.len(), MAX_EVENTS + 1);
+    }
+
+    #[test]
+    fn host_cannot_turn_sound_on() {
+        // Unasked: stays off, and the host is told to stop.
+        assert_eq!(feature_from_host(false, 1), (false, true));
+        assert_eq!(feature_from_host(false, 7), (false, true));
+        // Confirmed, or ended by the host.
+        assert_eq!(feature_from_host(true, 1), (true, false));
+        assert_eq!(feature_from_host(true, 0), (false, false));
+        assert_eq!(feature_from_host(false, 0), (false, false));
+    }
+
+    #[test]
+    fn windows_key_chords_stay_local_in_a_window() {
+        let (mut r, win, d, e) = (HashMap::new(), MOD_WIN, b'D' as u16, b'E' as u16);
+        // Win+D: every event stays local, so the host gets no 'd' and Start does not open.
+        assert!(stays_local(false, win, VK_LWIN, false, &mut r));
+        assert!(stays_local(false, win, d, false, &mut r));
+        assert!(stays_local(false, win, d, true, &mut r));
+        assert!(stays_local(false, 0, VK_LWIN, true, &mut r));
+        assert!(r.is_empty());
+        // Shift pressed before Win keeps going to the host, auto-repeats and release included.
+        assert!(!stays_local(false, 0, VK_LSHIFT, false, &mut r));
+        assert!(stays_local(false, win, VK_LWIN, false, &mut r));
+        assert!(!stays_local(false, win, VK_LSHIFT, false, &mut r));
+        assert!(!stays_local(false, win, VK_LSHIFT, true, &mut r));
+        // A key pressed during the chord is released locally, even after Win went up.
+        assert!(stays_local(false, win, e, false, &mut r));
+        assert!(stays_local(false, 0, VK_LWIN, true, &mut r));
+        assert!(stays_local(false, 0, e, true, &mut r));
+        assert!(!stays_local(false, 0, e, false, &mut r));
+        assert!(!stays_local(false, 0, e, true, &mut r));
+        // Alt+Tab stays local (Alt itself goes to the host).
+        assert!(!stays_local(false, MOD_ALT, VK_LMENU, false, &mut r));
+        assert!(stays_local(false, MOD_ALT, VK_TAB, false, &mut r));
+        assert!(!stays_local(false, 0, VK_LMENU, true, &mut r));
+        assert!(stays_local(false, 0, VK_TAB, true, &mut r));
+        // Full screen: everything goes to the host.
+        assert!(!stays_local(true, win, VK_LWIN, false, &mut r));
+        assert!(!stays_local(true, win, d, false, &mut r));
+        assert!(!stays_local(true, win, d, true, &mut r));
+        assert!(!stays_local(true, 0, VK_LWIN, true, &mut r));
+        assert!(r.is_empty());
+        // Pressed before the viewer had the focus: the release is not swallowed either.
+        assert!(stays_local(true, 0, VK_RETURN, true, &mut r));
     }
 
     fn env_num(name: &str) -> Option<u64> {

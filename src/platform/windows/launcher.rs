@@ -344,7 +344,7 @@ static EN: Text = Text {
     removed: "Key removed.",
     nothing_removed: "No key was stored.",
     copied: "Copied. It will be removed from the clipboard in one minute.",
-    copy_failed: "Could not use the clipboard. Select the key and copy it manually.",
+    copy_failed: "Could not use the clipboard. Try Copy again in a moment.",
     import_empty: "Paste the key into the field first.",
     bad_key: |e| format!("That is not a valid key: {e}"),
     key_failed: |e| format!("Could not update the key: {e}"),
@@ -465,7 +465,7 @@ static KO: Text = Text {
     removed: "키를 삭제했습니다.",
     nothing_removed: "저장된 키가 없습니다.",
     copied: "복사했습니다. 1분 뒤 클립보드에서 지워집니다.",
-    copy_failed: "클립보드를 사용할 수 없습니다. 키를 선택해 직접 복사하세요.",
+    copy_failed: "클립보드를 사용할 수 없습니다. 잠시 후 복사를 다시 눌러 보세요.",
     import_empty: "먼저 입력란에 키를 붙여넣으세요.",
     bad_key: |e| format!("올바른 키가 아닙니다: {e}"),
     key_failed: |e| format!("키를 저장하지 못했습니다: {e}"),
@@ -604,6 +604,27 @@ impl Settings {
 /// A host name, MagicDNS name, IP literal or `host:port` (never something that looks like an option).
 fn valid_host(s: &str) -> bool {
     !s.is_empty() && s.len() <= 253 && !s.starts_with('-') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._:[]%".contains(&b))
+}
+
+/// What to connect to for the text in the host field, and the name to show for it: a known
+/// device by its address (so MagicDNS need not be on, and any name the list shows works,
+/// "Beta box" included), else the text itself if it is a valid host. `None`: neither.
+fn resolve_target<'a>(typed: &str, devices: impl IntoIterator<Item = &'a Device>) -> Option<(String, String)> {
+    match devices.into_iter().find(|d| d.matches(typed)).and_then(|d| Some((d.address()?, d))) {
+        Some((ip, d)) => Some((ip.to_string(), d.name.clone())),
+        None => valid_host(typed).then(|| (typed.to_string(), typed.to_string())),
+    }
+}
+
+/// Host field text for device `i` of the list: its name, or its address when another device
+/// has the same name (`resolve_target` would pick the first of them).
+fn picked_text(devices: &[Device], me: Option<&Device>, i: usize) -> Option<String> {
+    let d = devices.get(i)?;
+    let shared = devices.iter().chain(me).filter(|o| o.name.eq_ignore_ascii_case(&d.name)).count() > 1;
+    Some(match d.address() {
+        Some(ip) if shared => ip.to_string(),
+        _ => d.name.clone(),
+    })
 }
 
 fn parse_recent(text: &str) -> Vec<String> {
@@ -1530,6 +1551,7 @@ fn create_controls(parent: HWND, t: &Text) -> (Controls, HashMap<usize, Tone>) {
     let k_hide = b.button(t.hide, ID_HIDE);
     b.surface = Surface::Page;
     let k_shown = b.edit(ID_KEY_TEXT, ES_READONLY as u32, "", Mono);
+    unsafe { SetWindowSubclass(k_shown, Some(key_edit_proc), KEY_EDIT_SUBCLASS, 0) };
     b.surface = Surface::Page;
     let k_msg = b.para("", Body, Tone::Muted);
 
@@ -2013,6 +2035,52 @@ unsafe extern "system" fn hover_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             _ => {}
         }
         DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyEdit {
+    Pass,
+    Block,
+    Copy,
+}
+
+/// What the edit showing the key does with a message. Its own copy (Ctrl+C, Ctrl+Insert, the
+/// context menu) would leave the key on the clipboard for good, history and cloud sync
+/// included; copying goes through the Copy button instead, which avoids both.
+fn key_edit_action(msg: u32, wp: WPARAM, ctrl: bool, shift: bool) -> KeyEdit {
+    let key = wp as VIRTUAL_KEY;
+    match msg {
+        WM_COPY => KeyEdit::Copy,
+        WM_CUT | WM_CLEAR | WM_PASTE | WM_CONTEXTMENU => KeyEdit::Block,
+        WM_KEYDOWN if ctrl && (key == VK_C || key == VK_INSERT) => KeyEdit::Copy,
+        WM_KEYDOWN if (ctrl && key == VK_X) || (shift && key == VK_DELETE) => KeyEdit::Block,
+        // Ctrl+C and Ctrl+X as characters.
+        WM_CHAR if wp == 0x03 || wp == 0x18 => KeyEdit::Block,
+        _ => KeyEdit::Pass,
+    }
+}
+
+const KEY_EDIT_SUBCLASS: usize = 2;
+
+unsafe extern "system" fn key_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    unsafe {
+        let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+        let shift = GetKeyState(VK_SHIFT as i32) < 0;
+        match key_edit_action(msg, wp, ctrl, shift) {
+            KeyEdit::Pass => {
+                if msg == WM_NCDESTROY {
+                    RemoveWindowSubclass(hwnd, Some(key_edit_proc), KEY_EDIT_SUBCLASS);
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+            KeyEdit::Block => 0,
+            KeyEdit::Copy => {
+                // As if the Copy button was clicked (BN_CLICKED is 0).
+                PostMessageW(GetParent(hwnd), WM_COMMAND, ID_COPY as usize, 0);
+                0
+            }
+        }
     }
 }
 
@@ -2878,9 +2946,12 @@ impl App {
     }
 
     fn device_selected(&self, index: i32) {
-        let name = self.st.borrow().devices.get(index.max(0) as usize).map(|d| d.name.clone());
-        if let Some(name) = name {
-            set_text(self.c.c_host, &name);
+        let text = {
+            let st = self.st.borrow();
+            picked_text(&st.devices, st.me.as_ref(), index.max(0) as usize)
+        };
+        if let Some(text) = text {
+            set_text(self.c.c_host, &text);
         }
     }
 
@@ -2895,18 +2966,14 @@ impl App {
             unsafe { SetFocus(self.c.c_host) };
             return;
         }
-        if !valid_host(&typed) {
+        let resolved = {
+            let st = self.st.borrow();
+            resolve_target(&typed, st.devices.iter().chain(st.me.iter()))
+        };
+        let Some((target, label)) = resolved else {
             self.say(self.c.c_msg, t.bad_host, Tone::Bad);
             unsafe { SetFocus(self.c.c_host) };
             return;
-        }
-        // Known devices are reached by address, so MagicDNS does not have to be enabled.
-        let (target, label) = {
-            let st = self.st.borrow();
-            match st.devices.iter().chain(st.me.iter()).find(|d| d.matches(&typed)) {
-                Some(d) => (d.address().map(|a| a.to_string()).unwrap_or_else(|| typed.clone()), d.name.clone()),
-                None => (typed.clone(), typed.clone()),
-            }
         };
         let args = viewer_args(&target, &self.connect_options());
         let mut child = match spawn_self(&args, false) {
@@ -3533,6 +3600,67 @@ mod tests {
         }
         for bad in ["", "-x", "--key-file", "a b", "a;b", "pc\n", "名前", &"a".repeat(254)] {
             assert!(!valid_host(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_listed_device_can_be_connected() {
+        // Peers without a MagicDNS name are listed under their OS host name.
+        let mut beta = dev("Beta box", "100.64.0.5");
+        beta.dns_name.clear();
+        beta.ips.insert(0, "fd7a:115c:a1e0::5".parse().unwrap());
+        let devices = [dev("desk", "100.64.0.2"), beta, dev("사무실-PC", "100.64.0.6"), dev("-evil", "100.64.0.7")];
+        let resolve = |s: &str| resolve_target(s, devices.iter());
+        for d in &devices {
+            let (target, label) = resolve(&d.name).unwrap_or_else(|| panic!("{}", d.name));
+            assert_eq!(target, d.address().unwrap().to_string(), "connects by address");
+            assert_eq!(label, d.name);
+        }
+        assert_eq!(resolve("beta box"), Some(("100.64.0.5".into(), "Beta box".into())));
+        assert_eq!(resolve("desk.example.ts.net"), Some(("100.64.0.2".into(), "desk".into())));
+        // Anything else must be a host name or address, never an option or free text.
+        assert_eq!(resolve("other-pc"), Some(("other-pc".into(), "other-pc".into())));
+        for bad in ["--key-file", "-x", "a b", "名前"] {
+            assert_eq!(resolve(bad), None, "{bad}");
+        }
+        // Picking from the list: the name, unless another device shares it.
+        let twins = [dev("Beta box", "100.64.0.8"), dev("BETA BOX", "100.64.0.9"), dev("desk", "100.64.0.2")];
+        let me = dev("desk", "100.64.0.1");
+        for (i, d) in twins.iter().enumerate() {
+            let picked = picked_text(&twins, Some(&me), i).unwrap();
+            assert_eq!(picked, d.address().unwrap().to_string());
+            assert_eq!(resolve_target(&picked, twins.iter()).unwrap().0, picked);
+        }
+        assert_eq!(picked_text(&devices, None, 1).as_deref(), Some("Beta box"));
+        assert_eq!(picked_text(&devices, None, 9), None);
+    }
+
+    #[test]
+    fn shown_key_is_copied_only_through_the_copy_button() {
+        use KeyEdit::*;
+        let (c, x, ins, del) = (VK_C as WPARAM, VK_X as WPARAM, VK_INSERT as WPARAM, VK_DELETE as WPARAM);
+        assert_eq!(key_edit_action(WM_COPY, 0, false, false), Copy);
+        assert_eq!(key_edit_action(WM_KEYDOWN, c, true, false), Copy);
+        assert_eq!(key_edit_action(WM_KEYDOWN, ins, true, false), Copy);
+        for (msg, wp, ctrl, shift) in [
+            (WM_CONTEXTMENU, 0, false, false),
+            (WM_CUT, 0, false, false),
+            (WM_KEYDOWN, x, true, false),
+            (WM_KEYDOWN, del, false, true),
+            (WM_CHAR, 0x03, true, false),
+            (WM_CHAR, 0x18, true, false),
+        ] {
+            assert_eq!(key_edit_action(msg, wp, ctrl, shift), Block, "{msg:#x} {wp:#x}");
+        }
+        // Selecting, scrolling and moving the caret still work.
+        for (msg, wp, ctrl, shift) in [
+            (WM_KEYDOWN, c, false, false),
+            (WM_KEYDOWN, VK_LEFT as WPARAM, false, true),
+            (WM_KEYDOWN, b'A' as WPARAM, true, false),
+            (WM_CHAR, b'c' as WPARAM, false, false),
+            (WM_LBUTTONDOWN, 0, false, false),
+        ] {
+            assert_eq!(key_edit_action(msg, wp, ctrl, shift), Pass, "{msg:#x} {wp:#x}");
         }
     }
 
