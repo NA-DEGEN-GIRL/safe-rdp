@@ -4,14 +4,15 @@
 //!  [--set KEY=VALUE]... [--upload FILE]... [--pull] [--expect-change] [--snapshot FILE.ppm]`
 //!
 //! It prints the host's hello, frame/byte rates, round-trip times, setting confirmations and
-//! file-transfer results, and exits non-zero if an expectation fails. `--snapshot` is the only
-//! thing in safe-rdp that writes screen contents to disk, and only when explicitly asked.
+//! file-transfer results (`--pull` saves into `files::transfer_dir()`, like the viewer), and
+//! exits non-zero if an expectation fails. `--snapshot` is the only thing in safe-rdp that
+//! writes screen contents to disk, and only when explicitly asked.
 
 use crate::codec::{self, Decoder};
 use crate::files::{Incoming, Outgoing};
 use crate::proto::*;
 use crate::util::{Error, Result, Secret};
-use crate::viewer::{ViewerOptions, connect};
+use crate::viewer::{ViewerOptions, check_screen_size, connect};
 use crate::{bail, log};
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,15 @@ fn checksum(fb: &[u8]) -> u64 {
     })
 }
 
+/// Where pulled files go: the user's own `files::transfer_dir()`, never a shared temp directory.
+/// Files the host sends without `--pull` are refused.
+fn download_dir(pull: bool) -> Result<std::path::PathBuf> {
+    if !pull {
+        bail!("the host sent a file that was not asked for (no --pull)");
+    }
+    crate::files::transfer_dir()
+}
+
 fn write_ppm(path: &str, fb: &[u8], w: usize, h: usize) -> Result<()> {
     let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
     out.reserve(w * h * 3);
@@ -127,6 +137,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     let mut conn = connect(target, &o.viewer, &psk)?;
     drop(psk);
     println!("handshake:   {:.1} ms to {}", t_connect.elapsed().as_secs_f64() * 1000.0, conn.addr);
+    // `connect` already made the host name printable and checked the screen size.
     println!("host:        {} ({}x{}), flags {:#x}, monitor {}", conn.host_name, conn.width, conn.height, conn.flags, conn.monitor);
     for (i, m) in conn.monitors.iter().enumerate() {
         println!("  monitor {}: {}x{} at ({}, {})", i + 1, m.width, m.height, m.left, m.top);
@@ -217,6 +228,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             ServerMsg::Tiles(p) => {
                 let hdr = codec::parse_header(p)?;
                 if (hdr.width, hdr.height) != (fw, fh) {
+                    check_screen_size(hdr.width, hdr.height)?;
                     (fw, fh) = (hdr.width, hdr.height);
                     fb = vec![0u8; fw * fh * 4];
                     println!("resized:     {fw}x{fh}");
@@ -239,9 +251,10 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 println!("state:       key {key} = {}", if value == STATE_UNAVAILABLE { "unavailable".into() } else { value.to_string() });
                 states.push((key, value));
             }
-            ServerMsg::Notice(t) => println!("notice:      {t}"),
+            ServerMsg::Notice(t) => println!("notice:      {}", printable(&t)),
             ServerMsg::Audio { .. } => audio_packets += 1,
             ServerMsg::FileResult { id, ok, message } => {
+                let message = printable(&message);
                 println!("upload {id}:  {} {message}", if ok { "ok" } else { "FAILED" });
                 if !ok {
                     failures.push(format!("upload {id} failed: {message}"));
@@ -249,16 +262,14 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 pending_uploads = pending_uploads.saturating_sub(1);
             }
             ServerMsg::FileBegin { id, size, name } => {
-                let dir = std::env::temp_dir().join("safe-rdp-probe");
-                std::fs::create_dir_all(&dir)?;
-                download = Some(Incoming::begin(&dir, id, size, &name)?);
+                download = Some(Incoming::begin(&download_dir(o.pull)?, id, size, &name)?);
             }
             ServerMsg::FileData { id, data } => match download.as_mut() {
                 Some(d) if d.id == id => d.write(data)?,
                 _ => bail!("file data without a matching begin"),
             },
             ServerMsg::FileEnd { id, sha256 } => match download.take() {
-                Some(d) if d.id == id => println!("download:    {}", d.finish(&sha256)?.display()),
+                Some(d) if d.id == id => println!("download:    {}", printable(&d.finish(&sha256)?.display().to_string())),
                 _ => bail!("file end without a matching begin"),
             },
             ServerMsg::Cursor(_) | ServerMsg::Clipboard(_) | ServerMsg::Ping | ServerMsg::Hello { .. } => {}
@@ -327,5 +338,12 @@ mod tests {
         assert_eq!(scancode_for('\n'), Some((0x1c, false)));
         assert!(scancode_for('한').is_none());
         assert_eq!(key_msgs("Hi").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn unrequested_files_are_refused() {
+        // With --pull the directory is `files::transfer_dir()` (not created here: it is the
+        // user's real Downloads folder).
+        assert!(download_dir(false).is_err());
     }
 }

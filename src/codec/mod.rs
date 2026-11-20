@@ -50,6 +50,8 @@ const LOSSY_RUN_TILES: usize = 8;
 const REFINE_RUN_TILES: usize = 4;
 /// Jobs covering fewer pixels than this are encoded on the calling thread.
 const PARALLEL_PIXELS: usize = 128 * 1024;
+/// Total rect area one `S_TILES` message may cover, in screens (see `Decoder::apply`).
+const MAX_COVERAGE: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -548,12 +550,17 @@ impl Decoder {
     }
 
     /// Applies the rects in `payload` to `fb` (BGRA, `fbw*fbh*4`); returns the dirty bounding box.
+    ///
+    /// The encoder never sends a pixel twice in one message, so rects covering more than
+    /// `MAX_COVERAGE` times the screen are rejected: a few bytes per full-screen solid rect
+    /// must not buy a host minutes of decoding.
     pub fn apply(&mut self, payload: &[u8], fb: &mut [u8], fbw: usize, fbh: usize) -> Result<Option<Rect>> {
         assert_eq!(fb.len(), fbw * fbh * 4);
         let mut r = Rd(payload);
         r.bytes(9)?;
         let count = r.u16()?;
         let mut bbox: Option<Rect> = None;
+        let mut area = 0;
         for _ in 0..count {
             let (x, y, w, h) = (r.u16()? as usize, r.u16()? as usize, r.u16()? as usize, r.u16()? as usize);
             let enc = r.u8()?;
@@ -561,6 +568,10 @@ impl Decoder {
             let data = r.bytes(len)?;
             if w == 0 || h == 0 || x + w > fbw || y + h > fbh {
                 bail!("tile out of bounds");
+            }
+            area += w * h;
+            if area > MAX_COVERAGE * fbw * fbh {
+                bail!("tiles cover the screen more than {MAX_COVERAGE} times");
             }
             let nr = Rect { x, y, w, h };
             match enc {
@@ -748,6 +759,81 @@ mod tests {
         let r = EncodedRect { rect: Rect { x: 0, y: 0, w: 4, h: 4 }, enc: 4, data: vec![] };
         assert!(dec.apply(&pack(1, 16, 16, &[r])[0][1..], &mut fb, 16, 16).is_err());
         assert!(dec.apply(&[0; 5], &mut fb, 16, 16).is_err());
+    }
+
+    /// Pixels covered by the rects of one packed message.
+    fn coverage(msg: &[u8]) -> usize {
+        let mut r = Rd(&msg[1..]);
+        r.bytes(9).unwrap();
+        let mut area = 0;
+        for _ in 0..r.u16().unwrap() {
+            let (_, _, w, h) = (r.u16().unwrap(), r.u16().unwrap(), r.u16().unwrap() as usize, r.u16().unwrap() as usize);
+            r.u8().unwrap();
+            let len = r.u32().unwrap() as usize;
+            r.bytes(len).unwrap();
+            area += w * h;
+        }
+        area
+    }
+
+    #[test]
+    fn decoder_limits_work_per_message() {
+        let (w, h) = (64, 32);
+        let mut dec = Decoder::new().unwrap();
+        let mut fb = vec![0u8; w * h * 4];
+        let solid = |rect: Rect, c: u8| EncodedRect { rect, enc: ENC_SOLID, data: vec![c; 3] };
+        let full = Rect { x: 0, y: 0, w, h };
+        // Twice the screen is the limit; one more pixel is refused.
+        assert!(dec.apply(&pack(1, w, h, &[solid(full, 1), solid(full, 2)])[0][1..], &mut fb, w, h).is_ok());
+        let over = [solid(full, 3), solid(full, 4), solid(Rect { x: 5, y: 5, w: 1, h: 1 }, 5)];
+        assert!(dec.apply(&pack(2, w, h, &over)[0][1..], &mut fb, w, h).is_err());
+        // A hostile host packing thousands of full-screen solid rects into one message.
+        let flood: Vec<EncodedRect> = (0..10_000).map(|i| solid(full, i as u8)).collect();
+        let msgs = pack(3, w, h, &flood);
+        assert_eq!(msgs.len(), 1);
+        assert!(dec.apply(&msgs[0][1..], &mut fb, w, h).is_err());
+    }
+
+    #[test]
+    fn encoder_messages_stay_within_the_decoder_limit() {
+        // Every message the encoder produces (exact and lossy runs, refinement, chunked frames)
+        // covers each pixel at most once.
+        let check = |msgs: &[Vec<u8>], dec: &mut Decoder, fb: &mut [u8], w: usize, h: usize| {
+            for m in msgs {
+                assert!(coverage(m) <= w * h, "{} > {}", coverage(m), w * h);
+                dec.apply(&m[1..], fb, w, h).unwrap();
+            }
+        };
+        let mut dec = Decoder::new().unwrap();
+        for quality in [QUALITY_BALANCED, QUALITY_LOW, QUALITY_LOSSLESS] {
+            let (f, w, h) = mixed(5);
+            let mut enc = Encoder::new().unwrap();
+            enc.set_quality(quality);
+            let mut fb = vec![0u8; w * h * 4];
+            let t0 = Instant::now();
+            check(&pack(1, w, h, &enc.encode_at(&f, w, h, t0)), &mut dec, &mut fb, w, h);
+            enc.request_full();
+            check(&pack(2, w, h, &enc.encode_at(&f, w, h, t0)), &mut dec, &mut fb, w, h);
+            let refined = enc.refine_at(&f, w, h, usize::MAX, t0 + Duration::from_secs(5));
+            assert_eq!(refined.is_empty(), quality == QUALITY_LOSSLESS);
+            check(&pack(3, w, h, &refined), &mut dec, &mut fb, w, h);
+            assert!(fb == f);
+        }
+        // An incompressible frame spread over several messages.
+        let (w, h) = (1920, 1080);
+        let mut s = 9u32;
+        let f: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 24) as u8
+            })
+            .collect();
+        let mut enc = lossless();
+        let mut fb = vec![0u8; w * h * 4];
+        let msgs = pack(1, w, h, &enc.encode(&f, w, h));
+        assert!(msgs.len() > 1);
+        assert_eq!(msgs.iter().map(|m| coverage(m)).sum::<usize>(), w * h);
+        check(&msgs, &mut dec, &mut fb, w, h);
     }
 
     #[test]
