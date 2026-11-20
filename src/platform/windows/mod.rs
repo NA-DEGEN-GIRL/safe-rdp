@@ -34,15 +34,18 @@ pub fn request_sas() -> bool {
 }
 
 static STOP_FLAG: std::sync::OnceLock<&'static std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+static CONSOLE_EVENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 unsafe extern "system" fn on_console_event(event: u32) -> i32 {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
     let Some(stop) = STOP_FLAG.get() else { return 0 };
     // A second Ctrl+C while shutting down falls through to the default handler (exit now).
-    if stop.swap(true, Ordering::SeqCst) {
+    // Counted separately: `stop` may also have been set for another reason.
+    if CONSOLE_EVENTS.fetch_add(1, Ordering::SeqCst) > 0 {
         return 0;
     }
+    stop.store(true, Ordering::SeqCst);
     if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
         // Console closed / logoff / shutdown: the process ends when this returns, so give
         // the host a moment to release held keys and end the session.

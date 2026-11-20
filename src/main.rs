@@ -54,7 +54,8 @@ HOST OPTIONS:
   --port <n>               TCP port (default 47300)
   --allow <ip>[,<ip>...]   Only accept these peer addresses (default: any Tailscale peer)
   --allow-non-tailscale    Permit binding/peers outside Tailscale ranges (not recommended)
-  --monitor <n|all>        Monitor to share, 1 = primary (default), or 'all'
+  --monitor <n|all>        Monitor shown first, 1 = primary (default), or 'all'; viewers can
+                           switch to any monitor of this machine
   --fps <n>                Frame rate cap (default 30)
   --quality <q>            Picture quality for viewers that do not ask: lossless | balanced | low
   --clipboard              Allow text clipboard sharing (viewer must opt in too)
@@ -64,7 +65,8 @@ HOST OPTIONS:
   --privacy                Allow viewers to blank this screen and lock local input while connected
   --view-only              Ignore keyboard and mouse from viewers
   --virtual <WxH>          (Linux) Run in a new headless X display (Xvfb) of this size
-  --session <cmd>          (Linux, with --virtual) Program to run in it (default: a terminal)
+  --session <cmd>          (Linux, with --virtual) Program to run in it (default: a terminal);
+                           the host stops when it exits, so do not start it in the background
   --key-file <path>        Read the key from a text file instead of the user key store
 
 VIEWER OPTIONS:
@@ -142,7 +144,7 @@ fn dispatch(args: &[String]) -> Result<()> {
                 while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
                 STOP.store(true, Ordering::SeqCst);
             });
-            let listener = host::bind(&cli.opts)?;
+            let listener = host::bind(&cli.opts, &STOP)?;
             host::serve(listener, cli.opts, key, &STOP)
         }
         "connect" => connect(rest),
@@ -214,12 +216,18 @@ struct HostCli {
 fn host_cmd(args: &[String]) -> Result<()> {
     let cli = parse_host(args, false)?;
     let key = load_key(cli.key_file.as_deref())?;
+    // From here on Ctrl+C / SIGTERM only request a stop, so everything below unwinds normally
+    // (the virtual display included).
+    platform::stop_on_signals(&STOP);
     // Must come before any thread starts: it sets DISPLAY/XAUTHORITY for this process.
     #[cfg(target_os = "linux")]
     let _display = match cli.virtual_size {
         Some((w, h)) => {
             let s = cli.session.clone().unwrap_or_else(|| platform::xvfb::default_session(w, h));
-            Some(platform::xvfb::VirtualDisplay::start(w, h, (!s.is_empty()).then_some(s.as_str()))?)
+            let d = platform::xvfb::VirtualDisplay::start(w, h, (!s.is_empty()).then_some(s.as_str()))?;
+            // Stop when Xvfb or the session program ends instead of serving a dead screen.
+            d.watch(&STOP)?;
+            Some(d)
         }
         None => None,
     };
@@ -238,7 +246,6 @@ fn host_cmd(args: &[String]) -> Result<()> {
         });
     }
     let listener = host::bind(&cli.opts, &STOP)?;
-    platform::stop_on_signals(&STOP);
     host::serve(listener, cli.opts, key, &STOP)
 }
 

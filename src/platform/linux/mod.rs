@@ -13,7 +13,7 @@ pub mod viewer;
 mod x11;
 pub mod xvfb;
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 mod libc {
     use std::ffi::{c_char, c_int, c_long};
@@ -73,13 +73,16 @@ pub fn init_process() {
 }
 
 static STOP_FLAG: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+static SIGNALS: AtomicU32 = AtomicU32::new(0);
 
 extern "C" fn on_signal(_sig: std::ffi::c_int) {
     let flag = STOP_FLAG.load(Ordering::SeqCst);
-    // A second signal while shutting down means "now".
-    if flag.is_null() || unsafe { (*flag).swap(true, Ordering::SeqCst) } {
+    // A second signal while shutting down means "now". Counted separately: `stop` may also
+    // have been set for other reasons (the session ended), which is not a first signal.
+    if flag.is_null() || SIGNALS.fetch_add(1, Ordering::SeqCst) > 0 {
         unsafe { libc::_exit(130) };
     }
+    unsafe { (*flag).store(true, Ordering::SeqCst) };
 }
 
 /// SIGINT, SIGTERM and SIGHUP set `stop` instead of killing the process, so it can shut down
