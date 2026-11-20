@@ -16,10 +16,38 @@ pub struct ViewerOptions {
     pub allow_capture: bool,
     /// Ask the host for 1/N resolution (1 = full).
     pub downscale: u8,
+    /// `proto::QUALITY_*`.
+    pub quality: u8,
+    /// Zero-based monitor index, `proto::MONITOR_ALL` or `proto::MONITOR_DEFAULT`.
+    pub monitor: u8,
+    /// Play the host's audio.
+    pub audio: bool,
+    /// Ask the host to blank its screen and block local input while connected.
+    pub privacy: bool,
+}
+
+impl Default for ViewerOptions {
+    fn default() -> Self {
+        ViewerOptions {
+            fullscreen: false,
+            clipboard: false,
+            view_only: false,
+            allow_capture: false,
+            downscale: 1,
+            quality: QUALITY_BALANCED as u8,
+            monitor: MONITOR_DEFAULT,
+            audio: false,
+            privacy: false,
+        }
+    }
 }
 
 /// An authenticated session, after the hello exchange.
 pub struct Connection {
+    /// Host name, monitors and the monitor being shown, from the host's hello.
+    pub host_name: String,
+    pub monitors: Vec<MonitorInfo>,
+    pub monitor: u8,
     pub addr: SocketAddr,
     pub stream: TcpStream,
     pub reader: RecordReader<TcpStream>,
@@ -49,7 +77,7 @@ pub fn resolve(target: &str) -> Result<SocketAddr> {
         .ok_or_else(|| Error::msg(format!("{target} has no addresses")))
 }
 
-pub fn connect(target: &str, downscale: u8, psk: &Secret<32>) -> Result<Connection> {
+pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<Connection> {
     let addr = resolve(target)?;
     if !crate::net::is_tailscale(addr.ip()) && !addr.ip().is_loopback() {
         log!("warning: {addr} is not a Tailscale address; traffic is still end-to-end encrypted");
@@ -66,15 +94,22 @@ pub fn connect(target: &str, downscale: u8, psk: &Secret<32>) -> Result<Connecti
     let mut reader = RecordReader::new(stream.try_clone()?, keys.recv);
     let mut writer = RecordWriter::new(stream.try_clone()?, keys.send);
     let mut hello = Vec::new();
-    ClientMsg::Hello { downscale, quality: QUALITY_BALANCED as u8, monitor: MONITOR_DEFAULT, flags: 0 }.encode(&mut hello);
+    let mut flags = 0;
+    if opts.audio {
+        flags |= HELLO_AUDIO;
+    }
+    if opts.privacy {
+        flags |= HELLO_PRIVACY;
+    }
+    ClientMsg::Hello { downscale: opts.downscale, quality: opts.quality, monitor: opts.monitor, flags }.encode(&mut hello);
     writer.send(&hello)?;
-    let (width, height, flags) = match ServerMsg::decode(reader.recv()?)? {
-        ServerMsg::Hello { width, height, flags, .. } => (width as usize, height as usize, flags),
+    let (width, height, flags, monitor, monitors, host_name) = match ServerMsg::decode(reader.recv()?)? {
+        ServerMsg::Hello { width, height, flags, monitor, monitors, name } => (width as usize, height as usize, flags, monitor, monitors, name),
         _ => bail!("unexpected first message from host"),
     };
     if width == 0 || height == 0 {
         bail!("host reported an empty screen");
     }
-    log!("connected: remote screen {width}x{height}");
-    Ok(Connection { addr, stream, reader, writer, width, height, flags })
+    log!("connected to {host_name}: remote screen {width}x{height}");
+    Ok(Connection { host_name, monitors, monitor, addr, stream, reader, writer, width, height, flags })
 }

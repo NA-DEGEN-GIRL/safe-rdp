@@ -12,3 +12,8 @@ impl Clipboard {
 
     pub fn set(&self, _text: String) {}
 }
+
+/// Files currently copied on this machine (none: X11 file clipboards are not supported).
+pub fn copied_files() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}

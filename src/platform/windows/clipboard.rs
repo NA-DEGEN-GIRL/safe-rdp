@@ -208,3 +208,8 @@ pub fn write_text(hwnd: HWND, text: &str) -> bool {
         ok
     }
 }
+
+/// Regular files currently copied in Explorer (CF_HDROP); placeholder until implemented.
+pub fn copied_files() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}

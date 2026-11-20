@@ -116,7 +116,7 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
 
 fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     let crate::viewer::Connection { stream, mut reader, mut writer, width: w, height: h, flags, .. } =
-        crate::viewer::connect(target, opts.downscale, &psk)?;
+        crate::viewer::connect(target, &opts, &psk)?;
     drop(psk);
     let view_only = opts.view_only || flags & F_VIEW_ONLY != 0;
 

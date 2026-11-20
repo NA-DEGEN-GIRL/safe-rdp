@@ -202,7 +202,7 @@ fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
 fn connect(args: &[String]) -> Result<()> {
     let mut target = None;
     let mut key_file = None;
-    let mut o = viewer::ViewerOptions { fullscreen: false, clipboard: false, view_only: false, allow_capture: false, downscale: 1 };
+    let mut o = viewer::ViewerOptions::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
