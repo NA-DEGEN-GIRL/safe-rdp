@@ -17,6 +17,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 // Core requests
@@ -739,62 +740,123 @@ fn io_error(e: std::io::Error) -> Error {
     }
 }
 
+/// Where local displays keep their socket files.
+pub const SOCKET_DIR: &str = "/tmp/.X11-unix";
+
 /// The socket file of local display `number`. Servers also listen on the same name in the
 /// abstract namespace, which libxcb clients try first.
 pub fn local_socket_path(number: u32) -> String {
-    format!("/tmp/.X11-unix/X{number}")
+    format!("{SOCKET_DIR}/X{number}")
+}
+
+/// Process id of the only X server this process may talk to (0: any server run by root or by
+/// this user). Set for a virtual display, so a server another local user starts on its socket
+/// names after it dies never sees our cookie, keystrokes or screen requests.
+static PINNED_SERVER: AtomicU32 = AtomicU32::new(0);
+/// `PINNED_SERVER` once the pinned server is being stopped: no server is trusted any more.
+const RETIRED: u32 = u32::MAX;
+
+/// From now on every connection of this process must reach X server process `pid`, whichever
+/// socket name it goes through. Set once; it never reverts to trusting other servers.
+pub fn pin_server(pid: u32) -> Result<()> {
+    match PINNED_SERVER.compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => Ok(()),
+        Err(_) => bail!("this process already uses another X server"),
+    }
+}
+
+/// Called before pinned server `pid` is stopped (and its pid can be reused): later connections
+/// fail instead of reaching whoever gets that pid next.
+pub fn retire_server(pid: u32) {
+    let _ = PINNED_SERVER.compare_exchange(pid, RETIRED, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+fn pinned_server() -> Option<u32> {
+    Some(PINNED_SERVER.load(Ordering::SeqCst)).filter(|&p| p != 0)
 }
 
 const SOL_SOCKET: c_int = 1;
 const SO_PEERCRED: c_int = 17;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Ucred {
     pid: i32,
     uid: u32,
     gid: u32,
 }
 
-/// Process id at the other end of a connected Unix socket (for a server, the process that
-/// called `listen`).
-pub fn peer_pid(s: &UnixStream) -> Result<u32> {
+/// Who is at the other end of a connected Unix socket (for a server, the process that called
+/// `listen`).
+fn peer_cred(s: &UnixStream) -> Result<Ucred> {
     let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<Ucred>() as u32;
     let r = unsafe { getsockopt(s.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, (&mut cred as *mut Ucred).cast(), &mut len) };
     if r != 0 || len as usize != std::mem::size_of::<Ucred>() || cred.pid <= 0 {
         bail!("cannot tell which process serves an X socket: {}", std::io::Error::last_os_error());
     }
-    Ok(cred.pid as u32)
+    Ok(cred)
+}
+
+fn connect_unix(addr: &std::os::unix::net::SocketAddr) -> std::io::Result<UnixStream> {
+    loop {
+        match UnixStream::connect_addr(addr) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            r => return r,
+        }
+    }
 }
 
 /// Connects to `addr` and checks that process `pid` is the one listening there. Nothing is sent.
 fn connect_checked(addr: &std::os::unix::net::SocketAddr, pid: u32, what: &str) -> Result<UnixStream> {
-    let s = loop {
-        match UnixStream::connect_addr(addr) {
-            Ok(s) => break s,
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => bail!("cannot connect to {what}: {e}"),
-        }
-    };
-    let peer = peer_pid(&s)?;
-    if peer != pid {
+    let s = connect_unix(addr).map_err(|e| format!("cannot connect to {what}: {e}"))?;
+    let peer = peer_cred(&s)?.pid;
+    if peer as u32 != pid {
         bail!("{what} is served by another process (pid {peer})");
     }
     Ok(s)
 }
 
-fn connect_socket(name: &DisplayName) -> Result<(Sock, u16, Vec<u8>)> {
-    if name.host.is_empty() {
-        let path = local_socket_path(name.number);
-        let sock = match UnixStream::connect(&path) {
+/// Connects to local display `number` through its socket file, else its abstract name, and
+/// checks who serves it before anything is sent: X server process `pinned` when given, else a
+/// server run by root or by `euid`. A server failing the check is never passed over for the
+/// other name.
+fn connect_local(number: u32, pinned: Option<u32>, euid: u32) -> Result<UnixStream> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+    if pinned == Some(RETIRED) {
+        bail!("the virtual display has stopped");
+    }
+    let path = local_socket_path(number);
+    let mut failed = None;
+    for addr in [SocketAddr::from_pathname(&path)?, SocketAddr::from_abstract_name(path.as_bytes())?] {
+        let s = match connect_unix(&addr) {
             Ok(s) => s,
             Err(e) => {
-                use std::os::linux::net::SocketAddrExt;
-                let addr = std::os::unix::net::SocketAddr::from_abstract_name(path.as_bytes())?;
-                UnixStream::connect_addr(&addr).map_err(|_| Error::msg(format!("cannot connect to X display :{}: {e}", name.number)))?
+                failed.get_or_insert(e);
+                continue;
             }
         };
+        let peer = peer_cred(&s)?;
+        match pinned {
+            Some(pid) if peer.pid as u32 != pid => {
+                bail!("X display :{number} is served by another process (pid {}) than its virtual display", peer.pid)
+            }
+            None if peer.uid != 0 && peer.uid != euid => bail!("X display :{number} is served by another user (uid {})", peer.uid),
+            _ => return Ok(s),
+        }
+    }
+    let why = failed.map(|e| e.to_string()).unwrap_or_default();
+    bail!("cannot connect to X display :{number}: {why}")
+}
+
+fn connect_socket(name: &DisplayName, pinned: Option<u32>) -> Result<(Sock, u16, Vec<u8>)> {
+    if name.host.is_empty() {
+        let sock = connect_local(name.number, pinned, unsafe { geteuid() })?;
         return Ok((Sock::Unix(sock), FAMILY_LOCAL, super::hostname().into_bytes()));
+    }
+    if pinned.is_some() {
+        bail!("only the virtual display can be used, not {}:{}", name.host, name.number);
     }
     let port = 6000 + name.number as u16;
     let addrs: Vec<_> = (name.host.as_str(), port)
@@ -828,7 +890,7 @@ impl Conn {
     /// Connects to `target`, authenticating with its MIT-MAGIC-COOKIE-1 when there is one.
     pub fn connect(target: &Target) -> Result<Conn> {
         let name = parse_display(&target.display)?;
-        let (sock, family, address) = connect_socket(&name)?;
+        let (sock, family, address) = connect_socket(&name, pinned_server())?;
         Conn::handshake(sock, family, &address, &name, target)
     }
 
@@ -1657,6 +1719,7 @@ unsafe extern "C" {
     fn shmctl(id: c_int, cmd: c_int, buf: *mut c_void) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *mut c_void, len: *mut u32) -> c_int;
+    fn geteuid() -> u32;
 }
 
 /// Waits until one of `fds` is readable (or hung up); `timeout_ms < 0` waits forever.
@@ -1779,6 +1842,19 @@ impl Drop for ShmSegment {
 mod tests {
     use super::*;
 
+    /// The error `f` returns once a closed listener is gone. A child another test is starting
+    /// holds a copy of every descriptor until it runs its program, keeping the listener alive.
+    fn when_closed<T>(mut f: impl FnMut() -> Result<T>) -> Error {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match f() {
+                Err(e) => return e,
+                Ok(_) => assert!(std::time::Instant::now() < deadline, "the listener is still there"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn checks_who_serves_a_socket() {
         use std::os::linux::net::SocketAddrExt;
@@ -1794,7 +1870,7 @@ mod tests {
         assert_eq!(peer.read(&mut b).unwrap(), 0, "bytes were sent");
         assert!(connect_checked(&abs, me, "the test socket").is_ok());
         drop(listener);
-        assert!(connect_checked(&abs, me, "the test socket").is_err(), "nobody listens");
+        when_closed(|| connect_checked(&abs, me, "the test socket"));
 
         let dir = std::env::temp_dir().join(format!("safe-rdp-peer-{me}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1807,6 +1883,44 @@ mod tests {
 
         let tcp = Target { display: "localhost:1".into(), xauthority: None };
         assert!(Conn::connect_to_server(&tcp, me).err().expect("TCP display").to_string().contains("not a local display"));
+    }
+
+    /// Every local connection checks who serves the display before sending anything, also
+    /// when only the abstract name is left (as after the server we trusted died).
+    #[test]
+    fn local_connections_check_the_server() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        let me = std::process::id();
+        let euid = unsafe { geteuid() };
+        // A number far outside the X range, served on its abstract name only.
+        let n = 3_000_000_000 + me;
+        let abs = SocketAddr::from_abstract_name(local_socket_path(n).as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&abs).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let err = connect_local(n, Some(me + 1), euid).err().expect("accepted a server other than the pinned one");
+        assert!(err.to_string().contains("another process"), "{err}");
+        if euid != 0 {
+            let err = connect_local(n, None, euid + 1).err().expect("accepted another user's server");
+            assert!(err.to_string().contains("another user"), "{err}");
+        }
+        assert!(connect_local(n, Some(RETIRED), euid).is_err());
+        let mut sent = 0;
+        while let Ok((mut s, _)) = listener.accept() {
+            s.set_nonblocking(false).unwrap();
+            let mut b = [0u8; 8];
+            sent += s.read(&mut b).unwrap();
+        }
+        assert_eq!(sent, 0, "bytes were sent");
+        assert!(connect_local(n, Some(me), euid).is_ok());
+        assert!(connect_local(n, None, euid).is_ok());
+        drop(listener);
+        let err = when_closed(|| connect_local(n, Some(me), euid));
+        assert!(err.to_string().contains("cannot connect"), "{err}");
+
+        let tcp = parse_display("localhost:1").unwrap();
+        let err = connect_socket(&tcp, Some(me)).err().expect("left the pinned server");
+        assert!(err.to_string().contains("only the virtual display"), "{err}");
     }
 
     #[test]
