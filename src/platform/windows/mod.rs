@@ -1,5 +1,6 @@
 //! Windows platform layer.
 
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod desktop;
@@ -7,6 +8,7 @@ mod dxgi;
 pub mod input;
 pub mod keystore;
 pub mod mem;
+pub mod privacy;
 pub mod service;
 pub mod viewer;
 
@@ -49,4 +51,8 @@ pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
         r?;
     }
     Ok(line)
+}
+/// This machine's name as shown to viewers.
+pub fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
 }

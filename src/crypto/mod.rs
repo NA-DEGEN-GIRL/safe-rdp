@@ -4,7 +4,7 @@
 //! (bcrypt.dll, FIPS-validated) or the system OpenSSL libcrypto on Linux (loaded at run time).
 //! Only HKDF, a few HMAC calls, is composed here. Both backends expose the same API:
 //!
-//! * `random`, `sha256`, `hmac_sha256`
+//! * `random`, `sha256`, `hmac_sha256`, `Sha256` (incremental)
 //! * `EcdhKey` (P-256; `agree` returns the big-endian X coordinate, as in SEC 1)
 //! * `Aead` (AES-256-GCM, 96-bit nonce, 128-bit tag, in-place)
 
@@ -182,6 +182,15 @@ mod tests {
         let k = EcdhKey::from_private(&d, &q).unwrap();
         assert_eq!(k.public_bytes().unwrap(), q);
         assert_eq!(hex_encode(&k.agree(&peer).unwrap().0), "46fc62106420ff012e54a434fbdd2d25ccc5852060561e68040dd7778997bd7b");
+    }
+
+    #[test]
+    fn sha256_streaming_matches_one_shot() {
+        let mut s = Sha256::new();
+        s.update(b"a");
+        s.update(b"");
+        s.update(b"bc");
+        assert_eq!(s.finish(), sha256(&[b"abc"]));
     }
 
     #[test]

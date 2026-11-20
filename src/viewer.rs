@@ -66,10 +66,10 @@ pub fn connect(target: &str, downscale: u8, psk: &Secret<32>) -> Result<Connecti
     let mut reader = RecordReader::new(stream.try_clone()?, keys.recv);
     let mut writer = RecordWriter::new(stream.try_clone()?, keys.send);
     let mut hello = Vec::new();
-    ClientMsg::Hello { downscale }.encode(&mut hello);
+    ClientMsg::Hello { downscale, quality: QUALITY_BALANCED as u8, monitor: MONITOR_DEFAULT, flags: 0 }.encode(&mut hello);
     writer.send(&hello)?;
     let (width, height, flags) = match ServerMsg::decode(reader.recv()?)? {
-        ServerMsg::Hello { width, height, flags } => (width as usize, height as usize, flags),
+        ServerMsg::Hello { width, height, flags, .. } => (width as usize, height as usize, flags),
         _ => bail!("unexpected first message from host"),
     };
     if width == 0 || height == 0 {

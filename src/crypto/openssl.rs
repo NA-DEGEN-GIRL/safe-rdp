@@ -16,6 +16,20 @@ pub fn hmac_sha256(_key: &[u8], _parts: &[&[u8]]) -> [u8; 32] {
     unimplemented!("libcrypto backend not implemented yet")
 }
 
+pub struct Sha256;
+
+impl Sha256 {
+    pub fn new() -> Self {
+        unimplemented!("libcrypto backend not implemented yet")
+    }
+
+    pub fn update(&mut self, _data: &[u8]) {}
+
+    pub fn finish(self) -> [u8; 32] {
+        unimplemented!("libcrypto backend not implemented yet")
+    }
+}
+
 pub struct EcdhKey;
 
 impl EcdhKey {

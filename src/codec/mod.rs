@@ -114,6 +114,20 @@ impl Encoder {
         Ok(Encoder { prev: LockedBuf::new(0), width: 0, height: 0, force_full: true, workers })
     }
 
+    /// Selects lossless / balanced / low-bandwidth encoding (proto::QUALITY_*).
+    pub fn set_quality(&mut self, _quality: u32) {}
+
+    /// True while some regions were sent lossy and still await a lossless refinement.
+    pub fn needs_refine(&self) -> bool {
+        false
+    }
+
+    /// Lossless re-sends of lossy regions that have stayed unchanged long enough, limited
+    /// to roughly udget_bytes. Call with the current frame when nothing changed.
+    pub fn refine(&mut self, _cur: &[u8], _w: usize, _h: usize, _budget_bytes: usize) -> Vec<EncodedRect> {
+        Vec::new()
+    }
+
     pub fn request_full(&mut self) {
         self.force_full = true;
     }

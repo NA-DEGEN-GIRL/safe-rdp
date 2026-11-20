@@ -183,7 +183,7 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
     let mut reader = RecordReader::new(stream, keys.recv);
     let opts = &host.opts;
     let downscale = match ClientMsg::decode(reader.recv()?)? {
-        ClientMsg::Hello { downscale } => downscale.clamp(1, 4) as usize,
+        ClientMsg::Hello { downscale, .. } => downscale.clamp(1, 4) as usize,
         _ => bail!("protocol error: viewer did not start with a hello"),
     };
 
@@ -199,7 +199,16 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
         flags |= F_SAS;
     }
     let (w, h) = (area.width as usize / downscale, area.height as usize / downscale);
-    send(&writer, &ServerMsg::Hello { width: w as u16, height: h as u16, flags })?;
+    let monitors = capture::monitors()
+        .iter()
+        .map(|m| MonitorInfo { left: m.left, top: m.top, width: m.width.clamp(0, 0xffff) as u16, height: m.height.clamp(0, 0xffff) as u16 })
+        .collect();
+    let monitor = match opts.monitor {
+        MonitorSel::Primary => 0,
+        MonitorSel::Index(i) => i.min(0xfd) as u8,
+        MonitorSel::All => MONITOR_ALL,
+    };
+    send(&writer, &ServerMsg::Hello { width: w as u16, height: h as u16, flags, monitor, monitors, name: crate::platform::hostname() })?;
 
     let shared = Arc::new(Shared {
         acked: AtomicU32::new(0),
@@ -223,10 +232,10 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
     };
 
     let input_thread = {
-        let (shared, ctl) = (shared.clone(), ctl.clone());
+        let (shared, ctl, w) = (shared.clone(), ctl.clone(), writer.clone());
         let (view_only, sas) = (opts.view_only, opts.sas);
         std::thread::spawn(move || {
-            let r = input_loop(reader, &shared, view_only, sas, clip.as_ref());
+            let r = input_loop(reader, &w, &shared, view_only, sas, clip.as_ref());
             ctl.kick();
             r
         })
@@ -245,6 +254,7 @@ fn run_session(host: &Host, stream: TcpStream, keys: channel::SessionKeys, ctl: 
 
 fn input_loop(
     mut reader: RecordReader<TcpStream>,
+    writer: &Writer,
     shared: &Shared,
     view_only: bool,
     sas: bool,
@@ -258,7 +268,9 @@ fn input_loop(
         match m {
             ClientMsg::Ack(id) => shared.acked.store(id, Ordering::SeqCst),
             ClientMsg::Refresh => shared.refresh.store(true, Ordering::SeqCst),
-            ClientMsg::Ping | ClientMsg::Hello { .. } => {}
+            ClientMsg::Ping(t) => send(writer, &ServerMsg::Pong(t))?,
+            ClientMsg::Hello { .. } | ClientMsg::Set { .. } | ClientMsg::FilePull => {}
+            ClientMsg::FileBegin { .. } | ClientMsg::FileData { .. } | ClientMsg::FileEnd { .. } => {}
             ClientMsg::Clipboard(text) => {
                 if let Some(c) = clip {
                     c.set(text);

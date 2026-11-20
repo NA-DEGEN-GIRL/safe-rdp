@@ -3,6 +3,7 @@
 mod channel;
 mod codec;
 mod crypto;
+mod files;
 mod host;
 mod keys;
 mod net;

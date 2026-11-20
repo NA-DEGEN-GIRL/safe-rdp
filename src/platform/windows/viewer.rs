@@ -151,7 +151,7 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
             loop {
                 let m = match rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(m) => m,
-                    Err(mpsc::RecvTimeoutError::Timeout) => ClientMsg::Ping,
+                    Err(mpsc::RecvTimeoutError::Timeout) => ClientMsg::Ping(0),
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                 };
                 let mut b = Vec::with_capacity(16);
@@ -263,7 +263,7 @@ fn net_loop(reader: &mut RecordReader<TcpStream>, clip: Option<&Clipboard>) -> R
                 }
             }
             ServerMsg::Notice(t) => log!("host: {t}"),
-            ServerMsg::Ping | ServerMsg::Hello { .. } => {}
+            _ => {}
         }
     }
 }

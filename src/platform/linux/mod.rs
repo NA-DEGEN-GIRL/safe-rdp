@@ -1,11 +1,13 @@
 //! Linux platform layer (X11).
 
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod desktop;
 pub mod input;
 pub mod keystore;
 pub mod mem;
+pub mod privacy;
 pub mod viewer;
 
 mod libc {
@@ -103,4 +105,8 @@ pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
         r?;
     }
     Ok(line)
+}
+/// This machine's name as shown to viewers.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default()
 }

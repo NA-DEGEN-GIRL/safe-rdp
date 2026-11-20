@@ -47,6 +47,38 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     hash_parts(BCRYPT_HMAC_SHA256_ALG_HANDLE, key, parts)
 }
 
+/// Incremental SHA-256 (for file transfers).
+pub struct Sha256(BCRYPT_HASH_HANDLE);
+
+unsafe impl Send for Sha256 {}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        let mut h: BCRYPT_HASH_HANDLE = null_mut();
+        let st = unsafe { BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &mut h, null_mut(), 0, null(), 0, 0) };
+        assert!(st >= 0, "BCryptCreateHash failed: {st:#x}");
+        Sha256(h)
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        let st = unsafe { BCryptHashData(self.0, data.as_ptr(), data.len() as u32, 0) };
+        assert!(st >= 0, "BCryptHashData failed: {st:#x}");
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let st = unsafe { BCryptFinishHash(self.0, out.as_mut_ptr(), 32, 0) };
+        assert!(st >= 0, "BCryptFinishHash failed: {st:#x}");
+        out
+    }
+}
+
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        unsafe { BCryptDestroyHash(self.0) };
+    }
+}
+
 /// Ephemeral ECDH P-256 key pair.
 pub struct EcdhKey(BCRYPT_KEY_HANDLE);
 

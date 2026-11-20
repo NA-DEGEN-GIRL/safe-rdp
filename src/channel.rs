@@ -25,10 +25,10 @@ use crate::util::{Error, Result, Secret, SecureVec, wipe};
 use std::io::{Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"SRDP";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 const HELLO_LEN: usize = 4 + 1 + 32 + PUBKEY_LEN;
-const TRANSCRIPT_LABEL: &[u8] = b"safe-rdp/1 transcript";
-const KEYS_LABEL: &[u8] = b"safe-rdp/1 keys";
+const TRANSCRIPT_LABEL: &[u8] = b"safe-rdp/2 transcript";
+const KEYS_LABEL: &[u8] = b"safe-rdp/2 keys";
 /// Upper bound on a single record; bounds memory a peer can make us allocate.
 pub const MAX_RECORD: usize = 32 << 20;
 /// Error text for an orderly or abrupt close by the peer; callers treat it as a normal end.
