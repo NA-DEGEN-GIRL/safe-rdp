@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification};
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -167,13 +168,17 @@ impl App {
 /// Adds `ev` to the UI queue, keeping it bounded however fast the host sends: a notice
 /// replaces a queued notice and a setting's state a queued state of the same setting, and
 /// host-driven events are dropped once `MAX_EVENTS` wait. True if a new entry was added.
-fn enqueue(q: &mut VecDeque<Event>, ev: Event) -> bool {
+fn enqueue(q: &mut VecDeque<Event>, mut ev: Event) -> bool {
     let same = |e: &Event| match (e, &ev) {
         (Event::Notice { generation: a, .. }, Event::Notice { generation: b, .. }) => a == b,
         (Event::State { generation: a, key: k, .. }, Event::State { generation: b, key: l, .. }) => a == b && k == l,
         _ => false,
     };
     if let Some(i) = q.iter().position(same) {
+        // The merged state still answers every `Set` the replaced ones answered.
+        if let (Event::State { states: before, .. }, Event::State { states, .. }) = (&q[i], &mut ev) {
+            *states = states.saturating_add(*before);
+        }
         q[i] = ev;
         return false;
     }
@@ -189,7 +194,8 @@ enum Event {
     Attempt { id: u64, result: Result<Connection> },
     Toast { generation: u64, tone: Tone, title: String, text: String, action: Option<ToastAction> },
     Notice { generation: u64, text: String },
-    State { generation: u64, key: u8, value: u32 },
+    /// The latest of `states` host `State`s for `key` (more than one once merged in the queue).
+    State { generation: u64, key: u8, value: u32, states: u32 },
     SoundFailed { generation: u64, reason: String },
 }
 
@@ -321,6 +327,43 @@ impl Pull {
     }
 }
 
+/// The `Set`s sent for one `SET_*` key that the host has not answered yet (it answers each
+/// with a `State`, in order), and the value the latest asked for.
+#[derive(Clone, Copy, Default)]
+struct Asked {
+    due: u32,
+    value: u32,
+}
+
+/// What a `State` from the host is, next to the `Set`s sent for its key.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    /// The answer to an earlier `Set` than the latest: outdated, ignored.
+    Stale,
+    /// The answer to the latest `Set`, which asked for this value.
+    Latest(u32),
+    /// Nothing was asked: the host changed the setting by itself.
+    Unasked,
+}
+
+impl Asked {
+    fn sent(&mut self, value: u32) {
+        self.due = self.due.saturating_add(1);
+        self.value = value;
+    }
+
+    /// `states` `State`s arrived for the key; what the latest of them is.
+    fn reply(&mut self, states: u32) -> Reply {
+        let due = self.due;
+        self.due = due.saturating_sub(states);
+        match due.cmp(&states) {
+            std::cmp::Ordering::Greater => Reply::Stale,
+            std::cmp::Ordering::Equal => Reply::Latest(self.value),
+            std::cmp::Ordering::Less => Reply::Unasked,
+        }
+    }
+}
+
 /// Settings the user chose; they survive reconnects and seed the next hello.
 struct Prefs {
     quality: u8,
@@ -356,8 +399,8 @@ struct Ui {
     view_only: bool,
     /// `SET_*` keys the host reported unavailable.
     unavailable: [bool; 8],
-    /// `SET_*` keys changed by the user and not yet confirmed.
-    pending: [bool; 8],
+    /// `SET_*` keys changed here and not yet confirmed.
+    asked: [Asked; 8],
     sound_local_failed: bool,
     bar: Bar,
     toasts: Toasts,
@@ -473,7 +516,7 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
         flags: 0,
         view_only: opts.view_only,
         unavailable: [false; 8],
-        pending: [false; 8],
+        asked: [Asked::default(); 8],
         sound_local_failed: false,
         bar,
         toasts: Toasts::new(hwnd),
@@ -501,6 +544,8 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
 
     unsafe {
         DragAcceptFiles(hwnd, 1);
+        // Locking and unlocking (Win+L, Ctrl+Alt+Del) hide key releases from the hook.
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         ShowWindow(hwnd, SW_SHOW);
         SetTimer(hwnd, T_TICK, TICK_MS, None);
     }
@@ -619,8 +664,8 @@ fn read_session(
                 }
             }
             ServerMsg::Notice(text) => {
-                let text = toolbar::clean_text(&text, true, MAX_HOST_TEXT);
-                log!("host: {}", text.replace('\n', " "));
+                let text = host_text(&text, true);
+                log!("host: {}", host_line(&text));
                 s.last_notice_ms.store(s.ms(), Ordering::SeqCst);
                 app.post(Event::Notice { generation: s.generation, text });
             }
@@ -629,7 +674,7 @@ fn read_session(
             ServerMsg::FileData { id, data } => downloads.data(s, id, data),
             ServerMsg::FileEnd { id, sha256 } => downloads.end(s, id, &sha256),
             ServerMsg::FileResult { id, ok, message } => file_result(s, id, ok, message),
-            ServerMsg::State { key, value } => app.post(Event::State { generation: s.generation, key, value }),
+            ServerMsg::State { key, value } => app.post(Event::State { generation: s.generation, key, value, states: 1 }),
             ServerMsg::Ping | ServerMsg::Hello { .. } => {}
         }
     }
@@ -766,7 +811,7 @@ impl Downloads {
         let name = inc.name.clone();
         match inc.finish(sha256) {
             Ok(path) => {
-                log!("received {}", path.display());
+                log!("received {}", printable(&path.display().to_string()));
                 let folder = path.parent().map(Path::to_path_buf);
                 s.toast(
                     Tone::Success,
@@ -792,7 +837,7 @@ fn file_result(s: &Session, id: u32, ok: bool, message: String) {
         log!("file result for an unknown transfer {id}");
         return;
     };
-    let message = toolbar::clean_text(&message, false, MAX_HOST_TEXT);
+    let message = host_text(&message, false);
     if ok {
         log!("sent {name}");
         s.toast(Tone::Success, trf(Txt::Sent, &[&name]), trf(Txt::SavedOnHost, &[&message]), None);
@@ -929,7 +974,7 @@ impl Ui {
         self.flags = flags;
         self.view_only = view_only;
         self.unavailable = [false; 8];
-        self.pending = [false; 8];
+        self.asked = [Asked::default(); 8];
         self.sound_local_failed = false;
         self.last_notice = None;
         self.notice_waiting = false;
@@ -1002,9 +1047,9 @@ impl Ui {
                 }
                 After::Nothing
             }
-            Event::State { generation, key, value } => {
+            Event::State { generation, key, value, states } => {
                 if generation == self.generation {
-                    self.on_state(key, value);
+                    self.on_state(key, value, states);
                 }
                 After::Nothing
             }
@@ -1012,11 +1057,7 @@ impl Ui {
                 if generation == self.generation {
                     log!("sound playback unavailable: {reason}");
                     self.sound_local_failed = true;
-                    self.prefs.audio = false;
-                    if let Some(s) = APP.get().unwrap().session() {
-                        s.sound.store(false, Ordering::Relaxed);
-                        s.send(ClientMsg::Set { key: SET_AUDIO, value: 0 });
-                    }
+                    self.set_sound(false, true);
                     self.toasts.show(Tone::Warning, tr(Txt::SoundUnavailable), &reason, None);
                 }
                 After::Nothing
@@ -1047,8 +1088,9 @@ impl Ui {
         let reason = reason_text(kind, &reason);
         if !core::should_reconnect(kind, lifetime, reconnected, since_notice) {
             let message = match (kind, &self.last_notice) {
+                // One line: the message also ends up in the log as the viewer's last error.
                 (EndKind::Closed, Some(n)) if since_notice.is_some_and(|d| d < core::NOTICE_GRACE) => {
-                    trf(Txt::SessionEnded, &[&self.host, n])
+                    trf(Txt::SessionEnded, &[&self.host, &host_line(n)])
                 }
                 (EndKind::Closed, _) if reconnected => trf(Txt::KickedAgain, &[&self.host]),
                 _ => trf(Txt::SessionEnded, &[&self.host, &reason]),
@@ -1139,12 +1181,17 @@ impl Ui {
         self.overlay.show(&trf(Txt::Reconnecting, &[&self.host]), &text);
     }
 
-    fn on_state(&mut self, key: u8, value: u32) {
+    fn on_state(&mut self, key: u8, value: u32, states: u32) {
         let k = key as usize;
         if k >= self.unavailable.len() {
             return;
         }
-        let requested = std::mem::replace(&mut self.pending[k], false);
+        // While later `Set`s are unanswered, the latest of them decides.
+        let reply = self.asked[k].reply(states);
+        if reply == Reply::Stale {
+            return;
+        }
+        let requested = reply != Reply::Unasked;
         if value == STATE_UNAVAILABLE {
             self.unavailable[k] = true;
             let label = match key {
@@ -1170,15 +1217,15 @@ impl Ui {
                 SET_DOWNSCALE if (1..=4).contains(&value) => self.prefs.downscale = value as u8,
                 SET_MONITOR if value == MONITOR_ALL as u32 || (value as usize) < self.monitors.len() => self.prefs.monitor = value as u8,
                 SET_AUDIO | SET_PRIVACY => {
-                    let user_on = if key == SET_AUDIO { self.prefs.audio } else { self.prefs.privacy };
-                    let (on, refuse) = feature_from_host(user_on, value);
+                    let current = if key == SET_AUDIO { self.prefs.audio } else { self.prefs.privacy };
+                    let (on, refuse) = feature_state(current, &reply, value);
                     if key == SET_AUDIO {
                         self.set_sound(on, false);
                     } else {
                         self.prefs.privacy = on;
                     }
-                    if refuse && let Some(s) = APP.get().unwrap().session() {
-                        s.send(ClientMsg::Set { key, value: 0 });
+                    if refuse {
+                        self.request(key, 0);
                     }
                 }
                 _ => {}
@@ -1191,7 +1238,7 @@ impl Ui {
     fn request(&mut self, key: u8, value: u32) {
         if let Some(s) = APP.get().unwrap().session() {
             s.send(ClientMsg::Set { key, value });
-            self.pending[key as usize] = true;
+            self.asked[key as usize].sent(value);
         }
     }
 
@@ -1417,6 +1464,29 @@ impl Ui {
 fn feature_from_host(user_on: bool, value: u32) -> (bool, bool) {
     let host_on = value != 0;
     (user_on && host_on, host_on && !user_on)
+}
+
+/// `feature_from_host` for a feature that is `current`ly on or off: the answer to the latest
+/// `Set` is held to what that `Set` asked for, an unasked `State` to the current choice, and an
+/// outdated answer changes nothing.
+fn feature_state(current: bool, reply: &Reply, value: u32) -> (bool, bool) {
+    match *reply {
+        Reply::Stale => (current, false),
+        Reply::Latest(asked) => feature_from_host(asked != 0, value),
+        Reply::Unasked => feature_from_host(current, value),
+    }
+}
+
+/// Text from the host made safe to show: `clean_text`, then `proto::printable` on each line, so
+/// nothing deceptive is left (line separators, invisible characters, ...).
+fn host_text(s: &str, multiline: bool) -> String {
+    let s = toolbar::clean_text(s, multiline, MAX_HOST_TEXT);
+    s.split('\n').map(printable).collect::<Vec<_>>().join("\n")
+}
+
+/// Text from the host on one line, for the log and one-line messages.
+fn host_line(s: &str) -> String {
+    printable(&s.replace('\n', " "))
 }
 
 /// A connect error without the "cannot connect to <address>: " prefix the overlay already implies.
@@ -1861,12 +1931,7 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
     if app.local_keys.load(Ordering::SeqCst) {
         return false;
     }
-    let bit = match vk {
-        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => MOD_CTRL,
-        VK_MENU | VK_LMENU | VK_RMENU => MOD_ALT,
-        VK_LWIN | VK_RWIN => MOD_WIN,
-        _ => 0,
-    };
+    let bit = mod_bit(vk);
     if bit != 0 {
         if up {
             app.mods.fetch_and(!bit, Ordering::SeqCst);
@@ -1874,7 +1939,10 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
             app.mods.fetch_or(bit, Ordering::SeqCst);
         }
     }
-    let mods = app.mods.load(Ordering::SeqCst);
+    // Win always reaches the local system in a window, so it is read from there: the release of
+    // Win+L happens on the lock screen, where this hook never sees it.
+    let win = unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 };
+    let mods = app.mods.load(Ordering::SeqCst) | if win { MOD_WIN } else { 0 };
     let ctrl_alt = mods & (MOD_CTRL | MOD_ALT) == (MOD_CTRL | MOD_ALT);
     if up && lock(&app.swallowed).remove(&vk) {
         return true;
@@ -1891,12 +1959,10 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
         }
         return true;
     }
-    // Decided before the session check, so `routes` follows every press and release.
-    let local = stays_local(app.is_fullscreen(), mods, vk, up, &mut lock(&app.routes));
-    let Some(s) = session.filter(|s| !s.view_only) else { return false };
-    if local {
-        return false;
-    }
+    // Decided with the session check, so `routes` records where every press really went.
+    let session = session.filter(|s| !s.view_only);
+    let local = stays_local(app.is_fullscreen(), mods, vk, up, session.is_some(), &mut lock(&app.routes));
+    let Some(s) = session.filter(|_| !local) else { return false };
     let mut flags = if up { KEY_UP } else { 0 };
     if extended {
         flags |= KEY_EXTENDED;
@@ -1908,22 +1974,33 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
 /// Whether a key event goes to the local desktop instead of the host. In a window the
 /// Windows key with everything pressed while it is held (Win+D, Win+E, ...) and Alt+Tab /
 /// Alt+Esc / Ctrl+Esc stay local (like mstsc's default); in full screen everything goes to
-/// the host. Auto-repeats and the release of a key follow its first press (`routes`); a
-/// release whose press was not seen here (it went to another window or a menu) stays local.
-fn stays_local(fullscreen: bool, mods: u8, vk: u16, up: bool, routes: &mut HashMap<u16, bool>) -> bool {
+/// the host; without a session that takes input (`to_host` false) everything stays local.
+/// Auto-repeats and the release of a key follow its first press (`routes`); a release whose
+/// press was not seen here (it went to another window or a menu) stays local.
+fn stays_local(fullscreen: bool, mods: u8, vk: u16, up: bool, to_host: bool, routes: &mut HashMap<u16, bool>) -> bool {
     if up {
         return routes.remove(&vk).unwrap_or(true);
     }
     if let Some(&local) = routes.get(&vk) {
         return local;
     }
-    let local = !fullscreen
-        && (matches!(vk, VK_LWIN | VK_RWIN)
-            || mods & MOD_WIN != 0
-            || (mods & MOD_ALT != 0 && matches!(vk, VK_TAB | VK_ESCAPE))
-            || (mods & MOD_CTRL != 0 && vk == VK_ESCAPE));
+    let local = !to_host
+        || (!fullscreen
+            && (matches!(vk, VK_LWIN | VK_RWIN)
+                || mods & MOD_WIN != 0
+                || (mods & MOD_ALT != 0 && matches!(vk, VK_TAB | VK_ESCAPE))
+                || (mods & MOD_CTRL != 0 && vk == VK_ESCAPE)));
     routes.insert(vk, local);
     local
+}
+
+/// The modifier `on_key` tracks for `vk`. Not Win: that is read from the system.
+fn mod_bit(vk: u16) -> u8 {
+    match vk {
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => MOD_CTRL,
+        VK_MENU | VK_LMENU | VK_RMENU => MOD_ALT,
+        _ => 0,
+    }
 }
 
 unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2052,6 +2129,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 release_all(app);
                 0
             }
+            WM_WTSSESSION_CHANGE => {
+                if matches!(wp as u32, WTS_SESSION_LOCK | WTS_SESSION_UNLOCK) {
+                    release_all(app);
+                }
+                0
+            }
             WM_EXITMENULOOP => {
                 app.local_keys.store(false, Ordering::SeqCst);
                 0
@@ -2142,6 +2225,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 0
             }
             WM_DESTROY => {
+                WTSUnRegisterSessionNotification(hwnd);
                 PostQuitMessage(0);
                 0
             }
@@ -2246,7 +2330,7 @@ mod tests {
     fn host_events_cannot_flood_the_ui() {
         let mut q = VecDeque::new();
         let notice = |g: u64, t: &str| Event::Notice { generation: g, text: t.into() };
-        let state = |key: u8, value: u32| Event::State { generation: 1, key, value };
+        let state = |key: u8, value: u32| Event::State { generation: 1, key, value, states: 1 };
         assert!(enqueue(&mut q, notice(1, "a")));
         assert!(!enqueue(&mut q, notice(1, "b")), "merged into the queued notice");
         assert!(enqueue(&mut q, notice(2, "c")));
@@ -2255,7 +2339,8 @@ mod tests {
         assert!(enqueue(&mut q, state(SET_PRIVACY, 1)));
         assert_eq!(q.len(), 4);
         assert!(matches!(&q[0], Event::Notice { text, .. } if text == "b"));
-        assert!(matches!(q[2], Event::State { key: SET_AUDIO, value: 0, .. }));
+        // The merged state still counts as both answers.
+        assert!(matches!(q[2], Event::State { key: SET_AUDIO, value: 0, states: 2, .. }));
         let toast = |i: usize| Event::Toast { generation: 1, tone: Tone::Info, title: i.to_string(), text: String::new(), action: None };
         for i in 0..1000 {
             enqueue(&mut q, toast(i));
@@ -2281,39 +2366,133 @@ mod tests {
         assert_eq!(feature_from_host(false, 0), (false, false));
     }
 
+    /// Clicks on a feature toggle, then the host's answers (`states` per event); returns
+    /// whether the feature ends up on and how often the host was told to turn it off again.
+    fn settle(on: bool, clicks: usize, answers: &[(u32, u32)]) -> (bool, usize, u32) {
+        let (mut on, mut asked, mut refused) = (on, Asked::default(), 0);
+        for _ in 0..clicks {
+            on = !on;
+            asked.sent(on as u32);
+        }
+        for &(value, states) in answers {
+            let refuse;
+            (on, refuse) = feature_state(on, &asked.reply(states), value);
+            if refuse {
+                refused += 1;
+                asked.sent(0);
+            }
+        }
+        (on, refused, asked.due)
+    }
+
+    #[test]
+    fn quick_clicks_end_as_the_last_click() {
+        // On, then off and on again within one round trip: the outdated "off" changes nothing.
+        assert_eq!(settle(true, 2, &[(0, 1), (1, 1)]), (true, 0, 0));
+        // The same answers merged in the queue.
+        assert_eq!(settle(true, 2, &[(1, 2)]), (true, 0, 0));
+        // Off, then on, then off: the host's "on" for the middle click does not turn it on.
+        assert_eq!(settle(true, 3, &[(0, 1), (1, 1), (0, 1)]), (false, 0, 0));
+        assert_eq!(settle(false, 2, &[(1, 1), (0, 1)]), (false, 0, 0));
+        // The host keeps it on although the latest click asked for off: told again.
+        assert_eq!(settle(true, 1, &[(1, 1)]), (false, 1, 1));
+        // Refused, or turned on by the host unasked.
+        assert_eq!(settle(false, 1, &[(0, 1)]), (false, 0, 0));
+        assert_eq!(settle(false, 0, &[(1, 1)]), (false, 1, 1));
+        assert_eq!(settle(true, 0, &[(0, 1), (1, 1)]), (false, 1, 1));
+        // More answers than questions: the extra ones are the host's own, held to the choice.
+        assert_eq!(settle(true, 1, &[(1, 3)]), (false, 1, 1));
+        assert_eq!(settle(false, 1, &[(1, 3)]), (true, 0, 0));
+    }
+
+    #[test]
+    fn answers_are_matched_to_the_latest_request() {
+        let mut a = Asked::default();
+        assert_eq!(a.reply(1), Reply::Unasked);
+        a.sent(2);
+        a.sent(0);
+        assert_eq!(a.reply(1), Reply::Stale);
+        assert_eq!(a.reply(1), Reply::Latest(0));
+        assert_eq!(a.reply(1), Reply::Unasked);
+        a.sent(1);
+        a.sent(3);
+        a.sent(2);
+        assert_eq!(a.reply(2), Reply::Stale);
+        assert_eq!(a.reply(1), Reply::Latest(2));
+        assert_eq!(a.due, 0);
+    }
+
     #[test]
     fn windows_key_chords_stay_local_in_a_window() {
         let (mut r, win, d, e) = (HashMap::new(), MOD_WIN, b'D' as u16, b'E' as u16);
         // Win+D: every event stays local, so the host gets no 'd' and Start does not open.
-        assert!(stays_local(false, win, VK_LWIN, false, &mut r));
-        assert!(stays_local(false, win, d, false, &mut r));
-        assert!(stays_local(false, win, d, true, &mut r));
-        assert!(stays_local(false, 0, VK_LWIN, true, &mut r));
+        assert!(stays_local(false, win, VK_LWIN, false, true, &mut r));
+        assert!(stays_local(false, win, d, false, true, &mut r));
+        assert!(stays_local(false, win, d, true, true, &mut r));
+        assert!(stays_local(false, 0, VK_LWIN, true, true, &mut r));
         assert!(r.is_empty());
         // Shift pressed before Win keeps going to the host, auto-repeats and release included.
-        assert!(!stays_local(false, 0, VK_LSHIFT, false, &mut r));
-        assert!(stays_local(false, win, VK_LWIN, false, &mut r));
-        assert!(!stays_local(false, win, VK_LSHIFT, false, &mut r));
-        assert!(!stays_local(false, win, VK_LSHIFT, true, &mut r));
+        assert!(!stays_local(false, 0, VK_LSHIFT, false, true, &mut r));
+        assert!(stays_local(false, win, VK_LWIN, false, true, &mut r));
+        assert!(!stays_local(false, win, VK_LSHIFT, false, true, &mut r));
+        assert!(!stays_local(false, win, VK_LSHIFT, true, true, &mut r));
         // A key pressed during the chord is released locally, even after Win went up.
-        assert!(stays_local(false, win, e, false, &mut r));
-        assert!(stays_local(false, 0, VK_LWIN, true, &mut r));
-        assert!(stays_local(false, 0, e, true, &mut r));
-        assert!(!stays_local(false, 0, e, false, &mut r));
-        assert!(!stays_local(false, 0, e, true, &mut r));
+        assert!(stays_local(false, win, e, false, true, &mut r));
+        assert!(stays_local(false, 0, VK_LWIN, true, true, &mut r));
+        assert!(stays_local(false, 0, e, true, true, &mut r));
+        assert!(!stays_local(false, 0, e, false, true, &mut r));
+        assert!(!stays_local(false, 0, e, true, true, &mut r));
         // Alt+Tab stays local (Alt itself goes to the host).
-        assert!(!stays_local(false, MOD_ALT, VK_LMENU, false, &mut r));
-        assert!(stays_local(false, MOD_ALT, VK_TAB, false, &mut r));
-        assert!(!stays_local(false, 0, VK_LMENU, true, &mut r));
-        assert!(stays_local(false, 0, VK_TAB, true, &mut r));
+        assert!(!stays_local(false, MOD_ALT, VK_LMENU, false, true, &mut r));
+        assert!(stays_local(false, MOD_ALT, VK_TAB, false, true, &mut r));
+        assert!(!stays_local(false, 0, VK_LMENU, true, true, &mut r));
+        assert!(stays_local(false, 0, VK_TAB, true, true, &mut r));
         // Full screen: everything goes to the host.
-        assert!(!stays_local(true, win, VK_LWIN, false, &mut r));
-        assert!(!stays_local(true, win, d, false, &mut r));
-        assert!(!stays_local(true, win, d, true, &mut r));
-        assert!(!stays_local(true, 0, VK_LWIN, true, &mut r));
+        assert!(!stays_local(true, win, VK_LWIN, false, true, &mut r));
+        assert!(!stays_local(true, win, d, false, true, &mut r));
+        assert!(!stays_local(true, win, d, true, true, &mut r));
+        assert!(!stays_local(true, 0, VK_LWIN, true, true, &mut r));
         assert!(r.is_empty());
         // Pressed before the viewer had the focus: the release is not swallowed either.
-        assert!(stays_local(true, 0, VK_RETURN, true, &mut r));
+        assert!(stays_local(true, 0, VK_RETURN, true, true, &mut r));
+    }
+
+    #[test]
+    fn keys_after_a_lost_windows_release_reach_the_host() {
+        // Win+L: the release of Win happens on the lock screen and is never seen here. Win is
+        // not tracked (it is read from the system), so nothing keeps later keys local.
+        let mut mods = 0;
+        for vk in [VK_LWIN, VK_RWIN] {
+            mods |= mod_bit(vk);
+        }
+        assert_eq!(mods, 0);
+        assert!(!stays_local(false, mods, b'A' as u16, false, true, &mut HashMap::new()));
+        assert_eq!(mod_bit(VK_RCONTROL), MOD_CTRL);
+        assert_eq!(mod_bit(VK_LMENU), MOD_ALT);
+    }
+
+    #[test]
+    fn keys_pressed_without_a_session_are_released_locally() {
+        let mut r = HashMap::new();
+        // Shift pressed while reconnecting (or view-only) goes to the local system, and so do
+        // its auto-repeats and its release after the session is back: it never sticks here.
+        assert!(stays_local(false, 0, VK_LSHIFT, false, false, &mut r));
+        assert!(stays_local(false, 0, VK_LSHIFT, false, true, &mut r));
+        assert!(stays_local(false, 0, VK_LSHIFT, true, true, &mut r));
+        assert!(stays_local(true, 0, VK_LSHIFT, false, false, &mut r));
+        assert!(stays_local(true, 0, VK_LSHIFT, true, true, &mut r));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn host_text_is_printable() {
+        // Line breaks stay in toasts; escapes, bidi and invisible characters do not.
+        assert_eq!(host_text("a\u{2028}b\x1b[31m\nc\u{200b}\u{202e}d\te", true), "a?b[31m\nc?d e");
+        assert_eq!(host_text("ok\r\nerror:\u{2029}forged", false), "ok error:?forged");
+        // One line in the log and in the final message, whatever the host sent.
+        assert_eq!(host_line("x\nerror: forged"), "x error: forged");
+        assert_eq!(host_line("\x1b]0;t\x07\r"), "?]0;t??");
+        assert!(!host_line(&host_text(&"a\n".repeat(3000), true)).contains('\n'));
     }
 
     fn env_num(name: &str) -> Option<u64> {
