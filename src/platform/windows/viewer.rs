@@ -4,16 +4,17 @@
 //!   Ctrl+Alt+Enter  toggle full screen
 //!   Ctrl+Alt+End    send Ctrl+Alt+Del to the host (service mode only)
 
-use crate::capture::CURSOR_IDS;
-use crate::channel::{self, RecordReader, RecordWriter};
-use crate::clipboard::Clipboard;
+use super::capture::CURSOR_IDS;
+use super::clipboard::Clipboard;
+use super::mem::LockedBuf;
+use crate::channel::{self, RecordReader};
 use crate::codec::{self, Decoder, Rect};
-use crate::mem::LockedBuf;
+use crate::viewer::ViewerOptions;
 use crate::proto::*;
 use crate::util::{Error, Result, Secret, wide};
 use crate::{bail, log};
 use std::collections::HashSet;
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -23,16 +24,6 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
-pub struct ViewerOptions {
-    pub fullscreen: bool,
-    pub clipboard: bool,
-    pub view_only: bool,
-    /// Allow local screenshot/recording tools to capture the viewer window.
-    pub allow_capture: bool,
-    /// Ask the host for 1/N resolution (1 = full).
-    pub downscale: u8,
-}
 
 const WM_APP_FRAME: u32 = WM_APP + 1;
 const WM_APP_CURSOR: u32 = WM_APP + 2;
@@ -78,7 +69,7 @@ unsafe impl Send for Saved {}
 static APP: OnceLock<App> = OnceLock::new();
 
 /// True once the viewer window exists (later errors are reported in the window).
-pub fn window_shown() -> bool {
+fn window_shown() -> bool {
     APP.get().is_some_and(|a| a.hwnd.load(Ordering::SeqCst) != 0)
 }
 
@@ -104,52 +95,29 @@ impl App {
     }
 }
 
-fn resolve(target: &str) -> Result<SocketAddr> {
-    let with_port = if target.parse::<SocketAddr>().is_ok() || target.rsplit_once(':').is_some_and(|(h, p)| !h.contains(':') && p.parse::<u16>().is_ok()) {
-        target.to_string()
-    } else if target.contains(':') {
-        format!("[{target}]:{DEFAULT_PORT}")
-    } else {
-        format!("{target}:{DEFAULT_PORT}")
+/// Runs the viewer. When started from a shortcut or Explorer the console exists only for us:
+/// hide it, and report errors that happen before the window appears in a message box.
+pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let own_console = unsafe {
+        let mut pids = [0u32; 4];
+        GetConsoleProcessList(pids.as_mut_ptr(), 4) == 1
     };
-    let addrs: Vec<SocketAddr> = with_port.to_socket_addrs().map_err(|e| format!("cannot resolve {target}: {e}"))?.collect();
-    // Prefer Tailscale addresses when a name resolves to several.
-    addrs
-        .iter()
-        .find(|a| crate::net::is_tailscale(a.ip()))
-        .or(addrs.first())
-        .copied()
-        .ok_or_else(|| Error::msg(format!("{target} has no addresses")))
+    if own_console {
+        unsafe { FreeConsole() };
+    }
+    let r = run_window(target, opts, psk);
+    if let (true, false, Err(e)) = (own_console, window_shown(), &r) {
+        let (text, title) = (wide(&e.to_string()), wide("safe-rdp"));
+        unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_ICONERROR | MB_OK) };
+    }
+    r
 }
 
-pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
-    let addr = resolve(target)?;
-    if !crate::net::is_tailscale(addr.ip()) && !addr.ip().is_loopback() {
-        log!("warning: {addr} is not a Tailscale address; traffic is still end-to-end encrypted");
-    }
-    log!("connecting to {addr}...");
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let keys = channel::client_handshake(&mut &stream, &psk.0)?;
+fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
+    let crate::viewer::Connection { stream, mut reader, mut writer, width: w, height: h, flags, .. } =
+        crate::viewer::connect(target, opts.downscale, &psk)?;
     drop(psk);
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let mut reader = RecordReader::new(stream.try_clone()?, keys.recv);
-    let mut writer = RecordWriter::new(stream.try_clone()?, keys.send);
-    let mut hello = Vec::new();
-    ClientMsg::Hello { downscale: opts.downscale }.encode(&mut hello);
-    writer.send(&hello)?;
-    let (w, h, flags) = match ServerMsg::decode(reader.recv()?)? {
-        ServerMsg::Hello { width, height, flags } => (width as usize, height as usize, flags),
-        _ => bail!("unexpected first message from host"),
-    };
-    if w == 0 || h == 0 {
-        bail!("host reported an empty screen");
-    }
-    log!("connected: remote screen {w}x{h}");
     let view_only = opts.view_only || flags & F_VIEW_ONLY != 0;
 
     let (tx, rx) = mpsc::channel::<ClientMsg>();

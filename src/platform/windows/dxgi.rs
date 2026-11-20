@@ -4,8 +4,8 @@
 //! declared by hand. Slot numbers were taken from the Windows SDK headers (dxgi.h,
 //! dxgi1_2.h, d3d11.h, C interface section).
 
-use crate::capture::Area;
-use crate::mem::LockedBuf;
+use crate::screen::Area;
+use super::mem::LockedBuf;
 use crate::util::{Error, Result};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};

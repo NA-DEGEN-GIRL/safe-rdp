@@ -2,10 +2,10 @@
 name = "safe-rdp"
 version = "0.1.0"
 edition = "2024"
-description = "Minimal, hardened remote desktop for Windows over Tailscale"
+description = "Minimal, hardened remote desktop for Windows and Linux over Tailscale"
 license = "MIT"
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61.2"
 features = [
     "Win32_Foundation",

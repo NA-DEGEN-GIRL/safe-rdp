@@ -78,13 +78,8 @@ pub fn set_log_file(path: &std::path::Path) -> Result<()> {
 }
 
 pub fn log_line(msg: &str) {
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-    let mut t = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut t) };
-    let line = format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {msg}\n",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-    );
+    let [y, mo, d, h, mi, s] = crate::platform::local_time();
+    let line = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} {msg}\n");
     let _ = std::io::stderr().write_all(line.as_bytes());
     if let Some(f) = LOG_FILE.get() {
         if let Ok(mut f) = f.lock() {

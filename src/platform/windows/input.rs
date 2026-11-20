@@ -1,6 +1,7 @@
 //! Input injection on the host via SendInput.
 
-use crate::capture::{Area, virtual_screen};
+use super::capture::virtual_screen;
+use crate::screen::Area;
 use crate::proto::*;
 use std::collections::HashSet;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -146,7 +147,7 @@ mod tests {
         };
         let mut orig = POINT { x: 0, y: 0 };
         unsafe { GetCursorPos(&mut orig) };
-        let area = crate::capture::resolve(crate::capture::MonitorSel::Primary).unwrap();
+        let area = crate::platform::capture::resolve(crate::screen::MonitorSel::Primary).unwrap();
         let mut inj = Injector::default();
         inj.set_area(area);
         let mut seen = Vec::new();

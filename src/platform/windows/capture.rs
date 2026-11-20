@@ -1,28 +1,13 @@
 //! GDI screen capture and cursor-shape tracking.
 
-use crate::mem::lock_pages;
+use super::mem::lock_pages;
+pub use crate::screen::{Area, MonitorSel};
 use crate::proto::Cursor;
 use crate::util::{Error, Result};
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
-/// A rectangle of the virtual desktop, in physical pixels.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Area {
-    pub left: i32,
-    pub top: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MonitorSel {
-    Primary,
-    Index(usize),
-    All,
-}
 
 unsafe extern "system" fn enum_proc(hmon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
     let out = unsafe { &mut *(data as *mut Vec<(Area, bool)>) };
@@ -143,14 +128,14 @@ impl Drop for GdiCapture {
 /// Screen source: DXGI Desktop Duplication when possible, GDI otherwise
 /// (multi-monitor "all", rotated or HDR displays, no GPU, or DXGI refused).
 pub enum Capturer {
-    Dxgi(crate::dxgi::DxgiCapture),
+    Dxgi(super::dxgi::DxgiCapture),
     Gdi(GdiCapture),
 }
 
 impl Capturer {
     pub fn new(area: Area) -> Result<Capturer> {
         static LAST_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-        match crate::dxgi::DxgiCapture::new(area) {
+        match super::dxgi::DxgiCapture::new(area) {
             Ok(d) => Ok(Capturer::Dxgi(d)),
             Err(e) => {
                 let reason = e.to_string();
@@ -166,6 +151,37 @@ impl Capturer {
 
     pub fn gdi(area: Area) -> Result<Capturer> {
         Ok(Capturer::Gdi(GdiCapture::new(area)?))
+    }
+
+    /// Opens the best source for `sel` (already resolved to `area`).
+    pub fn open(sel: MonitorSel, area: Area) -> Result<Capturer> {
+        if sel == MonitorSel::All && monitors().len() > 1 {
+            Capturer::gdi(area)
+        } else {
+            Capturer::new(area)
+        }
+    }
+
+    /// After a fallback to GDI, tries DXGI again (a secure desktop, full-screen app or driver
+    /// reset may have passed). Returns true if the source changed.
+    pub fn try_upgrade(&mut self, sel: MonitorSel) -> bool {
+        if let Capturer::Gdi(g) = self {
+            if sel == MonitorSel::All && monitors().len() > 1 {
+                return false;
+            }
+            if let Ok(d) = super::dxgi::DxgiCapture::new(g.area) {
+                *self = Capturer::Dxgi(d);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn backend(&self) -> &'static str {
+        match self {
+            Capturer::Dxgi(_) => "DXGI",
+            Capturer::Gdi(_) => "GDI",
+        }
     }
 
     pub fn area(&self) -> Area {

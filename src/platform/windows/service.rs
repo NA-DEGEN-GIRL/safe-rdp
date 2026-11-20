@@ -9,7 +9,7 @@
 //! Ctrl+Alt+Del cannot be synthesised with SendInput; the agent signals a SYSTEM-only event
 //! and the service calls SendSAS (requires the SoftwareSASGeneration policy, `--enable-sas`).
 
-use crate::keystore;
+use super::keystore;
 use crate::util::{Error, Result, wide};
 use crate::{bail, log};
 use std::ffi::c_void;

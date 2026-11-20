@@ -1,23 +1,19 @@
-//! safe-rdp: a small, auditable remote desktop for Windows, meant to run over Tailscale.
+//! safe-rdp: a small, auditable remote desktop for Windows and Linux, meant to run over Tailscale.
 
-mod capture;
 mod channel;
-mod client;
-mod clipboard;
 mod codec;
 mod crypto;
-mod desktop;
-mod dxgi;
-mod input;
-mod keystore;
-mod mem;
+mod host;
+mod keys;
 mod net;
+mod platform;
 mod proto;
-mod server;
-mod service;
+mod screen;
 mod util;
+mod viewer;
 
-use capture::MonitorSel;
+use platform::{capture, keystore};
+use screen::MonitorSel;
 use net::PeerPolicy;
 use std::net::IpAddr;
 use util::{Error, Result, Secret};
@@ -71,11 +67,6 @@ fn main() {
     }
 }
 
-fn dpi_aware() {
-    use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-}
-
 fn dispatch(args: &[String]) -> Result<()> {
     let Some(cmd) = args.first() else {
         print!("{USAGE}");
@@ -88,41 +79,44 @@ fn dispatch(args: &[String]) -> Result<()> {
         "host" => {
             let (opts, key_file) = parse_host(rest, false)?;
             let key = load_key(key_file.as_deref())?;
-            dpi_aware();
-            server::run(opts, key)
+            platform::init_process();
+            host::run(opts, key)
         }
+        #[cfg(windows)]
         "agent" => {
             // Started by the service as SYSTEM inside the console session.
             util::set_log_file(&keystore::service_dir().join("host.log"))?;
             let (opts, _) = parse_host(rest, true)?;
             let key = keystore::load_service_key()?;
-            dpi_aware();
-            server::run(opts, key)
+            platform::init_process();
+            host::run(opts, key)
         }
         "connect" => connect(rest),
+        #[cfg(windows)]
         "service" => match rest.first().map(String::as_str) {
             Some("install") => {
                 let (opts, key_file) = parse_host(&rest[1..], true)?;
                 if key_file.is_some() {
                     bail!("--key-file is not supported for the service; it uses this user's stored key");
                 }
-                service::install(&rest[1..], opts.port, opts.sas)
+                platform::service::install(&rest[1..], opts.port, opts.sas)
             }
-            Some("uninstall") => service::uninstall(),
+            Some("uninstall") => platform::service::uninstall(),
             Some("status") => {
-                println!("{}", service::status()?);
+                println!("{}", platform::service::status()?);
                 Ok(())
             }
-            Some("run") => service::run_dispatcher(rest[1..].to_vec()),
+            Some("run") => platform::service::run_dispatcher(rest[1..].to_vec()),
             _ => bail!("usage: safe-rdp service install|uninstall|status"),
         },
         "monitors" => {
-            dpi_aware();
+            platform::init_process();
             for (i, m) in capture::monitors().iter().enumerate() {
                 println!("{}: {}x{} at ({}, {}){}", i + 1, m.width, m.height, m.left, m.top, if i == 0 { " primary" } else { "" });
             }
-            let v = capture::virtual_screen();
-            println!("all: {}x{} at ({}, {})", v.width, v.height, v.left, v.top);
+            if let Some(v) = capture::resolve(MonitorSel::All) {
+                println!("all: {}x{} at ({}, {})", v.width, v.height, v.left, v.top);
+            }
             Ok(())
         }
         "bench" => bench(rest),
@@ -153,8 +147,8 @@ fn parse_monitor(s: &str) -> Result<MonitorSel> {
     })
 }
 
-fn parse_host(args: &[String], service: bool) -> Result<(server::HostOptions, Option<String>)> {
-    let mut o = server::HostOptions {
+fn parse_host(args: &[String], service: bool) -> Result<(host::HostOptions, Option<String>)> {
+    let mut o = host::HostOptions {
         bind: None,
         port: proto::DEFAULT_PORT,
         policy: PeerPolicy { allow: vec![], allow_non_tailscale: false, loopback_ok: false },
@@ -199,7 +193,7 @@ fn parse_host(args: &[String], service: bool) -> Result<(server::HostOptions, Op
 
 fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
     match key_file {
-        Some(p) => keystore::load_key_file(p),
+        Some(p) => keys::load_key_file(p),
         None => keystore::load_user_key(),
     }
 }
@@ -207,7 +201,7 @@ fn load_key(key_file: Option<&str>) -> Result<Secret<32>> {
 fn connect(args: &[String]) -> Result<()> {
     let mut target = None;
     let mut key_file = None;
-    let mut o = client::ViewerOptions { fullscreen: false, clipboard: false, view_only: false, allow_capture: false, downscale: 1 };
+    let mut o = viewer::ViewerOptions { fullscreen: false, clipboard: false, view_only: false, allow_capture: false, downscale: 1 };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -224,47 +218,8 @@ fn connect(args: &[String]) -> Result<()> {
     }
     let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
     let key = load_key(key_file.as_deref())?;
-    dpi_aware();
-    // Started from a shortcut or Explorer: the console exists only for us, so hide it and
-    // report errors in a message box instead.
-    let own_console = unsafe {
-        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
-        let mut pids = [0u32; 4];
-        let own = GetConsoleProcessList(pids.as_mut_ptr(), 4) == 1;
-        if own {
-            FreeConsole();
-        }
-        own
-    };
-    let r = client::run(&target, o, key);
-    // Errors after the window appeared were already shown by the viewer itself.
-    if let (true, false, Err(e)) = (own_console, client::window_shown(), &r) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-        let (text, title) = (util::wide(&e.to_string()), util::wide("safe-rdp"));
-        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_ICONERROR | MB_OK) };
-    }
-    r
-}
-
-fn read_secret(prompt: &str) -> Result<String> {
-    use windows_sys::Win32::System::Console::*;
-    eprint!("{prompt}");
-    let mut line = String::new();
-    unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
-        let mut mode = 0;
-        let console = GetConsoleMode(h, &mut mode) != 0;
-        if console {
-            SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT);
-        }
-        let r = std::io::stdin().read_line(&mut line);
-        if console {
-            SetConsoleMode(h, mode);
-            eprintln!();
-        }
-        r?;
-    }
-    Ok(line)
+    platform::init_process();
+    platform::viewer::run(&target, o, key)
 }
 
 fn keygen(args: &[String]) -> Result<()> {
@@ -275,11 +230,11 @@ fn keygen(args: &[String]) -> Result<()> {
     if keystore::user_key_path()?.exists() && !force {
         bail!("a key is already stored; use `safe-rdp key show`, or `keygen --force` to replace it");
     }
-    let k = keystore::generate()?;
+    let k = keys::generate()?;
     let path = keystore::save_user_key(&k)?;
-    println!("{}", keystore::format_key(&k));
+    println!("{}", keys::format_key(&k));
     eprintln!();
-    eprintln!("Stored (DPAPI-encrypted for this Windows user) in {}", path.display());
+    eprintln!("Stored for this user in {}", path.display());
     eprintln!("On the other machine run `safe-rdp key import` and paste the line above.");
     eprintln!("Treat it like a password: anyone with this key and tailnet access can control the host.");
     Ok(())
@@ -291,15 +246,15 @@ fn key_cmd(args: &[String]) -> Result<()> {
             if args.len() > 1 {
                 bail!("pass the key on stdin or at the prompt, not as an argument (it would end up in shell history)");
             }
-            let mut line = read_secret("Paste key (input hidden): ")?;
-            let k = keystore::parse_key(&line);
+            let mut line = platform::read_secret("Paste key (input hidden): ")?;
+            let k = keys::parse_key(&line);
             unsafe { util::wipe(line.as_bytes_mut()) };
             let path = keystore::save_user_key(&k?)?;
             eprintln!("Key stored in {}", path.display());
             Ok(())
         }
         Some("show") => {
-            println!("{}", keystore::format_key(&keystore::load_user_key()?));
+            println!("{}", keys::format_key(&keystore::load_user_key()?));
             Ok(())
         }
         Some("forget") => {
@@ -324,36 +279,33 @@ fn bench(args: &[String]) -> Result<()> {
             other => bail!("unknown option '{other}'"),
         }
     }
-    dpi_aware();
+    platform::init_process();
     let area = capture::resolve(monitor).ok_or("monitor not found")?;
     let (w, h) = (area.width as usize, area.height as usize);
     println!("screen {w}x{h}, {} encoder threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
-    let mut frame = Vec::new();
-    for (name, cap) in [("DXGI", capture::Capturer::new(area)), ("GDI", capture::Capturer::gdi(area))] {
-        let mut cap = cap?;
-        if name == "DXGI" && !cap.waits_for_changes() {
-            println!("DXGI:          unavailable");
-            continue;
+    let mut cap = capture::Capturer::open(monitor, area)?;
+    let name = cap.backend();
+    let t = Instant::now();
+    while !cap.next_frame(500)? {
+        if t.elapsed().as_secs() > 3 {
+            bail!("{name}: no frame within 3 s");
         }
-        let t = Instant::now();
-        while !cap.next_frame(500)? {
-            if t.elapsed().as_secs() > 3 {
-                bail!("{name}: no frame within 3 s");
-            }
-        }
-        let first = t.elapsed().as_secs_f64() * 1000.0;
-        let t = Instant::now();
-        let mut frames = 0;
-        while t.elapsed().as_millis() < 1000 {
-            if cap.next_frame(50)? {
-                frames += 1;
-            }
-        }
-        println!("{name:<5}          first frame {first:.1} ms; {frames} frames delivered in 1 s");
-        frame = cap.pixels().to_vec();
     }
-
+    let first = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let mut frames = 0;
+    while t.elapsed().as_millis() < 1000 {
+        if cap.next_frame(50)? {
+            frames += 1;
+        }
+        if !cap.waits_for_changes() {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    println!("capture:       {name}, first frame {first:.1} ms, {frames} frames delivered in 1 s");
+    let mut frame = cap.pixels().to_vec();
+    drop(cap);
     let mut enc = codec::Encoder::new()?;
     let mut dec = codec::Decoder::new()?;
     let t = Instant::now();
@@ -377,6 +329,7 @@ fn bench(args: &[String]) -> Result<()> {
         enc.encode(&frame, w, h);
     }
     println!("unchanged:     diff {:.1} ms/frame", t.elapsed().as_secs_f64() * 100.0);
-    util::wipe(&mut frame);    util::wipe(&mut fb);
+    util::wipe(&mut frame);
+    util::wipe(&mut fb);
     Ok(())
 }

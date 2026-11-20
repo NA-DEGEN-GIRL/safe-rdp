@@ -1,12 +1,13 @@
 //! Host side: listens on the Tailscale interface, authenticates viewers and streams the screen.
 
-use crate::capture::{self, Area, Capturer, CursorTracker, MonitorSel};
 use crate::channel::{self, RecordReader, RecordWriter};
-use crate::clipboard::Clipboard;
 use crate::codec::{self, Encoder};
-use crate::desktop::DesktopFollower;
-use crate::input::Injector;
-use crate::mem::LockedBuf;
+use crate::platform::capture::{self, Capturer, CursorTracker};
+use crate::platform::clipboard::Clipboard;
+use crate::platform::desktop::DesktopFollower;
+use crate::platform::input::Injector;
+use crate::platform::mem::LockedBuf;
+use crate::screen::{Area, MonitorSel};
 use crate::net::{self, PeerPolicy};
 use crate::proto::*;
 use crate::util::{Result, Secret};
@@ -264,7 +265,7 @@ fn input_loop(
                 }
             }
             ClientMsg::Sas if !view_only => {
-                if !sas || !crate::service::request_sas() {
+                if !sas || !crate::platform::request_sas() {
                     log!("Ctrl+Alt+Del requested but SAS forwarding is unavailable (run as service with --enable-sas)");
                 }
             }
@@ -312,8 +313,7 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
     let mut last_send = Instant::now();
     let mut capture_failures = 0u32;
     let mut scaled = LockedBuf::new(0);
-    let mut last_dxgi_try = Instant::now();
-    let multi_all = opts.monitor == MonitorSel::All && capture::monitors().len() > 1;
+    let mut last_upgrade_try = Instant::now();
 
     while !ctl.stopped() {
         let t0 = Instant::now();
@@ -332,15 +332,10 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
             match capture::resolve(opts.monitor) {
                 Some(a) if switched || current != Some(a) => {
                     capturer = None; // release the old device/DCs before creating new ones
-                    let c = if multi_all {
-                        Capturer::gdi(a)
-                    } else {
-                        Capturer::new(a)
-                    };
-                    match c {
+                    match Capturer::open(opts.monitor, a) {
                         Ok(c) => {
                             if current != Some(a) {
-                                log!("capturing {}x{} via {}", a.width, a.height, if c.waits_for_changes() { "DXGI" } else { "GDI" });
+                                log!("capturing {}x{} via {}", a.width, a.height, c.backend());
                             }
                             capturer = Some(c);
                             *shared.area.lock().unwrap() = a;
@@ -349,13 +344,13 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
                         Err(e) => log!("capture setup failed: {e}"),
                     }
                 }
-                Some(a) if !multi_all && last_dxgi_try.elapsed() > Duration::from_secs(10) && capturer.as_ref().is_some_and(|c| !c.waits_for_changes()) => {
-                    // A transient DXGI failure (secure desktop, full-screen app, driver reset) may have passed.
-                    last_dxgi_try = Instant::now();
-                    if let Ok(d) = crate::dxgi::DxgiCapture::new(a) {
-                        log!("switched back to DXGI capture");
-                        capturer = Some(Capturer::Dxgi(d));
-                        encoder.request_full();
+                Some(_) if last_upgrade_try.elapsed() > Duration::from_secs(10) => {
+                    last_upgrade_try = Instant::now();
+                    if let Some(c) = capturer.as_mut() {
+                        if c.try_upgrade(opts.monitor) {
+                            log!("switched to {} capture", c.backend());
+                            encoder.request_full();
+                        }
                     }
                 }
                 Some(_) => {}

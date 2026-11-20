@@ -10,11 +10,13 @@
 //! `rect = x:u16 | y:u16 | w:u16 | h:u16 | enc:u8 | len:u32 | data[len]`
 
 use crate::bail;
-use crate::mem::LockedBuf;
+use crate::platform::mem::LockedBuf;
 use crate::proto::Rd;
-use crate::util::{Error, Result};
+use crate::util::Result;
+use lz::{Compressor, Decompressor};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use windows_sys::Win32::Storage::Compression::*;
+
+pub mod lz;
 
 pub const TILE: usize = 64;
 pub const ENC_SOLID: u8 = 0;
@@ -23,68 +25,6 @@ pub const ENC_RAW: u8 = 2;
 pub const FLAG_LAST: u8 = 1;
 /// Split a frame into several messages once a message grows past this.
 pub const CHUNK_BYTES: usize = 4 << 20;
-
-struct Compressor(COMPRESSOR_HANDLE);
-unsafe impl Send for Compressor {}
-
-impl Compressor {
-    fn new() -> Result<Self> {
-        let mut h = std::ptr::null_mut();
-        if unsafe { CreateCompressor(COMPRESS_ALGORITHM_XPRESS_HUFF, std::ptr::null(), &mut h) } == 0 {
-            return Err(Error::last_os("CreateCompressor"));
-        }
-        Ok(Compressor(h))
-    }
-
-    /// Compresses `src` into `dst`; returns false if the output would not be smaller.
-    fn compress(&mut self, src: &[u8], dst: &mut Vec<u8>) -> bool {
-        dst.clear();
-        dst.reserve(src.len());
-        let mut n = 0usize;
-        let ok = unsafe {
-            Compress(self.0, src.as_ptr().cast(), src.len(), dst.as_mut_ptr().cast(), dst.capacity(), &mut n)
-        };
-        if ok == 0 || n == 0 || n >= src.len() {
-            return false;
-        }
-        unsafe { dst.set_len(n) };
-        true
-    }
-}
-
-impl Drop for Compressor {
-    fn drop(&mut self) {
-        unsafe { CloseCompressor(self.0) };
-    }
-}
-
-struct Decompressor(DECOMPRESSOR_HANDLE);
-unsafe impl Send for Decompressor {}
-
-impl Decompressor {
-    fn new() -> Result<Self> {
-        let mut h = std::ptr::null_mut();
-        if unsafe { CreateDecompressor(COMPRESS_ALGORITHM_XPRESS_HUFF, std::ptr::null(), &mut h) } == 0 {
-            return Err(Error::last_os("CreateDecompressor"));
-        }
-        Ok(Decompressor(h))
-    }
-
-    fn decompress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<()> {
-        let mut n = 0usize;
-        let ok = unsafe { Decompress(self.0, src.as_ptr().cast(), src.len(), dst.as_mut_ptr().cast(), dst.len(), &mut n) };
-        if ok == 0 || n != dst.len() {
-            bail!("corrupt tile data");
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Decompressor {
-    fn drop(&mut self) {
-        unsafe { CloseDecompressor(self.0) };
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
