@@ -787,15 +787,24 @@ struct Ucred {
 }
 
 /// Who is at the other end of a connected Unix socket (for a server, the process that called
-/// `listen`).
+/// `listen`). The pid is 0 when that process lives outside our PID namespace (a container
+/// sharing the host's X socket), so only compare pids that are positive.
 fn peer_cred(s: &UnixStream) -> Result<Ucred> {
     let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<Ucred>() as u32;
     let r = unsafe { getsockopt(s.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, (&mut cred as *mut Ucred).cast(), &mut len) };
-    if r != 0 || len as usize != std::mem::size_of::<Ucred>() || cred.pid <= 0 {
-        bail!("cannot tell which process serves an X socket: {}", std::io::Error::last_os_error());
+    if r != 0 {
+        bail!("cannot tell who serves an X socket: {}", std::io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<Ucred>() {
+        bail!("cannot tell who serves an X socket (credentials of {len} bytes)");
     }
     Ok(cred)
+}
+
+/// Whether `peer` is process `pid` (never for a peer outside our PID namespace).
+fn is_process(peer: &Ucred, pid: u32) -> bool {
+    peer.pid > 0 && peer.pid as u32 == pid
 }
 
 fn connect_unix(addr: &std::os::unix::net::SocketAddr) -> std::io::Result<UnixStream> {
@@ -810,9 +819,9 @@ fn connect_unix(addr: &std::os::unix::net::SocketAddr) -> std::io::Result<UnixSt
 /// Connects to `addr` and checks that process `pid` is the one listening there. Nothing is sent.
 fn connect_checked(addr: &std::os::unix::net::SocketAddr, pid: u32, what: &str) -> Result<UnixStream> {
     let s = connect_unix(addr).map_err(|e| format!("cannot connect to {what}: {e}"))?;
-    let peer = peer_cred(&s)?.pid;
-    if peer as u32 != pid {
-        bail!("{what} is served by another process (pid {peer})");
+    let peer = peer_cred(&s)?;
+    if !is_process(&peer, pid) {
+        bail!("{what} is served by another process (pid {})", peer.pid);
     }
     Ok(s)
 }
@@ -839,7 +848,7 @@ fn connect_local(number: u32, pinned: Option<u32>, euid: u32) -> Result<UnixStre
         };
         let peer = peer_cred(&s)?;
         match pinned {
-            Some(pid) if peer.pid as u32 != pid => {
+            Some(pid) if !is_process(&peer, pid) => {
                 bail!("X display :{number} is served by another process (pid {}) than its virtual display", peer.pid)
             }
             None if peer.uid != 0 && peer.uid != euid => bail!("X display :{number} is served by another user (uid {})", peer.uid),
@@ -1853,6 +1862,15 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_server_outside_our_pid_namespace_is_judged_by_uid_only() {
+        // SO_PEERCRED reports pid 0 then: never the pinned server, but not an error either.
+        let outside = Ucred { pid: 0, uid: 1000, gid: 1000 };
+        assert!(!is_process(&outside, 0) && !is_process(&outside, 1234));
+        assert!(is_process(&Ucred { pid: 1234, uid: 0, gid: 0 }, 1234));
+        assert!(!is_process(&Ucred { pid: -1, uid: 0, gid: 0 }, u32::MAX));
     }
 
     #[test]

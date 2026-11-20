@@ -41,6 +41,7 @@ impl Device {
         self.ips.iter().find(|ip| ip.is_ipv4()).or(self.ips.first()).copied()
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
     /// Whether `s` refers to this device: its short name, MagicDNS name or one of its addresses.
     pub fn matches(&self, s: &str) -> bool {
         let s = s.trim().trim_end_matches('.');
@@ -81,6 +82,7 @@ impl Status {
         self.backend_state == "Running"
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
     pub fn self_device(&self) -> Option<&Device> {
         self.devices.iter().find(|d| d.is_self)
     }

@@ -89,6 +89,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Handshakes in progress at once, in all and per source (see `source`).
 const MAX_PENDING: usize = 8;
 const MAX_PENDING_PER_ADDR: usize = 2;
+const MAX_PENDING_PER_NET: usize = 4;
 /// How long a failed handshake keeps its source's slot (slows down guessing).
 const FAILURE_PENALTY: Duration = Duration::from_secs(1);
 /// Failed handshakes serving their penalty at once; while this many are, nobody is admitted.
@@ -234,28 +235,43 @@ fn report_dropped(n: u64) {
     }
 }
 
-/// Who a connection counts as for the per-address limits. Outside Tailscale (whose addresses
-/// each belong to one node) a peer can usually pick any address in an IPv6 /64, so the /64 counts.
+/// Who a connection counts as for the per-address limits (an IPv4-mapped address as IPv4).
 fn source(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None if net::is_tailscale(ip) => ip,
-            None => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
-        },
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     }
 }
 
-/// Handshakes in progress: at most `MAX_PENDING` in all and `MAX_PENDING_PER_ADDR` from one
-/// source, so one peer without the key cannot keep everybody else out. A failed one leaves the
-/// total but keeps its source's place for `FAILURE_PENALTY`; at most `MAX_PENALTIES` do at once,
-/// so peers with many addresses cannot make the host hold ever more threads.
+/// Outside Tailscale (whose addresses each belong to one node) one peer can often pick any
+/// address in an IPv6 /64, so the /64 has a limit of its own, larger than one address's.
+fn network(ip: IpAddr) -> Option<IpAddr> {
+    match source(ip) {
+        IpAddr::V6(v6) if !net::is_tailscale(ip) => Some(IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into())),
+        _ => None,
+    }
+}
+
+fn count_down(map: &mut HashMap<IpAddr, usize>, key: IpAddr) {
+    if let Some(n) = map.get_mut(&key) {
+        *n -= 1;
+        if *n == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+/// Handshakes in progress: at most `MAX_PENDING` in all, `MAX_PENDING_PER_ADDR` from one
+/// address and `MAX_PENDING_PER_NET` from one non-Tailscale IPv6 /64, so one peer without the
+/// key cannot keep everybody else out. A failed one leaves the total but keeps its source's
+/// place for `FAILURE_PENALTY`; at most `MAX_PENALTIES` do at once, so peers with many
+/// addresses cannot make the host hold ever more threads.
 #[derive(Default)]
 struct Pending {
     total: usize,
     penalties: usize,
     per_addr: HashMap<IpAddr, usize>,
+    per_net: HashMap<IpAddr, usize>,
 }
 
 impl Pending {
@@ -265,6 +281,10 @@ impl Pending {
         if n >= MAX_PENDING_PER_ADDR {
             return Err("too many pending handshakes from this address");
         }
+        let net = network(ip);
+        if net.is_some_and(|k| self.per_net.get(&k).copied().unwrap_or(0) >= MAX_PENDING_PER_NET) {
+            return Err("too many pending handshakes from this network");
+        }
         if self.total >= MAX_PENDING {
             return Err("too many pending handshakes");
         }
@@ -273,6 +293,9 @@ impl Pending {
         }
         self.total += 1;
         self.per_addr.insert(src, n + 1);
+        if let Some(k) = net {
+            *self.per_net.entry(k).or_default() += 1;
+        }
         Ok(())
     }
 
@@ -286,12 +309,9 @@ impl Pending {
     fn leave(&mut self, ip: IpAddr, penalized: bool) {
         let n = if penalized { &mut self.penalties } else { &mut self.total };
         *n = n.saturating_sub(1);
-        let src = source(ip);
-        if let Some(n) = self.per_addr.get_mut(&src) {
-            *n -= 1;
-            if *n == 0 {
-                self.per_addr.remove(&src);
-            }
+        count_down(&mut self.per_addr, source(ip));
+        if let Some(k) = network(ip) {
+            count_down(&mut self.per_net, k);
         }
     }
 }
@@ -346,7 +366,8 @@ impl Quiet {
 
     /// Whether a line about `ip` may be logged in the current window.
     fn allow(&mut self, ip: IpAddr) -> bool {
-        let src = source(ip);
+        // Only logging: a whole /64 may share one budget.
+        let src = network(ip).unwrap_or_else(|| source(ip));
         let n = self.per_addr.get(&src).copied().unwrap_or(0);
         if self.shown >= QUIET_TOTAL || n >= QUIET_PER_ADDR {
             self.dropped += 1;
@@ -1697,27 +1718,32 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_peers_count_by_their_64() {
+    fn ipv6_peers_count_by_address_and_by_their_64() {
         let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(source(v6("2001:db8:1:2:aaaa::1")), v6("2001:db8:1:2::"));
+        assert_eq!(source(v6("2001:db8:1:2:aaaa::1")), v6("2001:db8:1:2:aaaa::1"));
+        assert_eq!(network(v6("2001:db8:1:2:aaaa::1")), Some(v6("2001:db8:1:2::")));
         assert_eq!(source(v6("::ffff:100.64.0.1")), ip(1));
-        assert_eq!(source(ip(1)), ip(1));
+        assert_eq!((source(ip(1)), network(ip(1))), (ip(1), None));
         // Tailscale gives every node an address of its own.
-        assert_eq!(source(v6("fd7a:115c:a1e0::1")), v6("fd7a:115c:a1e0::1"));
+        assert_eq!(network(v6("fd7a:115c:a1e0::1")), None);
         let mut p = Pending::default();
         p.admit(v6("2001:db8::1")).unwrap();
-        p.admit(v6("2001:db8::ffff:2")).unwrap();
-        assert!(p.admit(v6("2001:db8::3")).unwrap_err().contains("this address"));
+        p.admit(v6("2001:db8::1")).unwrap();
+        assert!(p.admit(v6("2001:db8::1")).unwrap_err().contains("this address"));
+        // A neighbour in the same /64 still gets in while the first holds its share...
+        p.admit(v6("2001:db8::2")).unwrap();
+        p.admit(v6("2001:db8::3")).unwrap();
+        // ...but the /64 as a whole cannot take every place.
+        assert!(p.admit(v6("2001:db8::4")).unwrap_err().contains("this network"));
         p.admit(v6("2001:db8:0:1::1")).unwrap();
-        for i in 1..=3 {
-            p.admit(v6(&format!("fd7a:115c:a1e0::{i}"))).unwrap();
-        }
+        p.admit(v6("fd7a:115c:a1e0::1")).unwrap();
         p.admit(ip(1)).unwrap();
         p.admit(v6("::ffff:100.64.0.1")).unwrap();
         assert!(p.admit(ip(1)).unwrap_err().contains("this address"));
-        p.leave(v6("2001:db8::ffff:2"), false);
-        p.leave(v6("2001:db8::1"), false);
-        assert!(!p.per_addr.contains_key(&v6("2001:db8::")));
+        for a in ["2001:db8::1", "2001:db8::1", "2001:db8::2", "2001:db8::3"] {
+            p.leave(v6(a), false);
+        }
+        assert!(p.per_net.get(&v6("2001:db8::")).is_none() && !p.per_addr.contains_key(&v6("2001:db8::1")));
         // The log throttle counts them the same way.
         let mut q = Quiet::new(Instant::now());
         let shown = (0..10u16).filter(|&i| q.allow(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]))).count();

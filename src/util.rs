@@ -59,11 +59,13 @@ macro_rules! log {
     ($($t:tt)*) => { $crate::util::log_line(&format!($($t)*)) };
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // the service and the Windows UI
 /// Size at which the log file is moved to `<name>.old` and started afresh.
 const LOG_LIMIT: u64 = 4 << 20;
 
 static LOG_FILE: OnceLock<Mutex<LogFile>> = OnceLock::new();
 
+#[cfg_attr(not(windows), allow(dead_code))] // the service and the Windows UI
 /// Mirror log lines into `path` (append). Logs never contain key material or screen data.
 /// The file stays bounded however long the process runs: past 4 MiB it becomes `<name>.old`
 /// (replacing the previous one) and a new one is started.
@@ -96,6 +98,7 @@ struct LogFile {
 }
 
 impl LogFile {
+    #[cfg_attr(not(windows), allow(dead_code))] // the service and the Windows UI
     fn open(path: &Path, limit: u64) -> std::io::Result<LogFile> {
         let mut log = LogFile { path: path.to_path_buf(), limit, file: None, len: 0 };
         if std::fs::metadata(path).is_ok_and(|m| m.len() >= limit) {
@@ -140,10 +143,12 @@ impl LogFile {
 }
 
 /// NUL-terminated UTF-16 string for Win32 APIs.
+#[cfg_attr(not(windows), allow(dead_code))] // the service and the Windows UI
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // the service and the Windows UI
 pub fn from_wide(s: &[u16]) -> String {
     let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
     String::from_utf16_lossy(&s[..end])

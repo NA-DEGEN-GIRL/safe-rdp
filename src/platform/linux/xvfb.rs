@@ -419,17 +419,17 @@ impl VirtualDisplay {
         format!(":{}", self.number)
     }
 
-    pub fn number(&self) -> u32 {
-        self.number
+    pub fn target(&self) -> Target {
+        Target { display: self.display_name(), xauthority: Some(self.auth.clone()) }
     }
+}
 
+/// For tests; the host learns about exits through `watch`.
+#[cfg(test)]
+impl VirtualDisplay {
     /// The private Xauthority file holding this display's cookie.
     pub fn xauthority(&self) -> &Path {
         &self.auth
-    }
-
-    pub fn target(&self) -> Target {
-        Target { display: self.display_name(), xauthority: Some(self.auth.clone()) }
     }
 
     /// False once the session command has exited (always true without a session).

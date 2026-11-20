@@ -9,11 +9,14 @@
 //! * Low-level keyboard and mouse hooks swallow every event that our `input::Injector` did not
 //!   send: physical input as well as input synthesised by other programs. The injector gives
 //!   each event a fresh random `dwExtraInfo` tag (`input::new_tag`), and a tag lets one injected
-//!   event through, once. Hooks that run after ours and the window that receives the event only
-//!   ever see used tags. A program whose own low-level hook runs before ours (Windows calls the
-//!   most recently installed first) can still see our events and swallow one to replay its tag
-//!   with input of its own. Windows silently drops a low-level hook that once misses its time
-//!   limit, so the hooks are re-installed every few seconds.
+//!   event through, once. Tags count only while the hooks are installed (`input::arm`), so tags
+//!   other programs saw before privacy mode began are worthless. Hooks that run after ours and
+//!   the window that receives the event only ever see used tags. A program whose own low-level
+//!   hook runs before ours (Windows calls the most recently installed first), or that watches
+//!   during a moment when Windows has dropped our hook, can still see an unused tag and replay
+//!   it, once, with input of its own. Windows silently drops a low-level hook that once misses
+//!   its time limit, so the hooks are re-installed every few seconds. Only one privacy mode
+//!   per process can hold the hooks.
 //!
 //! Everything lives on one thread with its own message loop. Dropping `Privacy` removes the
 //! hooks and windows before it returns; if the thread or the process dies, Windows removes
@@ -33,7 +36,7 @@
 //! running as SYSTEM, has no such gap. Needs Windows 10 version 2004 (build 19041) or later for
 //! `WDA_EXCLUDEFROMCAPTURE`.
 
-use super::input::take_tag;
+use super::input::{arm, take_tag};
 use crate::bail;
 use crate::screen::Area;
 use crate::util::{Error, Result, wide};
@@ -81,6 +84,30 @@ pub struct Privacy {
     thread_id: u32,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Released after the thread (and so the hooks) are gone.
+    _claim: Option<HookClaim>,
+}
+
+/// Set while a privacy mode with input hooks is on.
+static HOOKED: AtomicBool = AtomicBool::new(false);
+
+/// The right to install the input hooks, held by one privacy mode at a time: each tag passes
+/// once, so a second set of hooks would swallow every event the first one let through.
+struct HookClaim;
+
+impl HookClaim {
+    fn take() -> Result<HookClaim> {
+        if HOOKED.swap(true, Ordering::SeqCst) {
+            bail!("privacy mode is still on for the previous session");
+        }
+        Ok(HookClaim)
+    }
+}
+
+impl Drop for HookClaim {
+    fn drop(&mut self) {
+        HOOKED.store(false, Ordering::SeqCst);
+    }
 }
 
 /// What the privacy thread puts up. `enable` covers every monitor; tests use small areas.
@@ -118,12 +145,13 @@ impl Privacy {
     }
 
     fn start(cfg: Config) -> Result<Privacy> {
+        let claim = if cfg.hooks { Some(HookClaim::take()?) } else { None };
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<Result<u32>>();
         let flag = stop.clone();
         let thread = std::thread::Builder::new().name("privacy".into()).spawn(move || run(cfg, &flag, tx))?;
         match rx.recv() {
-            Ok(Ok(thread_id)) => Ok(Privacy { thread_id, stop, thread: Some(thread) }),
+            Ok(Ok(thread_id)) => Ok(Privacy { thread_id, stop, thread: Some(thread), _claim: claim }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -171,6 +199,8 @@ fn run(cfg: Config, stop: &AtomicBool, ready: mpsc::Sender<Result<u32>>) {
     let setup = shield.sync_overlays().and_then(|()| {
         if hooks {
             shield.hooks = Some(Hooks::install()?);
+            // From now on our events carry tags that only these hooks have seen first.
+            arm(true);
         }
         shield.timer = unsafe { SetTimer(null_mut(), 0, TICK_MS, None) };
         if shield.timer == 0 {
@@ -317,6 +347,9 @@ impl Drop for Shield {
     fn drop(&mut self) {
         // Input first: it must come back even if taking a window down misbehaves.
         self.hooks = None;
+        if self.cfg.hooks {
+            arm(false);
+        }
         for o in self.overlays.drain(..) {
             unsafe { DestroyWindow(o.hwnd) };
         }
@@ -519,6 +552,7 @@ mod tests {
 
     #[test]
     fn only_our_injected_events_pass_and_each_once() {
+        let _armed = super::super::input::armed_for_test();
         let tag = new_tag();
         assert!(!passes(false, tag)); // a device driver claiming our tag is still physical
         assert!(passes(true, tag));
@@ -531,6 +565,17 @@ mod tests {
         assert!(!passes(true, 0x5344_5250)); // the fixed tag of earlier versions
         assert!(!passes(false, 0));
         assert!(passes(true, next));
+    }
+
+    #[test]
+    fn one_privacy_mode_holds_the_hooks_at_a_time() {
+        let a = HookClaim::take();
+        // Another test may hold a claim briefly; only judge when we got the first one.
+        if let Ok(a) = a {
+            assert!(HookClaim::take().is_err(), "two privacy modes would swallow each other's input");
+            drop(a);
+            drop(HookClaim::take().expect("the claim is free again once the first is dropped"));
+        }
     }
 
     #[test]

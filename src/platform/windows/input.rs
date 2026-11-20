@@ -8,31 +8,44 @@ use std::sync::{Mutex, PoisonError};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-/// Tags kept for events the privacy hooks have not seen yet. Nothing takes them while privacy
-/// mode is off, so the oldest make room.
+/// Tags kept for events the privacy hooks have not seen yet; the oldest make room.
 const MAX_PENDING: usize = 4096;
 
-/// Tags of the events we injected that no privacy hook has passed yet, oldest first.
-struct Pending(VecDeque<usize>);
+/// Tags of the events we injected that no privacy hook has passed yet, oldest first. Tags are
+/// recorded only while privacy mode is on ("armed"): an event sent while it is off reaches
+/// other programs' hooks and windows with its tag unused, so that tag must never open the
+/// privacy hooks later.
+struct Pending {
+    armed: bool,
+    tags: VecDeque<usize>,
+}
 
 impl Pending {
     const fn new() -> Pending {
-        Pending(VecDeque::new())
+        Pending { armed: false, tags: VecDeque::new() }
+    }
+
+    fn arm(&mut self, on: bool) {
+        self.armed = on;
+        self.tags.clear();
     }
 
     fn add(&mut self, tag: usize) {
-        if self.0.len() >= MAX_PENDING {
-            self.0.pop_front();
+        if !self.armed {
+            return;
         }
-        self.0.push_back(tag);
+        if self.tags.len() >= MAX_PENDING {
+            self.tags.pop_front();
+        }
+        self.tags.push_back(tag);
     }
 
     /// Removes `tag`; false if it is not (or no longer) there. The newest come first: with the
     /// hooks running, the event they are looking at was sent moments ago.
     fn take(&mut self, tag: usize) -> bool {
-        match self.0.iter().rposition(|&t| t == tag) {
+        match self.tags.iter().rposition(|&t| t == tag) {
             Some(i) => {
-                self.0.remove(i);
+                self.tags.remove(i);
                 true
             }
             None => false,
@@ -42,8 +55,15 @@ impl Pending {
 
 static PENDING: Mutex<Pending> = Mutex::new(Pending::new());
 
-/// A fresh random marker for the `dwExtraInfo` of one event we inject, recorded for the privacy
-/// hooks, which let an injected event through only with a tag they have not seen before.
+/// Called by privacy mode once its hooks are in place (`true`) and after they are gone
+/// (`false`). Either way every tag issued so far stops counting.
+pub fn arm(on: bool) {
+    PENDING.lock().unwrap_or_else(PoisonError::into_inner).arm(on);
+}
+
+/// A fresh random marker for the `dwExtraInfo` of one event we inject, recorded (while privacy
+/// mode is on) for the privacy hooks, which let an injected event through only with a tag they
+/// have not seen before.
 pub fn new_tag() -> usize {
     let mut b = [0u8; size_of::<usize>()];
     if crate::crypto::random(&mut b).is_err() {
@@ -61,6 +81,21 @@ pub fn new_tag() -> usize {
 /// stops being. Each tag lets one event through.
 pub fn take_tag(tag: usize) -> bool {
     PENDING.lock().unwrap_or_else(PoisonError::into_inner).take(tag)
+}
+
+/// Tests that use the process-wide tags hold this, with privacy mode's arming simulated.
+#[cfg(test)]
+pub fn armed_for_test() -> impl Drop {
+    static LOCK: Mutex<()> = Mutex::new(());
+    struct Armed(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            arm(false);
+        }
+    }
+    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    arm(true);
+    Armed(guard)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -194,6 +229,7 @@ mod tests {
 
     #[test]
     fn every_event_gets_a_fresh_tag_that_passes_once() {
+        let _armed = armed_for_test();
         let a = |up| key(HeldKey { vk: 0x41, scan: 0x1e, extended: false }, up);
         let inputs = [a(false), mouse(0, 0, 0, MOUSEEVENTF_MOVE), a(true), mouse(0, 0, 0, MOUSEEVENTF_MOVE)];
         let extra = |i: INPUT| unsafe { if i.r#type == INPUT_KEYBOARD { i.Anonymous.ki.dwExtraInfo } else { i.Anonymous.mi.dwExtraInfo } };
@@ -214,15 +250,32 @@ mod tests {
     }
 
     #[test]
+    fn tags_count_only_while_privacy_mode_is_on() {
+        let mut p = Pending::new();
+        p.add(7); // sent while privacy mode was off: others may have seen it
+        p.arm(true);
+        assert!(!p.take(7), "a tag from before privacy mode passed");
+        p.add(8);
+        p.add(9);
+        assert!(p.take(8));
+        p.arm(false);
+        assert!(!p.take(9), "a tag survived the end of privacy mode");
+        p.add(10);
+        p.arm(true);
+        assert!(!p.take(10));
+    }
+
+    #[test]
     fn pending_tags_are_bounded_and_the_oldest_go() {
         let mut p = Pending::new();
+        p.arm(true);
         for t in 1..=MAX_PENDING + 10 {
             p.add(t);
         }
-        assert_eq!(p.0.len(), MAX_PENDING);
+        assert_eq!(p.tags.len(), MAX_PENDING);
         assert!(!p.take(10) && p.take(11) && p.take(MAX_PENDING + 10) && p.take(MAX_PENDING));
         assert!(!p.take(11));
-        assert_eq!(p.0.len(), MAX_PENDING - 3);
+        assert_eq!(p.tags.len(), MAX_PENDING - 3);
     }
 
     #[test]

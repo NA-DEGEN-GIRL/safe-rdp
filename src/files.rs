@@ -4,8 +4,10 @@
 //! Receiving side guarantees:
 //! * names are a single plain path component (`proto::valid_file_name`), never a path;
 //! * data goes to a hidden, randomly named `.srdp-*.part` file created exclusively (on Windows
-//!   nobody can delete or rename it while the transfer holds it), and only becomes visible after
-//!   the size and SHA-256 match and the part still holds that many bytes; anything incomplete is
+//!   nobody else can write, delete or rename it while the transfer holds it; elsewhere a
+//!   same-user program could still alter it, which only a length check catches), and only
+//!   becomes visible after the size and SHA-256 match and the part still holds that many bytes;
+//!   anything incomplete is
 //!   deleted (parts left behind by a crash or kill are removed after a day);
 //! * existing files are never overwritten (`name (1).ext`, `name (2).ext`, ...);
 //! * received files are marked as coming from another machine (Windows: Mark of the Web, written
@@ -115,9 +117,10 @@ impl Incoming {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-            // No FILE_SHARE_DELETE: the part cannot be deleted or renamed while it is being written.
-            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+            // Nobody else may write, truncate, delete or rename the part while it is being
+            // written (the Zone.Identifier stream is shared separately).
+            options.share_mode(FILE_SHARE_READ);
         }
         let file = options.open(&part)?;
         let hash = Sha256::new();
@@ -128,6 +131,7 @@ impl Incoming {
         Ok(inc)
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
     pub fn received(&self) -> u64 {
         self.received
     }
@@ -223,6 +227,7 @@ impl Outgoing {
         Ok(Outgoing { id, name, size: meta.len(), file: File::open(path)?, sent: 0, hash: Sha256::new() })
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
     pub fn sent(&self) -> u64 {
         self.sent
     }
@@ -358,9 +363,16 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(std::fs::read(zone_identifier(&inc.part)).unwrap(), ZONE_INTERNET);
         inc.write(&data).unwrap();
-        // Cut short by another program: what arrived still matches the checksum, the file does not.
-        std::fs::OpenOptions::new().write(true).open(&inc.part).unwrap().set_len(0).unwrap();
-        assert!(inc.finish(&sum).is_err());
+        // Another program writing to the part: Windows refuses it outright; elsewhere a part cut
+        // short is caught by the length check (what arrived still matches the checksum).
+        let writer = std::fs::OpenOptions::new().write(true).open(&inc.part);
+        if cfg!(windows) {
+            assert!(writer.is_err(), "another program could write to the part");
+            drop(inc);
+        } else {
+            writer.unwrap().set_len(0).unwrap();
+            assert!(inc.finish(&sum).is_err());
+        }
         assert!(names(&dir).is_empty());
 
         // Removed: Windows refuses while the transfer holds the part; elsewhere finishing fails.

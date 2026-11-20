@@ -182,7 +182,14 @@ fn enqueue(q: &mut VecDeque<Event>, mut ev: Event) -> bool {
         q[i] = ev;
         return false;
     }
-    if q.len() >= MAX_EVENTS && matches!(ev, Event::Notice { .. } | Event::State { .. } | Event::Toast { .. }) {
+    // States of real settings are never dropped (each answers a `Set` that is being counted);
+    // they merge per setting above, so they cannot pile up.
+    let droppable = match ev {
+        Event::Notice { .. } | Event::Toast { .. } => true,
+        Event::State { key, .. } => key as usize >= 8,
+        _ => false,
+    };
+    if q.len() >= MAX_EVENTS && droppable {
         return false;
     }
     q.push_back(ev);
@@ -333,6 +340,8 @@ impl Pull {
 struct Asked {
     due: u32,
     value: u32,
+    /// The latest ask was the hello's wish, not a click: a refusal needs no toast.
+    hello: bool,
 }
 
 /// What a `State` from the host is, next to the `Set`s sent for its key.
@@ -350,6 +359,13 @@ impl Asked {
     fn sent(&mut self, value: u32) {
         self.due = self.due.saturating_add(1);
         self.value = value;
+        self.hello = false;
+    }
+
+    /// The hello asked for `value`; the host answers that with one `State` as well.
+    fn wished(&mut self, value: u32) {
+        self.sent(value);
+        self.hello = true;
     }
 
     /// `states` `State`s arrived for the key; what the latest of them is.
@@ -975,6 +991,14 @@ impl Ui {
         self.view_only = view_only;
         self.unavailable = [false; 8];
         self.asked = [Asked::default(); 8];
+        // The host answers the hello's sound and privacy wishes with a `State` each; count them,
+        // or a click before they arrive would be matched with the wrong answer.
+        if self.prefs.audio {
+            self.asked[SET_AUDIO as usize].wished(1);
+        }
+        if self.prefs.privacy {
+            self.asked[SET_PRIVACY as usize].wished(1);
+        }
         self.sound_local_failed = false;
         self.last_notice = None;
         self.notice_waiting = false;
@@ -1187,11 +1211,13 @@ impl Ui {
             return;
         }
         // While later `Set`s are unanswered, the latest of them decides.
+        let from_hello = self.asked[k].hello;
         let reply = self.asked[k].reply(states);
         if reply == Reply::Stale {
             return;
         }
-        let requested = reply != Reply::Unasked;
+        // Clicked for, rather than wished in the hello or changed by the host.
+        let requested = matches!(reply, Reply::Latest(_)) && !from_hello;
         if value == STATE_UNAVAILABLE {
             self.unavailable[k] = true;
             let label = match key {
@@ -2347,12 +2373,15 @@ mod tests {
         }
         assert_eq!(q.len(), MAX_EVENTS);
         assert!(!enqueue(&mut q, notice(3, "late")));
-        assert!(!enqueue(&mut q, state(SET_QUALITY, 1)));
+        assert!(!enqueue(&mut q, state(9, 1)), "a state of no real setting is dropped");
+        // An answer to a counted `Set` is never dropped, and still merges.
+        assert!(enqueue(&mut q, state(SET_QUALITY, 1)));
+        assert!(!enqueue(&mut q, state(SET_QUALITY, 2)));
         // The end of a session is never dropped.
         let ended =
             Event::Ended { generation: 1, kind: EndKind::Closed, reason: String::new(), lifetime: Duration::ZERO, since_notice: None };
         assert!(enqueue(&mut q, ended));
-        assert_eq!(q.len(), MAX_EVENTS + 1);
+        assert_eq!(q.len(), MAX_EVENTS + 2);
     }
 
     #[test]
@@ -2383,6 +2412,31 @@ mod tests {
             }
         }
         (on, refused, asked.due)
+    }
+
+    #[test]
+    fn hello_wishes_count_as_asked() {
+        // Sound wished in the hello; off and on clicked before the host's answer to the hello.
+        let (mut asked, mut on, mut refused) = (Asked::default(), true, 0);
+        asked.wished(1);
+        for v in [0, 1] {
+            on = v == 1;
+            asked.sent(v);
+        }
+        for value in [1, 0, 1] {
+            let refuse;
+            (on, refuse) = feature_state(on, &asked.reply(1), value);
+            refused += refuse as u32;
+        }
+        assert_eq!((on, refused, asked.due), (true, 0, 0));
+        // An answer to the hello alone is not one the user clicked for.
+        let mut a = Asked::default();
+        a.wished(1);
+        assert!(a.hello);
+        assert_eq!(a.reply(1), Reply::Latest(1));
+        a.wished(1);
+        a.sent(0);
+        assert!(!a.hello);
     }
 
     #[test]
