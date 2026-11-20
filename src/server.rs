@@ -34,6 +34,7 @@ const MAX_IN_FLIGHT: u32 = 2;
 
 struct SessionCtl {
     stop: AtomicBool,
+    finished: AtomicBool,
     sock: TcpStream,
 }
 
@@ -127,10 +128,16 @@ fn authenticate(host: &Host, stream: &TcpStream, peer: SocketAddr) -> Option<cha
 
 fn serve(host: &Host, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys) {
     let Ok(sock) = stream.try_clone() else { return };
-    let ctl = Arc::new(SessionCtl { stop: AtomicBool::new(false), sock });
-    if let Some(old) = host.current.lock().unwrap().replace(ctl.clone()) {
+    let ctl = Arc::new(SessionCtl { stop: AtomicBool::new(false), finished: AtomicBool::new(false), sock });
+    let old = host.current.lock().unwrap().replace(ctl.clone());
+    if let Some(old) = old {
         log!("replacing the existing session");
         old.kick();
+        // Let it release its screen duplication and injected keys first.
+        let t = Instant::now();
+        while !old.finished.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     log!("session started: {peer}");
     let r = run_session(host, stream, keys, &ctl);
@@ -141,9 +148,10 @@ fn serve(host: &Host, stream: TcpStream, peer: SocketAddr, keys: channel::Sessio
             *cur = None;
         }
     }
+    ctl.finished.store(true, Ordering::SeqCst);
     match r {
-        Ok(()) => log!("session ended: {peer}"),
-        Err(e) => log!("session ended: {peer}: {e}"),
+        Err(e) if e.to_string() != channel::CLOSED => log!("session ended: {peer}: {e}"),
+        _ => log!("session ended: {peer} disconnected"),
     }
 }
 
@@ -285,6 +293,8 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
     let mut last_change = Instant::now();
     let mut last_send = Instant::now();
     let mut capture_failures = 0u32;
+    let mut last_dxgi_try = Instant::now();
+    let multi_all = opts.monitor == MonitorSel::All && capture::monitors().len() > 1;
 
     while !ctl.stopped() {
         let t0 = Instant::now();
@@ -303,7 +313,7 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
             match capture::resolve(opts.monitor) {
                 Some(a) if switched || current != Some(a) => {
                     capturer = None; // release the old device/DCs before creating new ones
-                    let c = if opts.monitor == MonitorSel::All && capture::monitors().len() > 1 {
+                    let c = if multi_all {
                         Capturer::gdi(a)
                     } else {
                         Capturer::new(a)
@@ -318,6 +328,15 @@ fn capture_loop(opts: &HostOptions, writer: &Writer, shared: &Shared, ctl: &Sess
                             encoder.request_full();
                         }
                         Err(e) => log!("capture setup failed: {e}"),
+                    }
+                }
+                Some(a) if !multi_all && last_dxgi_try.elapsed() > Duration::from_secs(10) && capturer.as_ref().is_some_and(|c| !c.waits_for_changes()) => {
+                    // A transient DXGI failure (secure desktop, full-screen app, driver reset) may have passed.
+                    last_dxgi_try = Instant::now();
+                    if let Ok(d) = crate::dxgi::DxgiCapture::new(a) {
+                        log!("switched back to DXGI capture");
+                        capturer = Some(Capturer::Dxgi(d));
+                        encoder.request_full();
                     }
                 }
                 Some(_) => {}

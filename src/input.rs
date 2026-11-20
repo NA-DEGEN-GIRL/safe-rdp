@@ -131,3 +131,35 @@ impl Drop for Injector {
         self.release_all();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    #[test]
+    #[ignore = "moves the real mouse cursor; run with --ignored"]
+    fn absolute_moves_land_on_exact_pixels() {
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        };
+        let mut orig = POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut orig) };
+        let area = crate::capture::resolve(crate::capture::MonitorSel::Primary).unwrap();
+        let mut inj = Injector::default();
+        inj.set_area(area);
+        let mut seen = Vec::new();
+        for (x, y) in [(0, 0), (1, 1), (123, 457), (area.width - 1, area.height - 1), (area.width / 2 + 1, area.height / 3)] {
+            inj.handle(&ClientMsg::MouseMove { x: x as u16, y: y as u16 });
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let mut p = POINT { x: 0, y: 0 };
+            unsafe { GetCursorPos(&mut p) };
+            seen.push(((area.left + x, area.top + y), (p.x, p.y)));
+        }
+        unsafe { SetCursorPos(orig.x, orig.y) };
+        for (want, got) in seen {
+            assert_eq!(want, got);
+        }
+    }
+}

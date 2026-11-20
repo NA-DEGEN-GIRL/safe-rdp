@@ -268,10 +268,10 @@ fn keygen(args: &[String]) -> Result<()> {
 fn key_cmd(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("import") => {
-            let mut line = match args.get(1) {
-                Some(k) => k.clone(),
-                None => read_secret("Paste key (input hidden): ")?,
-            };
+            if args.len() > 1 {
+                bail!("pass the key on stdin or at the prompt, not as an argument (it would end up in shell history)");
+            }
+            let mut line = read_secret("Paste key (input hidden): ")?;
             let k = keystore::parse_key(&line);
             unsafe { util::wipe(line.as_bytes_mut()) };
             let path = keystore::save_user_key(&k?)?;

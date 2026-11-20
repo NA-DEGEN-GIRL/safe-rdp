@@ -21,7 +21,7 @@
 
 use crate::bail;
 use crate::crypto::{self, Aead, EcdhKey, NONCE_LEN, PUBKEY_LEN, TAG_LEN};
-use crate::util::{Result, Secret, SecureVec, wipe};
+use crate::util::{Error, Result, Secret, SecureVec, wipe};
 use std::io::{Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"SRDP";
@@ -31,6 +31,17 @@ const TRANSCRIPT_LABEL: &[u8] = b"safe-rdp/1 transcript";
 const KEYS_LABEL: &[u8] = b"safe-rdp/1 keys";
 /// Upper bound on a single record; bounds memory a peer can make us allocate.
 pub const MAX_RECORD: usize = 32 << 20;
+/// Error text for an orderly or abrupt close by the peer; callers treat it as a normal end.
+pub const CLOSED: &str = "connection closed by peer";
+
+fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
+    use std::io::ErrorKind::*;
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        UnexpectedEof | ConnectionReset | ConnectionAborted => Error::msg(CLOSED),
+        TimedOut | WouldBlock => Error::msg("connection timed out"),
+        _ => e.into(),
+    })
+}
 
 pub struct SessionKeys {
     pub send: Aead,
@@ -89,8 +100,8 @@ pub fn client_handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32]) -> Result<Se
 
     let mut sh = [0u8; HELLO_LEN];
     let mut confirm = [0u8; 32];
-    s.read_exact(&mut sh)?;
-    s.read_exact(&mut confirm)?;
+    read_full(s, &mut sh)?;
+    read_full(s, &mut confirm)?;
     let peer = parse_hello(&sh)?;
     let d = derive(psk, &eph, &peer, &ch, &sh)?;
     if !crypto::ct_eq(&confirm, &d.server_confirm.0) {
@@ -103,7 +114,7 @@ pub fn client_handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32]) -> Result<Se
 
 pub fn server_handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32]) -> Result<SessionKeys> {
     let mut ch = [0u8; HELLO_LEN];
-    s.read_exact(&mut ch)?;
+    read_full(s, &mut ch)?;
     let peer = parse_hello(&ch)?;
 
     let eph = EcdhKey::generate()?;
@@ -118,7 +129,10 @@ pub fn server_handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32]) -> Result<Se
     s.flush()?;
 
     let mut confirm = [0u8; 32];
-    s.read_exact(&mut confirm)?;
+    read_full(s, &mut confirm).map_err(|e| match e.to_string().as_str() {
+        CLOSED => Error::msg("viewer hung up during the handshake (it probably has a different key)"),
+        _ => e,
+    })?;
     if !crypto::ct_eq(&confirm, &d.client_confirm.0) {
         bail!("client failed authentication");
     }
@@ -184,7 +198,7 @@ impl<R: Read> RecordReader<R> {
     /// until the next call.
     pub fn recv(&mut self) -> Result<&[u8]> {
         let mut len = [0u8; 4];
-        self.r.read_exact(&mut len)?;
+        read_full(&mut self.r, &mut len)?;
         let total = u32::from_le_bytes(len) as usize;
         if total <= TAG_LEN || total > MAX_RECORD {
             bail!("invalid record length {total}");
@@ -195,7 +209,7 @@ impl<R: Read> RecordReader<R> {
         // Wipe the previous plaintext before reusing the buffer.
         wipe(&mut self.buf.0);
         self.buf.0.resize(total, 0);
-        self.r.read_exact(&mut self.buf.0)?;
+        read_full(&mut self.r, &mut self.buf.0)?;
         let body_len = total - TAG_LEN;
         let mut tag = [0u8; TAG_LEN];
         tag.copy_from_slice(&self.buf.0[body_len..]);

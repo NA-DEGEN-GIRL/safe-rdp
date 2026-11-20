@@ -202,8 +202,8 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     std::thread::spawn(move || {
         let r = net_loop(&mut reader, clip.as_ref());
         APP.get().unwrap().close(match r {
-            Ok(()) => "the host closed the connection".into(),
-            Err(e) => format!("connection lost: {e}"),
+            Err(e) if e.to_string() != channel::CLOSED => format!("connection lost: {e}"),
+            _ => "the host closed the connection".into(),
         });
     });
 

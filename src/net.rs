@@ -68,6 +68,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "depends on the local Tailscale state"]
+    fn detects_local_tailscale_ip() {
+        let ip = tailscale_ipv4().expect("Tailscale not up");
+        println!("tailscale ip: {ip}");
+        assert!(is_tailscale(IpAddr::V4(ip)));
+    }
+
+    #[test]
     fn policy() {
         let p = PeerPolicy { allow: vec![], allow_non_tailscale: false, loopback_ok: false };
         assert!(p.allows("100.100.1.2".parse().unwrap()));
