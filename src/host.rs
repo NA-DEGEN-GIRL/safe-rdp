@@ -964,7 +964,7 @@ impl Input {
                 Ok(())
             }
             Err(e) => {
-                self.log_refusal(format!("refused upload of {name} ({size} bytes): {e}"));
+                self.log_refusal(format!("refused upload of {} ({size} bytes): {e}", printable(name)));
                 self.file_result(id, false, e.to_string())
             }
         }

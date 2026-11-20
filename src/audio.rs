@@ -13,7 +13,11 @@
 #![allow(dead_code)]
 
 use crate::bail;
+#[cfg(not(test))]
 use crate::platform::audio::AudioPlayer;
+// Tests never open a sound device: the receiver gets a player that only records what it was asked.
+#[cfg(test)]
+use tests::FakePlayer as AudioPlayer;
 use crate::proto::{AUDIO_IMA_ADPCM, AUDIO_PCM16, ServerMsg};
 use crate::util::Result;
 use std::time::{Duration, Instant};
@@ -255,9 +259,12 @@ impl AudioSender {
 
 /// How long the receiver waits before trying to open an audio device again.
 const PLAYER_RETRY: Duration = Duration::from_secs(5);
+/// However often the host changes the stream format, a new player (on Linux a `pw-play` process)
+/// is opened at most this often; packets in another format are dropped meanwhile.
+const FORMAT_HOLD: Duration = Duration::from_secs(2);
 
 /// Viewer side: decodes `ServerMsg::Audio` and queues it on the platform player, which is
-/// (re)opened whenever the stream format changes.
+/// (re)opened when the stream format changes.
 #[derive(Default)]
 pub struct AudioReceiver {
     dec: AdpcmDecoder,
@@ -265,6 +272,8 @@ pub struct AudioReceiver {
     player: Option<AudioPlayer>,
     format: (u32, u8),
     retry_at: Option<Instant>,
+    /// When a player was last opened (or tried).
+    opened_at: Option<Instant>,
 }
 
 impl AudioReceiver {
@@ -289,16 +298,24 @@ impl AudioReceiver {
     /// Decodes and plays one message. Errors report a malformed message or a missing audio
     /// device (once per failure streak); the session can carry on after either.
     pub fn play(&mut self, rate: u32, channels: u8, codec: u8, data: &[u8]) -> Result<()> {
+        self.play_at(Instant::now(), rate, channels, codec, data)
+    }
+
+    fn play_at(&mut self, now: Instant, rate: u32, channels: u8, codec: u8, data: &[u8]) -> Result<()> {
         self.decode(rate, channels, codec, data)?;
         if self.format != (rate, channels) {
+            if self.opened_at.is_some_and(|t| now.duration_since(t) < FORMAT_HOLD) {
+                return Ok(());
+            }
             self.player = None;
             self.format = (rate, channels);
             self.retry_at = None;
         }
         if self.player.is_none() {
-            if self.retry_at.is_some_and(|t| Instant::now() < t) {
+            if self.retry_at.is_some_and(|t| now < t) {
                 return Ok(());
             }
+            self.opened_at = Some(now);
             match AudioPlayer::new(rate, channels) {
                 Ok(p) => {
                     self.player = Some(p);
@@ -306,7 +323,7 @@ impl AudioReceiver {
                 }
                 Err(e) => {
                     let first = self.retry_at.is_none();
-                    self.retry_at = Some(Instant::now() + PLAYER_RETRY);
+                    self.retry_at = Some(now + PLAYER_RETRY);
                     return if first { Err(e) } else { Ok(()) };
                 }
             }
@@ -328,6 +345,54 @@ impl AudioReceiver {
 mod tests {
     use super::*;
     use crate::proto::S_AUDIO;
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        /// Formats `AudioPlayer::new` was called with on this thread, and whether it fails.
+        static OPENED: RefCell<Vec<(u32, u8)>> = const { RefCell::new(Vec::new()) };
+        static NO_DEVICE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub struct FakePlayer;
+
+    impl FakePlayer {
+        pub fn new(rate: u32, channels: u8) -> Result<FakePlayer> {
+            OPENED.with_borrow_mut(|o| o.push((rate, channels)));
+            if NO_DEVICE.get() {
+                bail!("no audio device");
+            }
+            Ok(FakePlayer)
+        }
+
+        pub fn push(&mut self, _pcm: &[i16]) {}
+    }
+
+    #[test]
+    fn format_flapping_cannot_respawn_the_player() {
+        let packet = |ch: u8| vec![1u8; 2 * 960 * ch as usize];
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for no_device in [false, true] {
+            NO_DEVICE.set(no_device);
+            let mut r = AudioReceiver::new();
+            // A host alternating mono and stereo in every 20 ms packet for 10 s: a player every 2 s.
+            for i in 0..500 {
+                let ch = 1 + (i % 2) as u8;
+                let _ = r.play_at(at(20 * i), 48_000, ch, AUDIO_PCM16, &packet(ch));
+            }
+            let opened = OPENED.take();
+            assert_eq!(opened.len(), 5);
+            assert!(opened.windows(2).all(|w| w[0] != w[1]), "{opened:?}");
+        }
+        NO_DEVICE.set(false);
+        // A format that settles is followed at once, then kept.
+        let mut r = AudioReceiver::new();
+        r.play_at(at(0), 48_000, 2, AUDIO_PCM16, &packet(2)).unwrap();
+        for i in 0..100 {
+            r.play_at(at(5000 + 20 * i), 44_100, 1, AUDIO_PCM16, &packet(1)).unwrap();
+        }
+        assert_eq!(OPENED.take(), [(48_000, 2), (44_100, 1)]);
+    }
 
     struct Rng(u64);
 
