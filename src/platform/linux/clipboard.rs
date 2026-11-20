@@ -10,6 +10,11 @@ use crate::log;
 use crate::proto::MAX_CLIPBOARD;
 use crate::util::{Error, Result, wipe};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// How long after we take the selection a local offer of the same text counts as its echo
+/// (a clipboard manager copies it within milliseconds; a person copying it again takes longer).
+const ECHO_WINDOW: Duration = Duration::from_secs(2);
 
 /// The bridge, as seen from the session: remote text goes in with `set`, local changes come
 /// out through the callback given to `spawn`.
@@ -129,9 +134,10 @@ struct Bridge {
     /// The text the local clipboard holds as far as we know (`None`: unknown, empty or not
     /// text), so text it already holds is not taken over again.
     last: Option<String>,
-    /// `last` came from the remote side and no local application has offered it since. The
-    /// first such offer (typically a clipboard manager copying it from us) is not sent back.
-    echo: bool,
+    /// When `last` came from the remote side, until a local application offers text. The first
+    /// such offer of the same text within `ECHO_WINDOW` (typically a clipboard manager copying
+    /// it from us) is not sent back.
+    echo: Option<Instant>,
     fetch: Option<Fetch>,
 }
 
@@ -159,7 +165,7 @@ impl Bridge {
         };
         conn.select_selection_input(xfixes, win, atoms.clipboard)?;
         conn.sync()?;
-        Ok(Bridge { conn, win, xfixes, atoms, owned: None, last: None, echo: false, fetch: None })
+        Ok(Bridge { conn, win, xfixes, atoms, owned: None, last: None, echo: None, fetch: None })
     }
 
     fn run(&mut self, wake: &Wake, rx: &mpsc::Receiver<String>, on_change: &dyn Fn(String)) -> Result<()> {
@@ -213,14 +219,14 @@ impl Bridge {
         wipe_string(&mut self.last);
         self.last = Some(text.clone());
         self.owned = Some(text);
-        self.echo = true;
+        self.echo = Some(Instant::now());
         Ok(())
     }
 
     /// The local clipboard no longer holds text we know of.
     fn forget(&mut self) {
         wipe_string(&mut self.last);
-        self.echo = false;
+        self.echo = None;
     }
 
     fn on_event(&mut self, ev: Event, on_change: &dyn Fn(String)) -> Result<()> {
@@ -315,7 +321,7 @@ impl Bridge {
     /// echoed back; text copied again locally is sent again (the remote clipboard may have
     /// changed to something that is not text in the meantime).
     fn report(&mut self, mut text: String, on_change: &dyn Fn(String)) {
-        let echo = std::mem::take(&mut self.echo);
+        let echo = self.echo.take().is_some_and(|at| at.elapsed() < ECHO_WINDOW);
         if text.is_empty() {
             self.forget();
             return;
@@ -374,7 +380,6 @@ impl Bridge {
 mod tests {
     use super::*;
     use crate::platform::linux::xvfb::VirtualDisplay;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn text_encodings() {
@@ -470,6 +475,20 @@ mod tests {
         let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
         app.set(text.into());
         assert!(arx.recv_timeout(Duration::from_millis(700)).is_err(), "echoed the remote text");
+        app.set(text.into());
+        assert_eq!(wait_for(&arx), text);
+
+        drop(app);
+        wait_owner(&mut c, &|o| o == NONE);
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Long after the remote side sent text, a local copy of the same text is no echo (with
+        // no clipboard manager, no echo ever came).
+        let text = "make test";
+        a.set(text.into());
+        wait_owner(&mut c, &|o| o == a_win);
+        std::thread::sleep(ECHO_WINDOW + Duration::from_millis(300));
+        let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
         app.set(text.into());
         assert_eq!(wait_for(&arx), text);
         drop(app);

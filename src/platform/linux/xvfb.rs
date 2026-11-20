@@ -3,8 +3,9 @@
 //! stops both when dropped.
 //!
 //! /tmp/.X11-unix is shared by every local user, so a display is only used once it is proven
-//! to be ours: Xvfb reports through `-displayfd` when it accepts clients, and both socket
-//! names of the display must then belong to the Xvfb process we started.
+//! to be ours: the directory must be one no other user controls, Xvfb reports through
+//! `-displayfd` when it accepts clients, and both socket names of the display must then belong
+//! to the Xvfb process we started. A host serving the display talks to that process only.
 
 use super::x11::{self, AuthEntry, COOKIE_NAME, Conn, FAMILY_WILD, Target, encode_auth_entry};
 use crate::util::{Error, Result, wipe};
@@ -13,10 +14,10 @@ use std::ffi::c_int;
 use std::fs::File;
 use std::io::{ErrorKind, PipeReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,10 +26,56 @@ unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn waitid(idtype: c_int, id: u32, info: *mut SigInfo, options: c_int) -> c_int;
+    fn geteuid() -> u32;
 }
 
 const PR_SET_PDEATHSIG: c_int = 1;
 const F_SETFD: c_int = 2;
+const P_PID: c_int = 1;
+const WNOHANG: c_int = 1;
+const WEXITED: c_int = 4;
+const WNOWAIT: c_int = 0x0100_0000;
+const CLD_EXITED: i32 = 1;
+const CLD_DUMPED: i32 = 3;
+
+/// `siginfo_t` as `waitid` fills it in for a child (x86_64 layout).
+#[repr(C, align(8))]
+struct SigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    _pad: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+    _rest: [i32; 25],
+}
+
+const _: () = assert!(std::mem::size_of::<SigInfo>() == 128);
+
+/// How `child` ended, if it has, seen without reaping it (an error once it is reaped): until
+/// `stop_group` reaps it, the zombie keeps its pid and process group id from being reused.
+fn peek_exit(child: &Child) -> std::io::Result<Option<ExitStatus>> {
+    let mut info = SigInfo { signo: 0, errno: 0, code: 0, _pad: 0, pid: 0, uid: 0, status: 0, _rest: [0; 25] };
+    if unsafe { waitid(P_PID, child.id(), &mut info, WEXITED | WNOHANG | WNOWAIT) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // As a wait status: the exit code in the second byte, else the signal (0x80: core dumped).
+    Ok((info.pid != 0).then(|| {
+        ExitStatus::from_raw(match info.code {
+            CLD_EXITED => (info.status & 0xff) << 8,
+            CLD_DUMPED => (info.status & 0x7f) | 0x80,
+            _ => info.status & 0x7f,
+        })
+    }))
+}
+
+/// How `child` ended, if it has, without reaping it.
+fn exit_status(child: &mut Child) -> Option<ExitStatus> {
+    // Reaped already: std keeps the status it got.
+    peek_exit(child).unwrap_or_else(|_| child.try_wait().ok().flatten())
+}
 
 /// Backstop for a host killed without a chance to clean up: the child gets SIGTERM when the
 /// thread that started it ends (the main thread, for the host).
@@ -63,7 +110,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often `watch` checks on Xvfb and the session.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Xvfb and the session command, each leading its own process group.
+/// Xvfb and the session command, each leading its own process group. Only `stop_group` reaps
+/// them.
 struct Procs {
     xvfb: Child,
     session: Option<Child>,
@@ -74,10 +122,10 @@ struct Procs {
 impl Procs {
     /// Why the display is no longer usable, once Xvfb or the session command has exited.
     fn ended(&mut self, dir: &Path) -> Option<String> {
-        if let Ok(Some(status)) = self.xvfb.try_wait() {
+        if let Some(status) = exit_status(&mut self.xvfb) {
             return Some(format!("Xvfb exited ({status}): {}", log_tail(&dir.join("xvfb.log"))));
         }
-        let status = self.session.as_mut().and_then(|s| s.try_wait().ok().flatten())?;
+        let status = self.session.as_mut().and_then(exit_status)?;
         Some(if status.success() {
             "the session ended".to_string()
         } else {
@@ -142,21 +190,35 @@ fn log_tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(3)..].join(" / ")
 }
 
-/// Stops a process group: SIGTERM, a grace period, then SIGKILL.
+/// Stops a process group: SIGTERM, a grace period, then SIGKILL for whatever is left. The
+/// leader is reaped last, so the group id cannot pass to another process while it is signalled.
 fn stop_group(child: &mut Child) {
+    if peek_exit(child).is_err() {
+        return; // reaped already: its group id may be someone else's by now
+    }
     let pid = child.id() as c_int;
     unsafe { kill(-pid, SIGTERM) };
     let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            // The leader is gone; make sure nothing it started lingers.
-            unsafe { kill(-pid, SIGKILL) };
-            return;
-        }
+    while exit_status(child).is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     unsafe { kill(-pid, SIGKILL) };
     let _ = child.wait();
+}
+
+/// Refuses a socket directory that another user controls: its owner can swap our display's
+/// socket for theirs, which the sticky bit does not prevent.
+fn check_socket_dir(dir: &Path, euid: u32) -> Result<()> {
+    let m = std::fs::symlink_metadata(dir).map_err(|e| format!("cannot check {}: {e}", dir.display()))?;
+    let writable_by_others = m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0;
+    if !m.file_type().is_dir() || (m.uid() != 0 && m.uid() != euid) || writable_by_others {
+        bail!(
+            "refusing to start a virtual display: {} must be a directory owned by root or by this user, \
+             sticky if others can write to it",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Reads the display number Xvfb writes to its `-displayfd` pipe once it accepts clients.
@@ -165,7 +227,7 @@ fn read_display_number(ready: &mut PipeReader, xvfb: &Mutex<Procs>, n: u32, log_
     let mut got = Vec::new();
     let mut open = true;
     loop {
-        if let Ok(Some(status)) = xvfb.lock().unwrap_or_else(|e| e.into_inner()).xvfb.try_wait() {
+        if let Some(status) = exit_status(&mut xvfb.lock().unwrap_or_else(|e| e.into_inner()).xvfb) {
             bail!("Xvfb on :{n} exited ({status}): {}", log_tail(log_path));
         }
         if Instant::now() > deadline {
@@ -204,6 +266,8 @@ impl VirtualDisplay {
     /// Signals arriving meanwhile (a stop request) do not disturb it.
     pub fn start(width: u32, height: u32, session: Option<&str>) -> Result<VirtualDisplay> {
         let vd = VirtualDisplay::spawn(None, width, height, session)?;
+        // Should Xvfb die, a server another user starts on its socket names gets nothing from us.
+        x11::pin_server(vd.procs().xvfb.id())?;
         // SAFETY: documented to be called before other threads exist.
         unsafe {
             std::env::set_var("DISPLAY", vd.display_name());
@@ -225,6 +289,11 @@ impl VirtualDisplay {
         };
         if candidates.is_empty() {
             bail!("no free X display number between {FIRST_DISPLAY} and {LAST_DISPLAY}");
+        }
+        // Checked again once Xvfb has made sure it exists.
+        let dir = Path::new(x11::SOCKET_DIR);
+        if std::fs::symlink_metadata(dir).is_ok() {
+            check_socket_dir(dir, unsafe { geteuid() })?;
         }
         let mut last = Error::msg("no display tried");
         for n in candidates {
@@ -289,6 +358,7 @@ impl VirtualDisplay {
         if shown != n {
             bail!("Xvfb started display :{shown} instead of :{n}");
         }
+        check_socket_dir(Path::new(x11::SOCKET_DIR), unsafe { geteuid() })?;
         // Proves the listener is our Xvfb before the cookie goes anywhere.
         Conn::connect_to_server(&vd.target(), pid).map_err(|e| format!("cannot use display :{n}: {e}"))?;
         Ok(vd)
@@ -364,8 +434,8 @@ impl VirtualDisplay {
 
     /// False once the session command has exited (always true without a session).
     pub fn session_running(&self) -> bool {
-        match &mut self.procs().session {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
+        match &self.procs().session {
+            Some(c) => matches!(peek_exit(c), Ok(None)),
             None => true,
         }
     }
@@ -377,7 +447,7 @@ impl VirtualDisplay {
 
     /// False once Xvfb has exited.
     pub fn running(&self) -> bool {
-        matches!(self.procs().xvfb.try_wait(), Ok(None))
+        matches!(peek_exit(&self.procs().xvfb), Ok(None))
     }
 }
 
@@ -385,6 +455,7 @@ impl Drop for VirtualDisplay {
     fn drop(&mut self) {
         let mut p = self.procs();
         p.closing = true;
+        x11::retire_server(p.xvfb.id());
         if let Some(s) = &mut p.session {
             stop_group(s);
         }
@@ -416,6 +487,55 @@ mod tests {
         assert!(find_cookie(&entries, 256, b"somehost", 43).is_none());
         assert!(write_auth(&path, 42, &[1; 16]).is_err(), "never overwrites");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn socket_dir_must_be_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = unsafe { geteuid() };
+        let dir = private_dir("sockets").unwrap();
+        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        for (mode, safe) in [(0o700, true), (0o755, true), (0o1777, true), (0o1775, true), (0o777, false), (0o775, false)] {
+            set(mode);
+            assert_eq!(check_socket_dir(&dir, euid).is_ok(), safe, "mode {mode:o}");
+        }
+        set(0o755);
+        if euid != 0 {
+            assert!(check_socket_dir(&dir, euid + 1).is_err(), "another user's directory");
+        }
+        let link = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let err = check_socket_dir(&link, euid).err().expect("followed a link");
+        assert!(err.to_string().contains("refusing"), "{err}");
+        std::fs::remove_file(&link).unwrap();
+        assert!(check_socket_dir(&dir.join("missing"), euid).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An ended process stays a zombie, holding its pid and process group id, until
+    /// `stop_group` is done signalling its group.
+    #[test]
+    fn exits_are_seen_without_reaping() {
+        let spawn = |script: &str| Command::new("sh").args(["-c", script]).process_group(0).spawn().unwrap();
+        let mut p = Procs { xvfb: spawn("sleep 30"), session: Some(spawn("exit 3")), closing: false };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let why = loop {
+            if let Some(why) = p.ended(Path::new("/nonexistent")) {
+                break why;
+            }
+            assert!(Instant::now() < deadline, "the exit was not seen");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(why.contains("exit status: 3"), "{why}");
+        let session = p.session.as_mut().unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", session.id())).expect("the session was reaped");
+        assert!(stat.contains(") Z "), "{stat}");
+        assert_eq!(exit_status(session).map(|s| s.code()), Some(Some(3)), "seen again");
+        stop_group(session);
+        assert!(peek_exit(session).is_err(), "not reaped");
+        assert!(exit_status(&mut p.xvfb).is_none());
+        stop_group(&mut p.xvfb);
+        assert_eq!(exit_status(&mut p.xvfb).and_then(|s| s.signal()), Some(SIGTERM));
     }
 
     #[test]

@@ -162,7 +162,7 @@ fn on_server_msg(
                 c.set(t);
             }
         }
-        ServerMsg::Notice(t) => log!("host: {}", t.chars().filter(|c| !c.is_control()).collect::<String>()),
+        ServerMsg::Notice(t) => log!("host: {}", printable(&t)),
         ServerMsg::Audio { rate, channels, codec, data, .. } => {
             if let Some(s) = sound {
                 s.play(rate, channels, codec, data);
@@ -833,7 +833,7 @@ impl Ui {
 
 /// Window title from the host's (untrusted) name.
 fn title(host_name: &str, target: &str) -> String {
-    let name: String = host_name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let name: String = printable(host_name).chars().take(64).collect();
     if name.is_empty() || name == target { format!("safe-rdp - {target}") } else { format!("safe-rdp - {name} ({target})") }
 }
 
@@ -990,7 +990,9 @@ mod tests {
     fn titles_are_sanitised() {
         assert_eq!(title("desk", "desk"), "safe-rdp - desk");
         assert_eq!(title("", "100.64.0.1"), "safe-rdp - 100.64.0.1");
-        assert_eq!(title("pc\n\u{1b}[31m", "pc.tail"), "safe-rdp - pc[31m (pc.tail)");
+        assert_eq!(title("pc\n\u{1b}[31m", "pc.tail"), "safe-rdp - pc??[31m (pc.tail)");
+        assert_eq!(title("a\u{202E}gpj.exe\u{200B}", "t"), "safe-rdp - a?gpj.exe? (t)");
+        assert_eq!(title(&"x".repeat(100), "t"), format!("safe-rdp - {} (t)", "x".repeat(64)));
     }
 
     #[test]
