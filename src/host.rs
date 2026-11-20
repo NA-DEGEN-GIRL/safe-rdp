@@ -86,11 +86,13 @@ impl Default for HostOptions {
 /// Longest a handshake may take in all, however the peer paces its bytes.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Handshakes in progress at once, in all and per source address.
+/// Handshakes in progress at once, in all and per source (see `source`).
 const MAX_PENDING: usize = 8;
 const MAX_PENDING_PER_ADDR: usize = 2;
-/// How long a failed handshake keeps its address's slot (slows down guessing).
+/// How long a failed handshake keeps its source's slot (slows down guessing).
 const FAILURE_PENALTY: Duration = Duration::from_secs(1);
+/// Failed handshakes serving their penalty at once; while this many are, nobody is admitted.
+const MAX_PENALTIES: usize = 64;
 const MAX_IN_FLIGHT: u32 = 2;
 /// How often the accept loop looks at its stop flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -186,6 +188,17 @@ struct Host {
 }
 
 impl Host {
+    fn new(opts: HostOptions, psk: Secret<32>) -> Host {
+        Host {
+            opts,
+            psk,
+            current: Mutex::new(None),
+            pending: Mutex::new(Pending::default()),
+            quiet: Mutex::new(Quiet::new(Instant::now())),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
     /// Stops accepting sessions and ends the current one.
     fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -221,37 +234,63 @@ fn report_dropped(n: u64) {
     }
 }
 
+/// Who a connection counts as for the per-address limits. Outside Tailscale (whose addresses
+/// each belong to one node) a peer can usually pick any address in an IPv6 /64, so the /64 counts.
+fn source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None if net::is_tailscale(ip) => ip,
+            None => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+        },
+        v4 => v4,
+    }
+}
+
 /// Handshakes in progress: at most `MAX_PENDING` in all and `MAX_PENDING_PER_ADDR` from one
-/// address, so one peer without the key cannot keep everybody else out.
+/// source, so one peer without the key cannot keep everybody else out. A failed one leaves the
+/// total but keeps its source's place for `FAILURE_PENALTY`; at most `MAX_PENALTIES` do at once,
+/// so peers with many addresses cannot make the host hold ever more threads.
 #[derive(Default)]
 struct Pending {
     total: usize,
+    penalties: usize,
     per_addr: HashMap<IpAddr, usize>,
 }
 
 impl Pending {
     fn admit(&mut self, ip: IpAddr) -> std::result::Result<(), &'static str> {
-        let n = self.per_addr.get(&ip).copied().unwrap_or(0);
+        let src = source(ip);
+        let n = self.per_addr.get(&src).copied().unwrap_or(0);
         if n >= MAX_PENDING_PER_ADDR {
             return Err("too many pending handshakes from this address");
         }
         if self.total >= MAX_PENDING {
             return Err("too many pending handshakes");
         }
+        if self.penalties >= MAX_PENALTIES {
+            return Err("too many failed handshakes");
+        }
         self.total += 1;
-        self.per_addr.insert(ip, n + 1);
+        self.per_addr.insert(src, n + 1);
         Ok(())
     }
 
-    fn leave_total(&mut self) {
+    /// A handshake failed: it leaves the total and starts its penalty.
+    fn penalize(&mut self) {
         self.total = self.total.saturating_sub(1);
+        self.penalties += 1;
     }
 
-    fn leave_addr(&mut self, ip: IpAddr) {
-        if let Some(n) = self.per_addr.get_mut(&ip) {
+    /// A handshake (`penalized`: its penalty) is over.
+    fn leave(&mut self, ip: IpAddr, penalized: bool) {
+        let n = if penalized { &mut self.penalties } else { &mut self.total };
+        *n = n.saturating_sub(1);
+        let src = source(ip);
+        if let Some(n) = self.per_addr.get_mut(&src) {
             *n -= 1;
             if *n == 0 {
-                self.per_addr.remove(&ip);
+                self.per_addr.remove(&src);
             }
         }
     }
@@ -261,26 +300,22 @@ impl Pending {
 struct Slot {
     host: Arc<Host>,
     ip: IpAddr,
-    /// Still counted against `MAX_PENDING`.
-    counted: bool,
+    /// Serving the failure penalty: counted against `MAX_PENALTIES`, not `MAX_PENDING`.
+    penalized: bool,
 }
 
 impl Slot {
-    /// Gives back the place in the total but keeps the address's own (the failure penalty).
-    fn uncount(&mut self) {
-        if std::mem::take(&mut self.counted) {
-            lock(&self.host.pending).leave_total();
+    /// Gives back the place in the total but keeps the source's own (the failure penalty).
+    fn penalize(&mut self) {
+        if !std::mem::replace(&mut self.penalized, true) {
+            lock(&self.host.pending).penalize();
         }
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut p = lock(&self.host.pending);
-        if self.counted {
-            p.leave_total();
-        }
-        p.leave_addr(self.ip);
+        lock(&self.host.pending).leave(self.ip, self.penalized);
     }
 }
 
@@ -311,13 +346,14 @@ impl Quiet {
 
     /// Whether a line about `ip` may be logged in the current window.
     fn allow(&mut self, ip: IpAddr) -> bool {
-        let n = self.per_addr.get(&ip).copied().unwrap_or(0);
+        let src = source(ip);
+        let n = self.per_addr.get(&src).copied().unwrap_or(0);
         if self.shown >= QUIET_TOTAL || n >= QUIET_PER_ADDR {
             self.dropped += 1;
             return false;
         }
         self.shown += 1;
-        self.per_addr.insert(ip, n + 1);
+        self.per_addr.insert(src, n + 1);
         true
     }
 }
@@ -378,13 +414,6 @@ impl Write for Deadline<'_> {
     }
 }
 
-/// Listens on the configured address and serves viewers until the process ends.
-pub fn run(opts: HostOptions, psk: Secret<32>) -> Result<()> {
-    let stop = AtomicBool::new(false);
-    let listener = bind(&opts, &stop)?;
-    serve(listener, opts, psk, &stop)
-}
-
 /// Opens the listening socket on `opts.bind`, or on this machine's Tailscale address once
 /// Tailscale is up. Fails promptly if `stop` is set while it waits.
 pub fn bind(opts: &HostOptions, stop: &AtomicBool) -> Result<TcpListener> {
@@ -433,14 +462,7 @@ fn wait_for_address(find: impl Fn() -> Option<IpAddr>, stop: &AtomicBool, every:
 pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &AtomicBool) -> Result<()> {
     // Non-blocking accepts let the loop notice `stop`.
     listener.set_nonblocking(true)?;
-    let host = Arc::new(Host {
-        opts,
-        psk,
-        current: Mutex::new(None),
-        pending: Mutex::new(Pending::default()),
-        quiet: Mutex::new(Quiet::new(Instant::now())),
-        stopping: AtomicBool::new(false),
-    });
+    let host = Arc::new(Host::new(opts, psk));
     while !stop.load(Ordering::SeqCst) {
         let (stream, peer) = match listener.accept() {
             Ok(c) => c,
@@ -468,7 +490,7 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
             host.log_unauthenticated(peer.ip(), format_args!("refused {peer}: {why}"));
             continue;
         }
-        let mut slot = Slot { host: host.clone(), ip: peer.ip(), counted: true };
+        let mut slot = Slot { host: host.clone(), ip: peer.ip(), penalized: false };
         let h = host.clone();
         // If the thread cannot start, dropping the closure gives the slot back.
         let spawned = std::thread::Builder::new().name("session".into()).spawn(move || {
@@ -479,7 +501,7 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
                 }
                 None => {
                     // Slow down guessing from this address without holding up anybody else.
-                    slot.uncount();
+                    slot.penalize();
                     drop(stream);
                     std::thread::sleep(FAILURE_PENALTY);
                 }
@@ -1629,22 +1651,78 @@ mod tests {
         }
         assert_eq!(p.admit(ip(200)), Err("too many pending handshakes"));
         // A failed handshake leaves the total at once but keeps its address's place.
-        p.leave_total();
+        p.penalize();
         assert!(p.admit(ip(1)).is_err());
         p.admit(ip(200)).unwrap();
-        p.leave_addr(ip(1));
-        p.leave_total();
+        p.leave(ip(1), true);
+        p.leave(ip(2), false);
         p.admit(ip(1)).unwrap();
         // Nothing is kept for addresses without handshakes.
         let mut p = Pending::default();
         p.admit(ip(7)).unwrap();
         assert!(p.admit(ip(7)).is_ok() && p.admit(ip(7)).is_err());
-        for _ in 0..2 {
-            p.leave_total();
-            p.leave_addr(ip(7));
+        p.penalize();
+        p.leave(ip(7), true);
+        p.leave(ip(7), false);
+        p.leave(ip(7), false);
+        assert!(p.per_addr.is_empty() && p.total == 0 && p.penalties == 0);
+    }
+
+    #[test]
+    fn failed_handshakes_serving_their_penalty_are_capped_in_all() {
+        let host = Arc::new(Host::new(opts(), Secret([0; 32])));
+        // Each from an address of its own, as a peer with many of them could.
+        let admit = |i: usize| {
+            let ip = IpAddr::from([10, 0, (i >> 8) as u8, i as u8]);
+            lock(&host.pending).admit(ip).map(|()| Slot { host: host.clone(), ip, penalized: false })
+        };
+        let mut failed = Vec::new();
+        for i in 0..MAX_PENALTIES {
+            let mut s = admit(i).unwrap();
+            s.penalize();
+            s.penalize();
+            failed.push(s);
         }
-        p.leave_addr(ip(7));
-        assert!(p.per_addr.is_empty() && p.total == 0);
+        let counts = |p: &Pending| (p.total, p.penalties);
+        assert_eq!(counts(&lock(&host.pending)), (0, MAX_PENALTIES));
+        assert_eq!(admit(MAX_PENALTIES).err(), Some("too many failed handshakes"));
+        // Once a penalty is over, others get in again, until that one fails too.
+        failed.pop();
+        let mut s = admit(MAX_PENALTIES).unwrap();
+        s.penalize();
+        assert!(admit(MAX_PENALTIES + 1).is_err());
+        drop((s, failed));
+        let p = lock(&host.pending);
+        assert!(p.per_addr.is_empty() && p.total == 0 && p.penalties == 0);
+    }
+
+    #[test]
+    fn ipv6_peers_count_by_their_64() {
+        let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(source(v6("2001:db8:1:2:aaaa::1")), v6("2001:db8:1:2::"));
+        assert_eq!(source(v6("::ffff:100.64.0.1")), ip(1));
+        assert_eq!(source(ip(1)), ip(1));
+        // Tailscale gives every node an address of its own.
+        assert_eq!(source(v6("fd7a:115c:a1e0::1")), v6("fd7a:115c:a1e0::1"));
+        let mut p = Pending::default();
+        p.admit(v6("2001:db8::1")).unwrap();
+        p.admit(v6("2001:db8::ffff:2")).unwrap();
+        assert!(p.admit(v6("2001:db8::3")).unwrap_err().contains("this address"));
+        p.admit(v6("2001:db8:0:1::1")).unwrap();
+        for i in 1..=3 {
+            p.admit(v6(&format!("fd7a:115c:a1e0::{i}"))).unwrap();
+        }
+        p.admit(ip(1)).unwrap();
+        p.admit(v6("::ffff:100.64.0.1")).unwrap();
+        assert!(p.admit(ip(1)).unwrap_err().contains("this address"));
+        p.leave(v6("2001:db8::ffff:2"), false);
+        p.leave(v6("2001:db8::1"), false);
+        assert!(!p.per_addr.contains_key(&v6("2001:db8::")));
+        // The log throttle counts them the same way.
+        let mut q = Quiet::new(Instant::now());
+        let shown = (0..10u16).filter(|&i| q.allow(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]))).count();
+        assert_eq!(shown, QUIET_PER_ADDR as usize);
+        assert!(q.allow(v6("2001:db8:0:1::1")) && q.allow(v6("fd7a:115c:a1e0::1")));
     }
 
     #[test]

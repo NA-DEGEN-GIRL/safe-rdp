@@ -430,13 +430,19 @@ mod tests {
         unsafe { GlobalFree(h) };
         assert_eq!(names, listed);
         let a = std::fs::canonicalize(dir.join("a.txt")).unwrap();
-        // Existing files, but named by verbatim paths: refused before they are opened.
-        let mut names = names;
-        names.push(a.clone());
-        names.push(PathBuf::from(format!(r"\\?\GLOBALROOT\??\{}", dir.join("a.txt").display())));
         let files = regular_files(names);
         let expect = [a, std::fs::canonicalize(dir.join("파일 b.bin")).unwrap()];
         assert_eq!(files, expect);
+        // A local file named only by verbatim, object-manager and device paths, all of which
+        // canonicalize to it: refused before anything opens them.
+        std::fs::write(dir.join("c.txt"), b"c").unwrap();
+        let c = std::fs::canonicalize(dir.join("c.txt")).unwrap();
+        let plain = dir.join("c.txt").display().to_string();
+        let raw = [c.clone(), format!(r"\\?\GLOBALROOT\??\{plain}").into(), format!(r"\\.\{plain}").into()];
+        for p in &raw {
+            assert_eq!(std::fs::canonicalize(p).unwrap(), c, "{}", p.display());
+        }
+        assert_eq!(regular_files(raw.to_vec()), Vec::<PathBuf>::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
