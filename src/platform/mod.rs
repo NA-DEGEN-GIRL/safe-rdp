@@ -12,6 +12,8 @@
 
 /// Playback jitter buffer shared by both platforms' `audio::AudioPlayer`.
 mod jitter;
+/// Remote clipboard text on its way to both platforms' `clipboard::Clipboard` bridge thread.
+mod handover;
 
 #[cfg(windows)]
 mod windows;

@@ -7,9 +7,10 @@
 
 use super::x11::{self, ANY_PROPERTY_TYPE, ATOM_ATOM, ATOM_STRING, CURRENT_TIME, Conn, Event, Ext, NONE, Target, Wake, Waker};
 use crate::log;
+use crate::platform::handover::Handover;
 use crate::proto::MAX_CLIPBOARD;
 use crate::util::{Error, Result, wipe};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// How long after we take the selection a local offer of the same text counts as its echo
@@ -19,7 +20,8 @@ const ECHO_WINDOW: Duration = Duration::from_secs(2);
 /// The bridge, as seen from the session: remote text goes in with `set`, local changes come
 /// out through the callback given to `spawn`.
 pub struct Clipboard {
-    tx: Option<mpsc::Sender<String>>,
+    /// Remote text for the bridge thread: only the newest waits, however busy the thread is.
+    pending: Arc<Handover>,
     waker: Waker,
 }
 
@@ -31,39 +33,40 @@ impl Clipboard {
     }
 
     pub fn spawn_on(target: Target, on_change: impl Fn(String) + Send + 'static) -> Result<Clipboard> {
-        let (tx, rx) = mpsc::channel::<String>();
+        let pending = Arc::new(Handover::default());
         let wake = Wake::new()?;
         let waker = wake.waker()?;
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let taken = pending.clone();
         std::thread::Builder::new().name("clipboard".into()).spawn(move || match Bridge::open(&target) {
             Ok(mut b) => {
                 let _ = ready_tx.send(Ok(()));
-                if let Err(e) = b.run(&wake, &rx, &on_change) {
+                if let Err(e) = b.run(&wake, &taken, &on_change) {
                     log!("clipboard sharing stopped: {e}");
                 }
+                // Text sent from now on has nowhere to go.
+                taken.close();
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
             }
         })?;
         ready_rx.recv().map_err(|_| Error::msg("clipboard thread died"))??;
-        Ok(Clipboard { tx: Some(tx), waker })
+        Ok(Clipboard { pending, waker })
     }
 
     /// Replaces the local clipboard text (asynchronously, on the bridge thread).
     pub fn set(&self, text: String) {
-        if let Some(tx) = &self.tx {
-            if tx.send(text).is_ok() {
-                self.waker.wake();
-            }
+        if self.pending.put(text) {
+            self.waker.wake();
         }
     }
 }
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
-        // Close the channel first so the woken thread sees it disconnected.
-        self.tx = None;
+        // Close first so the woken thread sees it closed.
+        self.pending.close();
         self.waker.wake();
     }
 }
@@ -168,24 +171,21 @@ impl Bridge {
         Ok(Bridge { conn, win, xfixes, atoms, owned: None, last: None, echo: None, fetch: None })
     }
 
-    fn run(&mut self, wake: &Wake, rx: &mpsc::Receiver<String>, on_change: &dyn Fn(String)) -> Result<()> {
-        let r = self.serve(wake, rx, on_change);
+    fn run(&mut self, wake: &Wake, pending: &Handover, on_change: &dyn Fn(String)) -> Result<()> {
+        let r = self.serve(wake, pending, on_change);
         wipe_string(&mut self.owned);
         wipe_string(&mut self.last);
         r
     }
 
-    fn serve(&mut self, wake: &Wake, rx: &mpsc::Receiver<String>, on_change: &dyn Fn(String)) -> Result<()> {
+    fn serve(&mut self, wake: &Wake, pending: &Handover, on_change: &dyn Fn(String)) -> Result<()> {
         loop {
-            let mut latest = None;
-            loop {
-                match rx.try_recv() {
-                    Ok(t) => latest = Some(t),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                }
+            // Taken only after the wake-up pipe is drained (below), so text put meanwhile
+            // without a wake-up of its own is not left behind.
+            if pending.is_closed() {
+                return Ok(());
             }
-            if let Some(t) = latest {
+            if let Some(t) = pending.take() {
                 self.take_ownership(t)?;
             }
             while let Some(ev) = self.conn.poll_event()? {
@@ -497,6 +497,48 @@ mod tests {
 
     fn wait_for(rx: &mpsc::Receiver<String>) -> String {
         rx.recv_timeout(Duration::from_secs(5)).expect("no clipboard change reported")
+    }
+
+    /// Remote texts sent while the bridge thread is busy passing a local change on (to a
+    /// stalled viewer, on a host) do not pile up; once it is free, the newest is offered.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn a_busy_bridge_offers_the_newest_text() {
+        let vd = VirtualDisplay::spawn(Some(84), 200, 200, None).unwrap();
+        let t = vd.target();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let a = Clipboard::spawn_on(t.clone(), move |_| {
+            let _ = busy_tx.send(());
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+        let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
+        app.set("copied here".into());
+        busy_rx.recv_timeout(Duration::from_secs(5)).expect("the local copy was not reported");
+        for i in 0..1000 {
+            a.set(format!("{i:04} {}", "x".repeat(1024)));
+        }
+        drop(release_tx);
+
+        let mut c = Conn::connect(&t).unwrap();
+        let root = c.root();
+        let win = c.create_window(root, 0, 0, 1, 1, 2, 0, &[]).unwrap();
+        let (clipboard, utf8, prop) = (c.atom("CLIPBOARD").unwrap(), c.atom("UTF8_STRING").unwrap(), c.atom("P").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "the newest text was not offered");
+            c.convert_selection(win, clipboard, utf8, prop, CURRENT_TIME).unwrap();
+            let answered = c.wait_event(Duration::from_secs(1)).unwrap();
+            if matches!(answered, Some(Event::SelectionNotify { property, .. }) if property == prop)
+                && c.get_property(win, prop, ANY_PROPERTY_TYPE, 1 << 16, true).unwrap().value.starts_with(b"0999 ")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(app);
+        drop(a);
     }
 
     #[test]
