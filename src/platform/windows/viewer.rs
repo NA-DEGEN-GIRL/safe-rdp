@@ -130,6 +130,9 @@ struct App {
     swallowed: Mutex<HashSet<u16>>,
     /// Keys held down and whether their press went to the local desktop (see `stays_local`).
     routes: Mutex<HashMap<u16, bool>>,
+    /// The Left Ctrl held down (`routes`) was pressed through a window message, which cannot
+    /// always tell it from AltGr's (`left_ctrl_scan`).
+    left_ctrl_unsure: AtomicBool,
     /// Modifiers held down on the host that a chord staying local pressed here as well
     /// (see `share_modifiers`): their repeats and release go to both.
     shared: Mutex<HashSet<u16>>,
@@ -476,6 +479,31 @@ struct Reconnect {
     instance_unanswered: bool,
 }
 
+impl Reconnect {
+    /// Whether the next hello carries the instance, to a host that `announced` it (`F_INSTANCE`).
+    fn names(&self, announced: bool) -> bool {
+        announced && !self.instance_unanswered
+    }
+
+    /// Counts a failed attempt (`e`) on a host that `announced` the instance; whether to try again.
+    fn failed(&mut self, e: &Error, announced: bool) -> bool {
+        let named = self.names(announced);
+        let text = e.to_string();
+        self.attempt += 1;
+        self.last_error = Some(short_error(&text));
+        self.instance_unanswered |= text == core::HELLO_UNANSWERED;
+        // A hello left without the instance after one went unanswered was turned away. Only a
+        // host that knows instances does that, and it takes them in the hello: the link, not the
+        // host, failed before the answer (a reset reads as a close), and the session live there
+        // may be this viewer's own. The next attempt names it; turned away then, it stops.
+        let name_again = announced && !named && text.starts_with(core::REFUSED);
+        if name_again {
+            self.instance_unanswered = false;
+        }
+        (name_again || core::retryable(e)) && self.since.elapsed() < core::RECONNECT_FOR
+    }
+}
+
 /// UI-thread state. Lives in `UI`; handlers borrow it briefly and never across calls that
 /// run a modal loop (menus, dialogs, message boxes).
 struct Ui {
@@ -582,6 +610,7 @@ fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<
         mods: AtomicU8::new(0),
         swallowed: Mutex::new(HashSet::new()),
         routes: Mutex::new(HashMap::new()),
+        left_ctrl_unsure: AtomicBool::new(false),
         shared: Mutex::new(HashSet::new()),
         fullscreen: Mutex::new(None),
         local_keys: AtomicBool::new(false),
@@ -1199,6 +1228,7 @@ impl Ui {
 
     /// The hello of an automatic reconnect.
     fn hello_options(&self) -> ViewerOptions {
+        let announced = self.flags & F_INSTANCE != 0;
         ViewerOptions {
             fullscreen: false,
             clipboard: self.prefs.clipboard,
@@ -1215,7 +1245,7 @@ impl Ui {
             // Only a host that announced it takes the instance in the hello: an older one rejects
             // that hello after replacing its viewer. Without it, an older host takes the hello as
             // any other, and a newer one lets it in only while nobody is connected.
-            instance_in_hello: self.flags & F_INSTANCE != 0 && !self.reconnect.as_ref().is_some_and(|rc| rc.instance_unanswered),
+            instance_in_hello: self.reconnect.as_ref().map_or(announced, |rc| rc.names(announced)),
         }
     }
 
@@ -1352,10 +1382,7 @@ impl Ui {
             }
             Err(e) => {
                 log!("reconnect failed: {e}");
-                rc.attempt += 1;
-                rc.last_error = Some(short_error(&e.to_string()));
-                rc.instance_unanswered |= e.to_string() == core::HELLO_UNANSWERED;
-                if !core::retryable(&e) || rc.since.elapsed() >= core::RECONNECT_FOR {
+                if !rc.failed(&e, self.flags & F_INSTANCE != 0) {
                     return After::Quit(Some(trf(Txt::GaveUp, &[&self.host, &e])));
                 }
                 let delay = core::reconnect_delay(rc.attempt);
@@ -1999,15 +2026,20 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
 
 /// Frames are repainted at most this often (a host sends at most 120 a second).
 const FRAME_GAP: Duration = Duration::from_millis(8);
-/// Smooth (HALFTONE) scaling takes 5-10 ns per source pixel painted, or per window pixel when
-/// enlarging: 40-90 ms for a whole 4K frame, 300-500 ms for 8192x8192 shown on 4K. One paint
-/// smooths at most this many, a whole 4K frame shrunk into a window or a whole 1440p one
-/// enlarged to 4K included, so that such an update shows one frame. A larger one (`Scaling`)
-/// is scaled by dropping pixels while the picture moves (COLORONCOLOR: 10-20 ms for 8192x8192
-/// on 4K) and smoothed once it stands still, in bands of this many with input and the keyboard
-/// hook getting their turn in between: whatever its screen size, a host never makes one paint
-/// take longer than a 4K screen does.
-const PAINT_PIXELS: i64 = 8 << 20;
+/// Smooth (HALFTONE) scaling takes 5-10 ns per source pixel painted, or 13-20 ns per window
+/// pixel when enlarging. Measured into an offscreen DC on a 6-core desktop CPU: 45-85 ms for a
+/// whole 4K frame shrunk into a window, 120-140 ms for 1440p enlarged to 4K, 130-175 ms for 5K
+/// shown on 4K or 5K, 260-300 ms for 8192x8192 shown on 4K. One paint smooths at most this many
+/// (window pixels, times the source pixels behind each when shrinking): a whole frame of the
+/// common 4K-class and 5K screens (3840x2400, 4096x2160, 5120x2160, 5120x2880) in a window, or
+/// of any screen enlarged to fill a 4K or 5K one, so that such an update shows one frame. A
+/// larger one (`Scaling`) is scaled by dropping pixels while the picture moves (COLORONCOLOR:
+/// 10-30 ms for 8192x8192 on 4K) and smoothed once it stands still, in bands of this many with
+/// input and the keyboard hook getting their turn in between: whatever its screen size, a host
+/// never makes one paint take longer than a 5K screen does (under 0.2 s on that CPU, little
+/// more than 1440p enlarged to 4K; a hook Windows drops for waiting too long is put back:
+/// `KeyHook`).
+const PAINT_PIXELS: i64 = 15 << 20;
 /// What was painted unsmoothed while it moved (`Scaling::Rough`) is smoothed once no such
 /// update came for this long (ms).
 const REFINE_MS: u32 = 150;
@@ -2394,7 +2426,8 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool, hooked: bool)
     }
     // Not a key of the keyboard (AltGr's Left Ctrl): the host's own layout decides what AltGr
     // does, and as Ctrl here it would turn AltGr+Enter and AltGr+End into the hotkeys.
-    let scan = if vk == VK_LCONTROL { left_ctrl_scan(&lock(&app.routes), scan) } else { scan };
+    let unsure = app.left_ctrl_unsure.load(Ordering::SeqCst);
+    let scan = if vk == VK_LCONTROL { left_ctrl_scan(&lock(&app.routes), scan, hooked, unsure) } else { scan };
     let simulated = is_simulated(vk, scan);
     let bit = if simulated { 0 } else { mod_bit(vk) };
     if bit != 0 {
@@ -2437,6 +2470,9 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool, hooked: bool)
     let (local, moved) = {
         let mut routes = lock(&app.routes);
         let first = !up && !routes.contains_key(&vk);
+        if first && vk == VK_LCONTROL {
+            app.left_ctrl_unsure.store(!hooked, Ordering::SeqCst);
+        }
         let local = stays_local(app.is_fullscreen(), mods, vk, up, to_host, &mut routes);
         // A chord that stays local needs the modifiers pressed before it, which went to the
         // host (the Alt of Alt+Tab, the Ctrl of Ctrl+Win+Right): they are pressed here too.
@@ -2577,19 +2613,22 @@ fn altgr_ctrl_queued(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, time: u32) ->
     queued && altgr_ctrl(msg, wp, lp, time, &next)
 }
 
-/// The scancode a Left Ctrl event is handled under, `ALTGR_CTRL` for AltGr's. A window
-/// message cannot always tell the two apart (`altgr_ctrl`: the Right Alt may not be queued
-/// yet), so a press or release whose own key is not held goes where the other one's went: a
-/// press, its auto-repeats (Windows repeats AltGr's Left Ctrl with its Right Alt, each told
-/// apart or not) and its release share one route. A press taken for a real Left Ctrl went to
-/// the host and set Ctrl here, and is repeated and released as one. (So a real Left Ctrl
-/// pressed while AltGr is held counts as AltGr's, and AltGr's while a real one is held as
-/// that one: rare chords, and nothing is left held either way.)
-fn left_ctrl_scan(routes: &HashMap<u16, bool>, scan: u16) -> u16 {
+/// The scancode a Left Ctrl event (`hooked`: seen by the hook) is handled under, `ALTGR_CTRL`
+/// for AltGr's. The hook always tells the two apart; a window message cannot always
+/// (`altgr_ctrl`: the Right Alt may not be queued yet), and then takes AltGr's for a real one.
+/// Where a window message may have mixed them up, an event whose own key is not held goes
+/// where the other one's went, so that a press, its auto-repeats (Windows repeats AltGr's Left
+/// Ctrl with its Right Alt, each told apart or not) and its release share one route: AltGr's
+/// joins a Left Ctrl pressed through a window message (`unsure`), which went to the host and
+/// set Ctrl here, and is repeated and released as one; a Left Ctrl from a window message joins
+/// AltGr's. Otherwise each keeps its own route, so a real Left Ctrl held through AltGr stays
+/// down on the host. (A real Left Ctrl pressed through a window message and AltGr's then count
+/// as one key: rare, and nothing is left held either way.)
+fn left_ctrl_scan(routes: &HashMap<u16, bool>, scan: u16, hooked: bool, unsure: bool) -> u16 {
     let held = |key: u16| routes.contains_key(&key);
     if is_simulated(VK_LCONTROL, scan) {
-        if !held(scan) && held(VK_LCONTROL) { modifier_scan(VK_LCONTROL).0 } else { scan }
-    } else if !held(VK_LCONTROL) && held(ALTGR_CTRL) {
+        if unsure && !held(scan) && held(VK_LCONTROL) { modifier_scan(VK_LCONTROL).0 } else { scan }
+    } else if !hooked && !held(VK_LCONTROL) && held(ALTGR_CTRL) {
         ALTGR_CTRL
     } else {
         scan
@@ -3025,6 +3064,42 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_fallback_names_its_own_session() {
+        let series = |since| Reconnect {
+            since,
+            attempt: 0,
+            due: None,
+            in_flight: None,
+            cause: String::new(),
+            last_error: None,
+            instance_unanswered: false,
+        };
+        let refused = || Error::msg(format!("{}another viewer is using this host", core::REFUSED));
+        let unanswered = Error::msg(core::HELLO_UNANSWERED);
+        let mut rc = series(Instant::now());
+        assert!(rc.names(true));
+        // The link breaks between the hello and the answer: the next hello leaves the instance
+        // out, and the host, which still holds this viewer's session, turns that one away.
+        assert!(rc.failed(&unanswered, true) && !rc.names(true));
+        assert!(rc.failed(&refused(), true), "gave up on its own session");
+        assert!(rc.names(true) && rc.attempt == 2);
+        // Turned away with the instance, too: another viewer's session. Stop.
+        assert!(!rc.failed(&refused(), true));
+        // A host that never announced instances, or a refusal of a hello that named the
+        // session: final at once.
+        assert!(!series(Instant::now()).failed(&refused(), false));
+        let mut rc = series(Instant::now());
+        rc.instance_unanswered = true;
+        assert!(!rc.failed(&refused(), false));
+        // And never beyond RECONNECT_FOR.
+        if let Some(long_ago) = Instant::now().checked_sub(core::RECONNECT_FOR) {
+            let mut rc = series(long_ago);
+            rc.instance_unanswered = true;
+            assert!(!rc.failed(&refused(), true));
+        }
+    }
+
+    #[test]
     fn files_arrive_only_when_asked() {
         let mut p = Pull::default();
         // Nothing requested: refused even in the session's first millisecond, and no toast
@@ -3256,7 +3331,7 @@ mod tests {
         while let Some((_, rest)) = paint_band(&update, &image, k8, p1080) {
             (update, bands) = (rest, bands + 1);
         }
-        assert_eq!(bands, 3, "four paints");
+        assert_eq!(bands + 1, 1080usize.div_ceil(rows as usize), "one paint per band");
         // A band is at least one row; nothing outside the image.
         let narrow = rect(0, 0, 4, 4);
         let (band, _) = paint_band(&narrow, &narrow, 8192 * 8192, 16).unwrap();
@@ -3299,6 +3374,22 @@ mod tests {
         assert_eq!((a.left, a.top, a.right, a.bottom), (-2, 38, 1922, 1122));
         let a = window_area(&image, &Rect { x: 1, y: 1, w: 2, h: 2 }, 3840, 2160);
         assert_eq!((a.left, a.top, a.right, a.bottom), (-2, 38, 4, 44));
+    }
+
+    #[test]
+    fn common_4k_and_5k_screens_move_smoothed() {
+        // Whole frames of them, shrunk into a window or enlarged to fill a 4K or 5K one.
+        let screens = [(3840, 2160), (3840, 2400), (4096, 2160), (5120, 2160), (5120, 2880), (2560, 1600), (1920, 1200), (2560, 1440)];
+        let windows = [(1920, 1097), (2560, 1377), (2880, 1800), (3840, 2120), (3840, 2160), (3840, 2400), (5120, 2880)];
+        for (fw, fh) in screens {
+            for (cw, ch) in windows {
+                let image = dest_rect(cw, ch, fw, fh);
+                let dst = (image.right - image.left) as i64 * (image.bottom - image.top) as i64;
+                let all = RECT { left: 0, top: 0, right: cw, bottom: ch };
+                let how = scaling(&all, Some(&all), &image, fw as i64 * fh as i64, dst);
+                assert!(matches!(how, Scaling::Smooth), "{fw}x{fh} in {cw}x{ch}");
+            }
+        }
     }
 
     #[test]
@@ -3595,82 +3686,127 @@ mod tests {
         // AltGr pressed while the hook was gone and released through a fresh one: its Left
         // Ctrl is the same key both times, and nothing is left held.
         assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL, true, false), ALTGR_CTRL);
         assert!(!stays_local(false, MOD_ALT, ALTGR_CTRL, true, true, &mut r));
         assert!(r.is_empty());
-        // Its press taken for a real Left Ctrl (the Right Alt was not queued yet) went to the
-        // host and set Ctrl: the release, told apart, still lets go of it there and here.
+        // Its press taken for a real Left Ctrl by a window message (the Right Alt was not
+        // queued yet) went to the host and set Ctrl: the release, told apart, still lets go of
+        // it there and here.
         assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
-        let scan = left_ctrl_scan(&r, ALTGR_CTRL);
-        assert!(!is_simulated(VK_LCONTROL, scan));
-        assert_eq!((scan, mod_bit(VK_LCONTROL)), (0x1d, MOD_CTRL));
+        for hooked in [true, false] {
+            let scan = left_ctrl_scan(&r, ALTGR_CTRL, hooked, true);
+            assert!(!is_simulated(VK_LCONTROL, scan));
+            assert_eq!((scan, mod_bit(VK_LCONTROL)), (0x1d, MOD_CTRL));
+        }
+        // A Left Ctrl pressed through the hook is a real one: AltGr's keeps its own route.
+        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL, true, false), ALTGR_CTRL);
         assert!(!stays_local(false, 0, VK_LCONTROL, true, true, &mut r));
         assert!(r.is_empty());
-        // And the other way round: its release taken for a real one ends its own route.
+        // And the other way round: its release taken for a real one by a window message ends
+        // its own route. Through the hook that is a real Left Ctrl, which keeps its own.
         assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_scan(&r, 0x1d), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, 0x1d, false, false), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, 0x1d, true, false), 0x1d);
         assert!(!stays_local(false, 0, ALTGR_CTRL, true, true, &mut r));
         assert!(r.is_empty());
         // Both held, or neither: each event is what it says.
         assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
         assert!(!stays_local(false, MOD_CTRL, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL), ALTGR_CTRL);
-        assert_eq!(left_ctrl_scan(&r, 0x1d), 0x1d);
-        assert_eq!(left_ctrl_scan(&HashMap::new(), ALTGR_CTRL), ALTGR_CTRL);
-        assert_eq!(left_ctrl_scan(&HashMap::new(), 0x1d), 0x1d);
+        for (hooked, unsure) in [(true, false), (false, true)] {
+            assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL, hooked, unsure), ALTGR_CTRL);
+            assert_eq!(left_ctrl_scan(&r, 0x1d, hooked, unsure), 0x1d);
+            assert_eq!(left_ctrl_scan(&HashMap::new(), ALTGR_CTRL, hooked, unsure), ALTGR_CTRL);
+            assert_eq!(left_ctrl_scan(&HashMap::new(), 0x1d, hooked, unsure), 0x1d);
+        }
     }
 
-    /// `on_key` for a Left Ctrl event (`scan` as the hook or `altgr_ctrl` names it) with a
-    /// session that takes input: whether it goes to the host; `routes` and `mods` follow.
-    fn left_ctrl_event(routes: &mut HashMap<u16, bool>, mods: &mut u8, scan: u16, up: bool) -> bool {
-        let scan = left_ctrl_scan(routes, scan);
+    /// What `on_key` keeps about the Left Ctrl keys: `routes`, `mods`, `left_ctrl_unsure`.
+    #[derive(Default)]
+    struct LeftCtrl {
+        routes: HashMap<u16, bool>,
+        mods: u8,
+        unsure: bool,
+    }
+
+    impl LeftCtrl {
+        fn idle(&self) -> bool {
+            self.routes.is_empty() && self.mods == 0
+        }
+    }
+
+    /// `on_key` for a Left Ctrl event (`scan` as the hook or `altgr_ctrl` names it, `hooked`:
+    /// seen by the hook) with a session that takes input: whether it goes to the host.
+    fn left_ctrl_event(k: &mut LeftCtrl, scan: u16, up: bool, hooked: bool) -> bool {
+        let scan = left_ctrl_scan(&k.routes, scan, hooked, k.unsure);
         if is_simulated(VK_LCONTROL, scan) {
-            stays_local(false, *mods, scan, up, true, routes);
+            stays_local(false, k.mods, scan, up, true, &mut k.routes);
             return false;
         }
         if up {
-            *mods &= !mod_bit(VK_LCONTROL);
+            k.mods &= !mod_bit(VK_LCONTROL);
         } else {
-            *mods |= mod_bit(VK_LCONTROL);
+            k.mods |= mod_bit(VK_LCONTROL);
         }
-        !stays_local(false, *mods, VK_LCONTROL, up, true, routes)
+        if !up && !k.routes.contains_key(&VK_LCONTROL) {
+            k.unsure = !hooked;
+        }
+        !stays_local(false, k.mods, VK_LCONTROL, up, true, &mut k.routes)
     }
 
     #[test]
     fn a_left_ctrl_is_repeated_where_its_press_went() {
-        let (mut r, mut mods) = (HashMap::new(), 0);
+        const HOOK: bool = true;
+        const WINDOW: bool = false;
+        let mut k = LeftCtrl::default();
         // AltGr held while Windows had dropped the hook: its press reached the window before
         // its Right Alt and was taken for a real Left Ctrl, which went to the host. A fresh
         // hook tells the auto-repeats and the release apart: they are still that Left Ctrl's,
         // so the host lets go of it, and Ctrl is not left set here.
-        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false));
+        assert!(left_ctrl_event(&mut k, 0x1d, false, WINDOW));
         for _ in 0..4 {
-            assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+            assert!(left_ctrl_event(&mut k, ALTGR_CTRL, false, HOOK));
         }
-        assert_eq!(mods, MOD_CTRL);
-        assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
-        assert!(r.is_empty() && mods == 0);
+        assert_eq!(k.mods, MOD_CTRL);
+        assert!(left_ctrl_event(&mut k, ALTGR_CTRL, true, HOOK));
+        assert!(k.idle());
         // The other way round: told apart when pressed, one auto-repeat through the window not
         // told apart, released told apart. Nothing goes to the host, nothing is left held.
-        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
-        assert!(!left_ctrl_event(&mut r, &mut mods, 0x1d, false));
-        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
-        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
-        assert!(r.is_empty() && mods == 0);
+        assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, false, HOOK));
+        assert!(!left_ctrl_event(&mut k, 0x1d, false, WINDOW));
+        assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, false, HOOK));
+        assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, true, HOOK));
+        assert!(k.idle());
         // A real Left Ctrl alone, and AltGr alone, are untouched.
-        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false) && left_ctrl_event(&mut r, &mut mods, 0x1d, false));
-        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, true));
-        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false) && !left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
-        assert!(r.is_empty() && mods == 0);
-        // A real Left Ctrl held, then AltGr: AltGr's goes with the real one. Let go in either
-        // order, nothing stays held on the host.
+        for path in [HOOK, WINDOW] {
+            assert!(left_ctrl_event(&mut k, 0x1d, false, path) && left_ctrl_event(&mut k, 0x1d, false, path));
+            assert!(left_ctrl_event(&mut k, 0x1d, true, path));
+            assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, false, path) && !left_ctrl_event(&mut k, ALTGR_CTRL, true, path));
+            assert!(k.idle());
+        }
+        // A real Left Ctrl held through a tap of AltGr (Ctrl+AltGr, then Ctrl+W): the hook
+        // tells the two apart, so the host keeps Left Ctrl down until the real one goes up.
         for real_first in [true, false] {
-            assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false));
-            assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+            assert!(left_ctrl_event(&mut k, 0x1d, false, HOOK));
+            assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, false, HOOK));
+            if !real_first {
+                assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, true, HOOK));
+                assert_eq!((k.routes.get(&VK_LCONTROL), k.mods), (Some(&false), MOD_CTRL), "let go of on the host");
+            }
+            assert!(left_ctrl_event(&mut k, 0x1d, true, HOOK));
+            if real_first {
+                assert!(!left_ctrl_event(&mut k, ALTGR_CTRL, true, HOOK));
+            }
+            assert!(k.idle());
+        }
+        // Pressed through a window message, the real one cannot be told from AltGr's, which
+        // goes with it. Let go in either order, nothing stays held on the host.
+        for real_first in [true, false] {
+            assert!(left_ctrl_event(&mut k, 0x1d, false, WINDOW));
+            assert!(left_ctrl_event(&mut k, ALTGR_CTRL, false, HOOK));
             let order = if real_first { [0x1d, ALTGR_CTRL] } else { [ALTGR_CTRL, 0x1d] };
-            assert!(left_ctrl_event(&mut r, &mut mods, order[0], true));
-            assert!(!left_ctrl_event(&mut r, &mut mods, order[1], true));
-            assert!(r.is_empty() && mods == 0);
+            assert!(left_ctrl_event(&mut k, order[0], true, HOOK));
+            assert!(!left_ctrl_event(&mut k, order[1], true, HOOK));
+            assert!(k.idle());
         }
     }
 

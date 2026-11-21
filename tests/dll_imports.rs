@@ -217,6 +217,36 @@ fn imports_at_start_up_are_known_dlls() {
     );
 }
 
+/// `DELAY_LOADED`, read from build.rs, lowercase.
+fn delay_loaded() -> Vec<String> {
+    let src = include_str!("../build.rs");
+    let decl = &src[src.find("const DELAY_LOADED").expect("no DELAY_LOADED in build.rs")..];
+    let value = &decl[decl.find('=').expect("DELAY_LOADED has no value")..];
+    let list = &value[..value.find(';').expect("DELAY_LOADED does not end")];
+    let names: Vec<String> = list.split('"').skip(1).step_by(2).map(str::to_ascii_lowercase).collect();
+    assert!(names.iter().all(|n| n.ends_with(".dll")) && names.len() > 2, "DELAY_LOADED misread: {names:?}");
+    names
+}
+
+#[test]
+fn every_dll_build_rs_names_is_delay_loaded() {
+    // link.exe ignores a /DELAYLOAD that matches no import (LNK4199, which build.rs keeps quiet)
+    // and so a misspelt entry, or functions that come from a DLL of another name, would be
+    // imported at start-up after all. The test above catches most such DLLs, but not one that
+    // is a KnownDLL on some Windows versions only, as crypt32.dll is.
+    let img = Image::read(EXE);
+    let at_start: Vec<String> = img.imports().iter().map(|d| d.to_ascii_lowercase()).collect();
+    let delayed: Vec<String> = img.delay_imports().iter().map(|(d, _)| d.to_ascii_lowercase()).collect();
+    let names = delay_loaded();
+    assert!(names.iter().any(|n| n == "crypt32.dll"), "crypt32.dll is no longer in DELAY_LOADED: {names:?}");
+    for dll in &names {
+        assert!(
+            delayed.contains(dll) && !at_start.contains(dll),
+            "{dll} (DELAY_LOADED in build.rs) is not delay-loaded by safe-rdp.exe: start-up {at_start:?}, delay-loaded {delayed:?}"
+        );
+    }
+}
+
 #[test]
 fn delay_loaded_functions_resolve_from_system32() {
     let img = Image::read(EXE);

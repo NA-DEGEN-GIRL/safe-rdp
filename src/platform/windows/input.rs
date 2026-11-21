@@ -947,10 +947,14 @@ mod tests {
         let mut inj = Injector::default();
         let mut desktop = DesktopFollower::new();
         assert!(!retry_once(&mut desktop, false));
+        let before = Instant::now();
         inj.retry_owed();
         assert_eq!(inj.owed, [held(LCTRL), Held::Button(0)]);
-        // The prompt is answered: they go out at the session's next try, not before.
+        assert!(inj.retry_at >= before + RETRY_EVERY);
+        // The prompt is answered: they go out at the session's next try, not before (however
+        // long this thread waited for its turn in between).
         world(|w| (w.off_desktop, w.unreachable) = (false, false));
+        inj.retry_at = Instant::now() + Duration::from_secs(3600);
         inj.retry_owed();
         assert!(world(|w| w.taken.is_empty()), "tried again within RETRY_EVERY");
         inj.retry_at = Instant::now();

@@ -245,7 +245,10 @@ struct Text {
     /// Instead of `svc_key_offer` while it cannot be told which key the service has.
     svc_key_reinstall_offer: &'static str,
     svc_key_remove_offer: &'static str,
+    /// The Key-tab note while the Share tab offers Update key for the service (`svc_note`).
     svc_key_note: &'static str,
+    /// Instead of `svc_key_note` while it offers Reinstall.
+    svc_reinstall_note: &'static str,
     sharing_restarts: &'static str,
     sharing_stopped: &'static str,
     created: &'static str,
@@ -411,6 +414,7 @@ static EN: Text = Text {
     svc_key_remove_offer: "The background service keeps the key it was given, so it may still accept the removed key.\n\n\
                            Remove the background service now? Windows will ask for administrator permission.",
     svc_key_note: " The background service keeps the key it had until you update its key or remove it (Share this PC).",
+    svc_reinstall_note: " The background service keeps the key it had until you reinstall it or remove it (Share this PC).",
     sharing_restarts: " Sharing restarts with the new key; anyone connected was disconnected.",
     sharing_stopped: " Sharing from this window stopped; anyone connected was disconnected.",
     created: "New key created. Copy it to your other PC.",
@@ -571,6 +575,7 @@ static KO: Text = Text {
     svc_key_remove_offer: "백그라운드 서비스는 받은 키를 계속 사용하므로 삭제한 키로도 아직 접속될 수 있습니다.\n\n지금 \
                            백그라운드 서비스를 제거할까요? Windows가 관리자 권한을 요청합니다.",
     svc_key_note: " 백그라운드 서비스는 키를 업데이트하거나 제거하기 전까지 기존 키를 계속 사용합니다 ('이 PC 공유').",
+    svc_reinstall_note: " 백그라운드 서비스는 다시 설치하거나 제거하기 전까지 기존 키를 계속 사용합니다 ('이 PC 공유').",
     sharing_restarts: " 공유를 새 키로 다시 시작합니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
     sharing_stopped: " 이 창의 공유를 중지했습니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
     created: "새 키를 만들었습니다. 다른 PC로 복사하세요.",
@@ -858,6 +863,18 @@ fn svc_key_update(present: bool, key: SvcKey) -> SvcOp {
 /// is `key`), may still accept another key than the stored one.
 fn svc_lacks_key(svc: Svc, key: SvcKey) -> bool {
     svc != Svc::NotInstalled && key != SvcKey::Mine
+}
+
+/// The Key-tab note that the service keeps a key other than the stored one (`stored`: a key is
+/// stored), worded after the button the Share tab shows for it (`key_update_due`): Update key
+/// for a service known to have another key, Reinstall otherwise.
+fn svc_note(t: &Text, stored: bool, key: SvcKey) -> &'static str {
+    if stored && key == SvcKey::Other { t.svc_key_note } else { t.svc_reinstall_note }
+}
+
+/// Key-tab message `text` without the note (`svc_note`) it ends with; `None` if it has none.
+fn without_svc_note<'a>(t: &Text, text: &'a str) -> Option<&'a str> {
+    [t.svc_key_note, t.svc_reinstall_note].into_iter().find_map(|n| text.strip_suffix(n.trim())).map(str::trim_end)
 }
 
 /// After the stored key changed from the one with fingerprint `old` to `new` (None: removed):
@@ -1521,6 +1538,8 @@ struct State {
     /// stored key, both as of the last check of the service (`ServiceInfo`).
     svc_key: Option<String>,
     key_fp: Option<String>,
+    /// The tone of the Key-tab message without the note it ends with (`set_svc_note`).
+    key_tone: Tone,
 }
 
 struct Controls {
@@ -2132,6 +2151,7 @@ fn run_window() -> crate::util::Result<()> {
             svc_busy: false,
             svc_key: None,
             key_fp: None,
+            key_tone: Tone::Muted,
         }),
         notifier: Notifier { tx, hwnd: hwnd as usize },
         rx,
@@ -3584,6 +3604,14 @@ impl App {
             st.svc_key = info.key;
             st.key_fp = info.mine;
         }
+        let has_key = {
+            let st = self.st.borrow();
+            !svc_lacks_key(st.svc, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
+        };
+        // However it got there (Update key, Reinstall, a terminal): the note is out of date.
+        if has_key {
+            self.set_svc_note(None);
+        }
         self.update_service_ui();
         self.update_share_ui();
     }
@@ -3714,18 +3742,15 @@ impl App {
         // As the command left it, not as it was before: a failed command may still have given
         // the service the key (and then not started it), or removed it.
         self.on_service_status(service_info());
-        let lacks_key = {
+        let note = {
             let st = self.st.borrow();
-            svc_lacks_key(st.svc, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
+            let key = svc_key(st.svc_key.as_deref(), st.key_fp.as_deref());
+            svc_lacks_key(st.svc, key).then(|| svc_note(t, st.key == KeyState::Present, key))
         };
         // Giving the service the key, or removing it, did not happen: say so where the key
-        // was changed, too.
-        if !done && lacks_key {
-            let mut text = get_text(self.c.k_msg);
-            if !text.contains(t.svc_key_note.trim()) {
-                text.push_str(t.svc_key_note);
-            }
-            self.key_message(text.trim_start(), Tone::Warn);
+        // was changed, too. (Once it has the key, `on_service_status` took that note away.)
+        if !done && note.is_some() {
+            self.set_svc_note(note);
         }
         let not_remove = op != SvcOp::Remove;
         match result {
@@ -3794,6 +3819,28 @@ impl App {
         self.layout();
     }
 
+    /// Ends the Key-tab message with `note` (`svc_note`), in place of the one it may end with,
+    /// or takes that one away (`None`), giving what is left its own tone back.
+    fn set_svc_note(&self, note: Option<&'static str>) {
+        let text = get_text(self.c.k_msg);
+        let rest = without_svc_note(self.t, &text);
+        match (note, rest) {
+            (Some(n), _) => {
+                if rest.is_none() {
+                    let tone = self.tones.borrow().get(&(self.c.k_msg as usize)).copied();
+                    self.st.borrow_mut().key_tone = tone.unwrap_or(Tone::Muted);
+                }
+                let text = format!("{}{n}", rest.unwrap_or(&text));
+                self.key_message(text.trim_start(), Tone::Warn);
+            }
+            (None, Some(rest)) => {
+                let tone = if rest.is_empty() { Tone::Muted } else { self.st.borrow().key_tone };
+                self.key_message(rest, tone);
+            }
+            (None, None) => {}
+        }
+    }
+
     /// Asks before the stored key is replaced or removed; `svc`: the service is installed.
     fn confirm_key_change(&self, text: &str, svc: bool) -> bool {
         confirm(self.hwnd, &format!("{text}{}", if svc { self.t.key_svc_confirm } else { "" }))
@@ -3809,7 +3856,7 @@ impl App {
             let st = self.st.borrow();
             (st.key == KeyState::Present, st.key_fp.clone())
         };
-        let (mut text, mut tone) = (done.to_string(), tone);
+        let mut text = done.to_string();
         if self.key_replaced(present) {
             text.push_str(if present { t.sharing_restarts } else { t.sharing_stopped });
         }
@@ -3819,11 +3866,15 @@ impl App {
             // While a service command runs nothing new can be read, nor offered.
             st.svc_busy || svc_needs_update(st.svc_key.as_deref(), old.as_deref(), st.key_fp.as_deref())
         };
-        if svc && needed && !self.offer_service_update(present) {
-            text.push_str(t.svc_key_note);
-            tone = Tone::Warn;
-        }
+        let declined = svc && needed && !self.offer_service_update(present);
         self.key_message(&text, tone);
+        if declined {
+            let note = {
+                let st = self.st.borrow();
+                svc_note(t, present, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
+            };
+            self.set_svc_note(Some(note));
+        }
     }
 
     /// Offers to give the service the stored key (`present`) or to remove it. True if that is
@@ -4338,6 +4389,23 @@ mod tests {
     }
 
     #[test]
+    fn the_key_note_names_the_button_and_goes_once_the_service_has_the_key() {
+        for t in [&EN, &KO] {
+            // Update key only for a service known to have another key than the stored one.
+            assert_eq!(svc_note(t, true, SvcKey::Other), t.svc_key_note);
+            assert_eq!(svc_note(t, true, SvcKey::Unknown), t.svc_reinstall_note);
+            assert_eq!(svc_note(t, false, SvcKey::Other), t.svc_reinstall_note, "no key stored: Reinstall");
+            // Either note comes off the end of the message, and nothing else does.
+            for note in [t.svc_key_note, t.svc_reinstall_note] {
+                assert_eq!(without_svc_note(t, &format!("{}{note}", t.created)), Some(t.created));
+                assert_eq!(without_svc_note(t, note.trim_start()), Some(""));
+            }
+            assert_eq!(without_svc_note(t, t.created), None);
+            assert_eq!(without_svc_note(t, ""), None);
+        }
+    }
+
+    #[test]
     fn overrides() {
         assert_eq!(sharing_overrides(None, None), Ok((None, None)));
         assert_eq!(sharing_overrides(Some(" "), Some("")), Ok((None, None)));
@@ -4430,7 +4498,7 @@ mod tests {
                 assert!(!s.is_empty());
             }
             // Added to other text.
-            for s in [t.svc_key_status, t.svc_key_unknown, t.svc_key_note, t.sharing_restarts, t.sharing_stopped] {
+            for s in [t.svc_key_status, t.svc_key_unknown, t.svc_key_note, t.svc_reinstall_note, t.sharing_restarts, t.sharing_stopped] {
                 assert!(s.starts_with(' ') && s.len() > 1, "{s}");
             }
             assert!(t.key_svc_confirm.starts_with("\n\n") && t.svc_key_remove_offer.contains("\n\n"));

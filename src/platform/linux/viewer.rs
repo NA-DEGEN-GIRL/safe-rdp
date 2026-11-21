@@ -194,6 +194,9 @@ fn on_server_msg(
                 let wait = fb.resizes.wait(Instant::now());
                 drop(fb);
                 std::thread::sleep(wait);
+                // This thread's own copy of the screen goes first, so that two screens' worth is
+                // held at most: the old framebuffer and the new one, then the new one and a new copy.
+                dec.forget();
                 fresh = Some(LockedBuf::new(hdr.width * hdr.height * 4));
             };
             if (fb.w, fb.h) != size
@@ -1039,10 +1042,14 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
         // Played on the network thread; the player stops when the connection ends.
         let sound = opts.audio.then(Sound::default);
         s.spawn(move || {
-            let r = net_loop(&mut reader, shared, queue, clip.as_ref(), sound);
+            // A panic (a framebuffer that cannot be allocated, say) ends the session with a
+            // reason, rather than leaving the window on the last frame.
+            let net = std::panic::AssertUnwindSafe(|| net_loop(&mut reader, shared, queue, clip.as_ref(), sound));
+            let r = std::panic::catch_unwind(net);
             shared.close(match r {
-                Err(e) if e.to_string() != channel::CLOSED => format!("connection lost: {e}"),
-                _ => "the host closed the connection".into(),
+                Err(_) => "the viewer failed while handling the host's data (out of memory?)".into(),
+                Ok(Err(e)) if e.to_string() != channel::CLOSED => format!("connection lost: {e}"),
+                Ok(_) => "the host closed the connection".into(),
             });
         });
 
