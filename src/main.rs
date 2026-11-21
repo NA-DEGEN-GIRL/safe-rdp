@@ -535,6 +535,14 @@ fn service_key_warning(
         Some(n) => format!("to give it this key, run `safe-rdp service rekey --expect-key {n}` from an elevated terminal (or `service uninstall`)"),
         None => "run `safe-rdp service uninstall` from an elevated terminal to remove it".to_string(),
     };
+    // An earlier safe-rdp recorded no fingerprint, and its service still runs that version.
+    let reinstall = match new {
+        Some(n) => format!(
+            "to give it this key and this version, run `safe-rdp service install --expect-key {n}` from an elevated terminal, \
+             with the options it was installed with (or `service uninstall`)"
+        ),
+        None => fix.clone(),
+    };
     match status {
         Ok("not installed") => return None,
         Ok(_) => {}
@@ -552,7 +560,7 @@ fn service_key_warning(
         Ok(Some(r)) => format!("warning: the background service has the key with fingerprint {r}, which may be the removed one;\n{fix}"),
         Ok(None) => format!(
             "warning: cannot tell which key the background service has (it recorded none, as an earlier safe-rdp did not),\n\
-             so it may still accept the {was} key; {fix}"
+             so it may still accept the {was} key; {reinstall}"
         ),
         Err(e) => format!("warning: cannot tell which key the background service has ({e}),\nso it may still accept the {was} key; {fix}"),
     })
@@ -567,7 +575,11 @@ fn service_key_line(recorded: std::result::Result<Option<String>, String>, mine:
         (Ok(Some(r)), Some(m)) if r == m => format!("key: {r}, the key stored for this user"),
         (Ok(Some(r)), Some(m)) => format!("key: {r}, not the key stored for this user ({m});\n{}", fix(m)),
         (Ok(Some(r)), None) => format!("key: {r} (no readable key is stored for this user)"),
-        (Ok(None), Some(m)) => format!("key: not recorded (as by an earlier safe-rdp);\n{}", fix(m)),
+        // Such a service also runs that earlier version.
+        (Ok(None), Some(m)) => format!(
+            "key: not recorded (as by an earlier safe-rdp);\n`safe-rdp service install --expect-key {m}` from an elevated terminal, \
+             with the options it was installed with, gives it yours and this version"
+        ),
         (Ok(None), None) => "key: not recorded (as by an earlier safe-rdp)".to_string(),
         (Err(e), _) => format!("key: cannot tell ({e})"),
     }
@@ -723,6 +735,11 @@ mod tests {
                 assert!(w.starts_with("warning:") && w.contains("cannot tell") && w.contains("may still accept"), "{w}");
             }
         }
+        // None recorded, as by an earlier safe-rdp: reinstalling also replaces that version.
+        let w = warning(Ok(None), Some(OLD), Some(NEW));
+        assert!(w.contains(&format!("service install --expect-key {NEW}")) && !w.contains("rekey"), "{w}");
+        let w = warning(Ok(None), Some(OLD), None);
+        assert!(w.contains("service uninstall") && !w.contains("service install"), "{w}");
         assert!(warning(Err("access denied"), None, Some(NEW)).contains("access denied"));
         let w = service_key_warning(Err("access denied".into()), Ok(None), Some(OLD), Some(NEW)).unwrap();
         assert!(w.contains("access denied") && w.contains(&format!("rekey --expect-key {NEW}")), "{w}");
@@ -737,7 +754,8 @@ mod tests {
         let l = line(Ok(Some(OLD)), Some(NEW));
         assert!(l.contains(&format!("{OLD}, not the key stored")) && l.contains(&format!("rekey --expect-key {NEW}")), "{l}");
         assert!(line(Ok(Some(OLD)), None).contains("no readable key"));
-        assert!(line(Ok(None), Some(NEW)).contains("not recorded") && line(Ok(None), Some(NEW)).contains(NEW));
+        let l = line(Ok(None), Some(NEW));
+        assert!(l.contains("not recorded") && l.contains(&format!("service install --expect-key {NEW}")) && !l.contains("rekey"), "{l}");
         assert!(line(Err("access denied"), Some(NEW)).contains("cannot tell (access denied)"));
     }
 }
