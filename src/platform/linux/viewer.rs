@@ -53,6 +53,15 @@ fn moves_focus(mode: u8) -> bool {
     matches!(mode, NOTIFY_NORMAL | NOTIFY_WHILE_GRABBED)
 }
 
+/// Whether a FocusIn gives this window the keyboard: the focus moved here. Under a window
+/// manager not a focus moved to the root (or PointerRoot) while the pointer is over this
+/// window (detail Pointer), as in GTK: keys come here only until the pointer leaves, which
+/// nothing tells this window, so a full-screen grab taken then would keep what is typed into
+/// the window focused next. Without a window manager that is how keys come at all.
+fn gains_focus(detail: u8, mode: u8, has_wm: bool) -> bool {
+    moves_focus(mode) && !(has_wm && detail == x11::NOTIFY_POINTER)
+}
+
 /// Whether after a FocusOut the keys held now are released elsewhere: the focus moved away, or
 /// another client grabbed the keyboard. A grab's FocusOut with detail Pointer is left out: our
 /// own grab sends one under a pointer-root focus, while the keys still come here.
@@ -367,9 +376,10 @@ struct View {
     want_grab: bool,
     /// The window has the input focus as far as FocusIn/FocusOut tell. A window manager
     /// focuses it after mapping it; without one keys follow the pointer and no FocusIn may
-    /// ever come, so it starts out true. The keyboard is grabbed only while this holds: a grab
-    /// kept after the focus moved would send what is typed into another local window to the
-    /// remote.
+    /// ever come, so it starts out true. Under a window manager a focus that reaches it only
+    /// through the pointer does not count (`gains_focus`). The keyboard is grabbed only while
+    /// this holds: a grab kept after the focus moved would send what is typed into another
+    /// local window to the remote.
     focused: bool,
 }
 
@@ -866,8 +876,8 @@ impl Ui {
                     self.view.focus_lost()?;
                 }
             }
-            Event::Focus { focus_in: true, mode, .. } => {
-                if moves_focus(mode) {
+            Event::Focus { focus_in: true, detail, mode } => {
+                if gains_focus(detail, mode, self.view.has_wm) {
                     if !self.view.focused {
                         // Keys seen while the focus was elsewhere were released there.
                         self.mods.clear();
@@ -875,8 +885,9 @@ impl Ui {
                     }
                     self.view.focus_gained()?;
                 } else {
-                    // A grab or ungrab, which brings no focus: only retry a grab that failed
-                    // while another client held the keyboard.
+                    // A grab or ungrab, or a focus that only follows the pointer, which bring
+                    // no focus: only retry a grab that failed while another client held the
+                    // keyboard.
                     self.view.try_grab()?;
                 }
             }
@@ -1155,6 +1166,21 @@ mod tests {
         // keyboard on the root (detail Pointer, to the window under the pointer) or letting go.
         assert!(moves_focus(NOTIFY_NORMAL) && moves_focus(NOTIFY_WHILE_GRABBED));
         assert!(!moves_focus(GRAB) && !moves_focus(x11::NOTIFY_UNGRAB));
+        // Under a window manager the focus must move to us, not to the root with the pointer
+        // over us (detail Pointer): nothing would tell us once the pointer leaves. Without one
+        // keys follow the pointer.
+        for mode in [NOTIFY_NORMAL, NOTIFY_WHILE_GRABBED] {
+            for has_wm in [false, true] {
+                assert!(gains_focus(ANCESTOR, mode, has_wm) && gains_focus(NONLINEAR, mode, has_wm), "{mode} {has_wm}");
+            }
+            assert!(gains_focus(x11::NOTIFY_POINTER, mode, false), "{mode}");
+            assert!(!gains_focus(x11::NOTIFY_POINTER, mode, true), "{mode}");
+        }
+        for detail in [ANCESTOR, NONLINEAR, x11::NOTIFY_POINTER] {
+            for has_wm in [false, true] {
+                assert!(!gains_focus(detail, GRAB, has_wm) && !gains_focus(detail, x11::NOTIFY_UNGRAB, has_wm), "{detail} {has_wm}");
+            }
+        }
     }
 
     #[test]
@@ -1621,5 +1647,127 @@ mod tests {
         assert!(free, "the viewer kept the keyboard");
         other.ungrab_keyboard().unwrap();
         inj.handle(&ClientMsg::Key { vk: 0xa2, scan: 0x1d, flags: KEY_UP });
+    }
+
+    /// Waits until the pointer is over `win`, a top-level window.
+    fn wait_pointer_over(conn: &mut Conn, win: u32) {
+        let root = conn.root();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // QueryPointer: the top-level window under the pointer.
+            let seq = conn.send(x11::Req::new(38, 0).u32(root)).unwrap();
+            let r = conn.reply(seq).unwrap();
+            if u32::from_le_bytes(r[12..16].try_into().unwrap()) == win {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the pointer is not over window {win:#x}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Under a window manager that focuses the root when nothing else is left to focus, the
+    /// full-screen viewer under the pointer is told (FocusIn, detail Pointer) but nothing when
+    /// the pointer leaves: it must not take the keyboard for that, or what is typed into the
+    /// window focused next would reach the host. The test plays the window manager.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn full_screen_ignores_pointer_focus_under_a_window_manager() {
+        let vd = VirtualDisplay::spawn(Some(93), 400, 300, None).unwrap();
+        let t = vd.target();
+        // Announced the EWMH way, so the viewer knows there is a window manager.
+        let mut wm = Conn::connect(&t).unwrap();
+        let root = wm.root();
+        let check = wm.create_window(root, 0, 0, 1, 1, 1, 0, &[]).unwrap();
+        let supporting = wm.atom("_NET_SUPPORTING_WM_CHECK").unwrap();
+        wm.change_property(root, supporting, x11::ATOM_WINDOW, 32, &check.to_le_bytes()).unwrap();
+        wm.sync().unwrap();
+        let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - pointer focus", 640, 480, true).unwrap();
+        assert!(view.has_wm && view.fullscreen && !view.focused);
+        let rx = Arc::new(OutQueue::default());
+        let mut ui = Ui::new(view, rx.clone(), false, false).unwrap();
+        ui.view.conn.sync().unwrap();
+        let viewer = ui.view.win;
+        // Another local program (a terminal, a password prompt) with a window of its own.
+        let mut other = Conn::connect(&t).unwrap();
+        let win = other.create_window(root, 0, 0, 50, 50, 1, x11::CW_EVENT_MASK, &[x11::KEY_PRESS_MASK]).unwrap();
+        other.map_window(win).unwrap();
+        other.sync().unwrap();
+        let viewer_holds_keyboard = |other: &mut Conn| {
+            let free = other.grab_keyboard(win).unwrap();
+            if free {
+                other.ungrab_keyboard().unwrap();
+                other.sync().unwrap();
+            }
+            !free
+        };
+
+        // The window manager shows the viewer full screen on top and focuses it: it takes the
+        // keyboard.
+        let mask = x11::CONFIG_X | x11::CONFIG_Y | x11::CONFIG_WIDTH | x11::CONFIG_HEIGHT | x11::CONFIG_STACK_MODE;
+        wm.configure_window(viewer, mask, &[0, 0, 400, 300, 0]).unwrap();
+        wm.set_input_focus(viewer).unwrap();
+        wm.sync().unwrap();
+        pump_until(&mut ui, |ui| ui.view.size == (400, 300) && ui.view.focused && !ui.view.want_grab);
+        assert!(viewer_holds_keyboard(&mut other));
+
+        // A dialog takes the focus: the viewer lets the keyboard go.
+        other.set_input_focus(win).unwrap();
+        other.sync().unwrap();
+        pump_until(&mut ui, |ui| !ui.view.focused);
+        ui.view.conn.sync().unwrap();
+        assert!(!viewer_holds_keyboard(&mut other));
+
+        // The dialog is answered while the pointer rests over the viewer, and the window manager,
+        // with nothing else to focus, focuses the root: keys now follow the pointer.
+        let mut inj = Injector::on(t.clone());
+        inj.set_area(Area { left: 0, top: 0, width: 400, height: 300 });
+        inj.handle(&ClientMsg::MouseMove { x: 200, y: 150 });
+        wait_pointer_over(&mut other, viewer);
+        wm.set_input_focus(root).unwrap();
+        wm.sync().unwrap();
+        ui.view.conn.sync().unwrap();
+        let mut seen = Vec::new();
+        while let Some(e) = ui.view.conn.poll_event().unwrap() {
+            seen.push(e);
+        }
+        let told = Event::Focus { focus_in: true, detail: x11::NOTIFY_POINTER, mode: NOTIFY_NORMAL };
+        assert!(seen.contains(&told), "{seen:?}");
+        for e in seen {
+            ui.on_event(e, None).unwrap();
+        }
+        assert!(!ui.view.focused);
+        assert!(!viewer_holds_keyboard(&mut other));
+
+        // The pointer moves on to the other program's window (on another monitor, say), which
+        // is then focused. The viewer is told nothing, and holds no keyboard: typing goes to
+        // that window, and nothing reaches the host.
+        wm.configure_window(win, x11::CONFIG_STACK_MODE, &[0]).unwrap();
+        wm.sync().unwrap();
+        inj.handle(&ClientMsg::MouseMove { x: 25, y: 25 });
+        wait_pointer_over(&mut other, win);
+        other.set_input_focus(win).unwrap();
+        other.sync().unwrap();
+        ui.view.conn.sync().unwrap();
+        ui.pump().unwrap();
+        assert!(!ui.view.focused);
+        assert!(!viewer_holds_keyboard(&mut other));
+        drain_messages(&rx);
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: 0 });
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: KEY_UP });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(other.wait_event(Duration::from_millis(100)).unwrap(), Some(Event::Key { press: true, .. })) {
+            assert!(Instant::now() < deadline, "the other window got no key");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        ui.view.conn.read_pending().unwrap();
+        ui.pump().unwrap();
+        let got = drain_messages(&rx);
+        assert!(!got.iter().any(|m| matches!(m, ClientMsg::Key { .. })), "{got:?}");
+
+        // Focused by the window manager again, the viewer takes the keyboard back.
+        wm.set_input_focus(viewer).unwrap();
+        wm.sync().unwrap();
+        pump_until(&mut ui, |ui| ui.view.focused && !ui.view.want_grab);
+        assert!(viewer_holds_keyboard(&mut other));
     }
 }
