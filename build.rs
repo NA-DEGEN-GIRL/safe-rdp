@@ -2,9 +2,9 @@
 //! DPI awareness, Windows 10/11) and an application icon into the executable.
 //!
 //! No resource compiler is needed: the icon is drawn here and written as a `.res` file, which
-//! link.exe accepts as an input like an object file. Only binaries get these, not test harnesses.
-//! `assets/icon.svg` is the same drawing for documents; keep the two in step. Binaries also
-//! take their imported DLLs from System32 only (see `/DEPENDENTLOADFLAG` below).
+//! link.exe accepts as an input like an object file. Only binaries (and their unit-test harness)
+//! get these, not integration tests. `assets/icon.svg` is the same drawing for documents; keep
+//! the two in step. Binaries also never take a DLL from their own folder (see `/DELAYLOAD` below).
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 const ICON_ID: u16 = 1;
 /// Sizes Windows picks from at 100-250% scaling; from 64 up they are stored as PNG.
 const ICON_SIZES: [u32; 10] = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
+/// The DLLs safe-rdp.exe imports that are not KnownDLLs, loaded on first use (see main()).
+/// crypt32 is a KnownDLL only as an import of other KnownDLLs, which differs between Windows
+/// versions (it is used only for the stored key). A new import that is not a KnownDLL belongs
+/// here: tests/dll_imports.rs says so.
+const DELAY_LOADED: [&str; 9] =
+    ["avrt.dll", "bcrypt.dll", "crypt32.dll", "d3d11.dll", "dxgi.dll", "iphlpapi.dll", "sas.dll", "uxtheme.dll", "wtsapi32.dll"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -27,12 +33,23 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
     // The manifest carries its own trustInfo (asInvoker); do not let the linker add another.
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
-    // Resolve the DLLs this executable imports (dxgi, sas, uxtheme, ...) from System32 only.
-    // By default the loader looks in the executable's own folder first, so a dxgi.dll that
-    // lands beside safe-rdp.exe (a received file, a download, another user's file in a shared
-    // folder) would run as code in it, elevated during `service install`. 0x800 is
-    // LOAD_LIBRARY_SEARCH_SYSTEM32; main() sets the same for DLLs loaded later.
+    // No DLL may come from the executable's own folder. The loader looks there first by
+    // default, so a DLL that lands beside safe-rdp.exe (a received file, a download, another
+    // user's file in a shared folder) would run as code in it, elevated during `service
+    // install`. A DLL imported at start-up is loaded before main() can change that, and its own
+    // imports follow its own load flags, usually none: wtsapi32 brought sspicli.dll, dxgi
+    // brought powrprof.dll and with it umpdc.dll, from beside the executable. So:
+    // - The DLLs in DELAY_LOADED load on first use, after main() has made System32 the only
+    //   place DLLs come from (SetDefaultDllDirectories), and their imports with them.
+    // - Everything still imported at start-up is a KnownDLL: Windows maps those, and what they
+    //   import, from its own copies. /DEPENDENTLOADFLAG 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32)
+    //   also looks for the executable's own imports in System32 only.
+    // tests/dll_imports.rs checks the built executable for both.
     println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    for dll in DELAY_LOADED {
+        println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
+    }
+    println!("cargo:rustc-link-arg-bins=delayimp.lib");
     // .cargo/config.toml links the C runtime statically, so the executable needs no Visual C++
     // redistributable on the other PC. RUSTFLAGS from the environment, or building from outside
     // this directory, replaces that setting without a word: say so.
