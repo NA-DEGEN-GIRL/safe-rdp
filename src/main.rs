@@ -437,7 +437,8 @@ fn keygen(args: &[String]) -> Result<()> {
     if let Some(a) = args.iter().find(|a| *a != "--force") {
         bail!("unknown option '{a}'");
     }
-    if keystore::user_key_path()?.exists() && !force {
+    let replaced = keystore::user_key_path()?.exists();
+    if replaced && !force {
         bail!("a key is already stored; use `safe-rdp key show`, or `keygen --force` to replace it");
     }
     let k = keys::generate()?;
@@ -447,7 +448,44 @@ fn keygen(args: &[String]) -> Result<()> {
     eprintln!("Stored for this user in {}", path.display());
     eprintln!("On the other machine run `safe-rdp key import` and paste the line above.");
     eprintln!("Treat it like a password: anyone with this key and tailnet access can control the host.");
+    warn_old_key_in_use(replaced, false);
     Ok(())
+}
+
+/// After the stored key was replaced or removed: what started with the old key keeps it.
+/// `had_key`: a key was stored before; `removed`: there is none now.
+fn warn_old_key_in_use(had_key: bool, removed: bool) {
+    if had_key {
+        let launcher = match (cfg!(windows), removed) {
+            (false, _) => "",
+            (true, false) => " (sharing from the launcher restarts with the new key by itself)",
+            (true, true) => " (sharing from the launcher stops by itself)",
+        };
+        eprintln!("note: a `safe-rdp host` that is already running keeps the old key until it is restarted{launcher}.");
+    }
+    #[cfg(windows)]
+    if let Some(w) = service_key_warning(platform::service::status().as_deref().map_err(|e| e.to_string()), removed) {
+        eprintln!("{w}");
+    }
+}
+
+/// The service keeps the key it was installed with: what to tell after the stored key changed,
+/// given `service status` (or why it failed). Nothing when the service is not installed.
+#[cfg(windows)]
+fn service_key_warning(status: std::result::Result<&str, String>, removed: bool) -> Option<String> {
+    Some(match status {
+        Ok("not installed") => return None,
+        Ok(_) if removed => "warning: the background service keeps the key it was installed with, so it still accepts the removed key;\n\
+                             run `safe-rdp service uninstall` from an elevated terminal to remove it"
+            .to_string(),
+        Ok(_) => "warning: the background service keeps the key it was installed with, so it still accepts the old key;\n\
+                  run `safe-rdp service install` again from an elevated terminal to give it this key (or `service uninstall`)"
+            .to_string(),
+        Err(e) => format!(
+            "warning: cannot check the background service ({e}); if it is installed, it keeps the key it was installed with\n\
+             until you reinstall or remove it from an elevated terminal"
+        ),
+    })
 }
 
 fn key_cmd(args: &[String]) -> Result<()> {
@@ -459,8 +497,10 @@ fn key_cmd(args: &[String]) -> Result<()> {
             let mut line = platform::read_secret("Paste key (input hidden): ")?;
             let k = keys::parse_key(&line);
             unsafe { util::wipe(line.as_bytes_mut()) };
+            let had_key = keystore::user_key_path()?.exists();
             let path = keystore::save_user_key(&k?)?;
             eprintln!("Key stored in {}", path.display());
+            warn_old_key_in_use(had_key, false);
             Ok(())
         }
         Some("show") => {
@@ -470,6 +510,7 @@ fn key_cmd(args: &[String]) -> Result<()> {
         Some("forget") => {
             if keystore::forget_user_key()? {
                 eprintln!("Stored key deleted.");
+                warn_old_key_in_use(true, true);
             } else {
                 eprintln!("No key was stored.");
             }
@@ -547,4 +588,24 @@ fn bench(args: &[String]) -> Result<()> {
     util::wipe(&mut frame);
     util::wipe(&mut fb);
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_changes_warn_while_the_service_holds_the_old_key() {
+        assert_eq!(service_key_warning(Ok("not installed"), false), None);
+        assert_eq!(service_key_warning(Ok("not installed"), true), None);
+        for status in ["running", "stopped", "starting", "unknown"] {
+            let replaced = service_key_warning(Ok(status), false).unwrap();
+            assert!(replaced.contains("old key") && replaced.contains("service install"), "{replaced}");
+            let removed = service_key_warning(Ok(status), true).unwrap();
+            assert!(removed.contains("removed key") && removed.contains("service uninstall"), "{removed}");
+        }
+        // Not knowing is no reason to stay quiet.
+        let unknown = service_key_warning(Err("access denied".into()), false).unwrap();
+        assert!(unknown.contains("access denied") && unknown.contains("reinstall"), "{unknown}");
+    }
 }
