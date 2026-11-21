@@ -172,6 +172,8 @@ struct Text {
     st_off_detail: &'static str,
     st_service_detail: &'static str,
     st_service_old_key: &'static str,
+    /// While it cannot be told which key the running service has.
+    st_service_unknown_key: &'static str,
     st_starting: &'static str,
     st_wait_ts: &'static str,
     st_wait_ts_detail: &'static str,
@@ -195,7 +197,7 @@ struct Text {
     svc_sas: &'static str,
     install: &'static str,
     reinstall: &'static str,
-    /// The install button while the service lacks the stored key.
+    /// The install button while the service has another key than the stored one.
     update_key: &'static str,
     uninstall: &'static str,
     svc_status: fn(&str) -> String,
@@ -212,6 +214,10 @@ struct Text {
     svc_failed: fn(u32) -> String,
     /// The elevated command refused the approving account's key (`service::EXIT_OTHER_KEY`).
     svc_other_key: &'static str,
+    /// The service did not stop, so nothing was replaced (`service::EXIT_NOT_STOPPED`).
+    svc_not_stopped: &'static str,
+    /// The service got the key but did not start (`service::EXIT_NOT_STARTED`).
+    svc_not_started: &'static str,
     close_sharing: &'static str,
     key_title: &'static str,
     key_sub: &'static str,
@@ -236,6 +242,8 @@ struct Text {
     /// Added to the two above when the service is installed.
     key_svc_confirm: &'static str,
     svc_key_offer: &'static str,
+    /// Instead of `svc_key_offer` while it cannot be told which key the service has.
+    svc_key_reinstall_offer: &'static str,
     svc_key_remove_offer: &'static str,
     svc_key_note: &'static str,
     sharing_restarts: &'static str,
@@ -308,6 +316,9 @@ static EN: Text = Text {
     st_service_detail: "The background service is running, so this PC can already be reached.",
     st_service_old_key: "The background service is running with another key than yours (perhaps a previous one). Update its key \
                          or remove it below.",
+    st_service_unknown_key: "The background service is running, but it cannot be told which key it has (an earlier safe-rdp \
+                             installed it, or changing its key failed), so it may still accept a previous key. Reinstall it \
+                             below: that gives it your key and this version of safe-rdp.",
     st_starting: "Starting…",
     st_wait_ts: "Waiting for Tailscale…",
     st_wait_ts_detail: "Sharing begins as soon as Tailscale is connected.",
@@ -355,6 +366,11 @@ static EN: Text = Text {
     svc_other_key: "Nothing was changed: the account that approved the administrator prompt does not have your current key, \
                     and the service gets the key of that account. Import your key into that account first (sign in to it and \
                     use Key → Import), or approve with an account that has it, then try again.",
+    svc_not_stopped: "Nothing was replaced: the background service did not stop when asked, so it keeps the key it had. Try \
+                      again in a moment, or restart Windows first.",
+    svc_not_started: "The background service now has your key, but Windows could not start it, so this PC cannot be reached \
+                      through it until it runs. Start \"safe-rdp host\" in Windows Services (if it is disabled there, \
+                      Reinstall turns it back on).",
     close_sharing: "This PC is being shared. Closing safe-rdp stops sharing and disconnects anyone viewing it.\n\nClose anyway?",
     key_title: "Security key",
     key_sub: "Your PCs use this key to recognize each other. Every PC needs the same key.",
@@ -386,6 +402,12 @@ static EN: Text = Text {
                     the previous one.\n\nGive it the new key now? Only its key changes; its other settings stay as they are. \
                     Windows will ask for administrator permission; if another account approves it, that account needs the new \
                     key too.",
+    svc_key_reinstall_offer: "The background service keeps the key it was given, and it cannot be told which key that is (an \
+                              earlier safe-rdp installed it, or changing its key failed), so it may still accept the previous \
+                              one.\n\nReinstall it now with the new key? It then runs this version of safe-rdp with only the \
+                              options ticked under \"While sharing, allow\": settings it was installed with in a terminal, such \
+                              as its port, allowed addresses or upload folder, are dropped. Windows will ask for administrator \
+                              permission; if another account approves it, that account needs the new key too.",
     svc_key_remove_offer: "The background service keeps the key it was given, so it may still accept the removed key.\n\n\
                            Remove the background service now? Windows will ask for administrator permission.",
     svc_key_note: " The background service keeps the key it had until you update its key or remove it (Share this PC).",
@@ -459,6 +481,9 @@ static KO: Text = Text {
     st_service_detail: "백그라운드 서비스가 실행 중이므로 이미 이 PC에 접속할 수 있습니다.",
     st_service_old_key: "백그라운드 서비스가 내 키가 아닌 다른 키(이전 키일 수 있음)로 실행 중입니다. 아래에서 키를 업데이트하거나 \
                          서비스를 제거하세요.",
+    st_service_unknown_key: "백그라운드 서비스가 실행 중이지만 어떤 키를 쓰는지 확인할 수 없어 (이전 버전의 safe-rdp로 설치했거나 \
+                             키 변경이 실패함) 이전 키로도 접속될 수 있습니다. 아래에서 다시 설치하면 내 키와 이 버전의 \
+                             safe-rdp를 사용합니다.",
     st_starting: "시작하는 중…",
     st_wait_ts: "Tailscale 연결을 기다리는 중…",
     st_wait_ts_detail: "Tailscale이 연결되면 바로 공유를 시작합니다.",
@@ -503,6 +528,11 @@ static KO: Text = Text {
     svc_other_key: "아무것도 바꾸지 않았습니다. 관리자 권한을 승인한 계정에 현재 키가 없습니다 (서비스는 승인한 계정의 키를 \
                     받습니다). 먼저 그 계정으로 로그인해 '보안 키 → 가져오기'로 키를 넣거나, 같은 키가 있는 계정으로 승인한 뒤 \
                     다시 시도하세요.",
+    svc_not_stopped: "아무것도 바꾸지 않았습니다. 백그라운드 서비스가 중지 요청에도 멈추지 않아 기존 키를 계속 사용합니다. 잠시 후 \
+                      다시 시도하거나, Windows를 다시 시작한 뒤 시도하세요.",
+    svc_not_started: "백그라운드 서비스에 내 키를 넣었지만 Windows가 서비스를 시작하지 못했습니다. 서비스가 실행되기 전까지는 \
+                      서비스로 이 PC에 접속할 수 없습니다. Windows 서비스에서 'safe-rdp host'를 시작하세요 ('사용 안 함'으로 \
+                      되어 있다면 다시 설치하면 다시 켜집니다).",
     close_sharing: "이 PC를 공유하는 중입니다. safe-rdp를 닫으면 공유가 중지되고 접속한 사람의 연결이 끊어집니다.\n\n그래도 닫을까요?",
     key_title: "보안 키",
     key_sub: "내 PC들은 이 키로 서로를 확인합니다. 모든 PC에 같은 키가 있어야 합니다.",
@@ -533,6 +563,11 @@ static KO: Text = Text {
     svc_key_offer: "백그라운드 서비스는 받은 키를 계속 사용하므로 아직 새 키를 쓰지 않으며 이전 키로도 접속될 수 있습니다.\n\n\
                     지금 서비스에 새 키를 넣을까요? 키만 바뀌고 다른 설정은 그대로 유지됩니다. Windows가 관리자 권한을 \
                     요청하며, 다른 계정이 승인한다면 그 계정에도 새 키가 있어야 합니다.",
+    svc_key_reinstall_offer: "백그라운드 서비스는 받은 키를 계속 사용하는데, 그 키가 무엇인지 확인할 수 없어 (이전 버전의 \
+                              safe-rdp로 설치했거나 키 변경이 실패함) 이전 키로도 접속될 수 있습니다.\n\n지금 새 키로 서비스를 \
+                              다시 설치할까요? 이 버전의 safe-rdp와 '공유 중 허용할 기능'에서 선택한 옵션만 사용하므로, 터미널에서 \
+                              설치할 때 지정한 포트·허용 주소·업로드 폴더 같은 설정은 사라집니다. Windows가 관리자 권한을 \
+                              요청하며, 다른 계정이 승인한다면 그 계정에도 새 키가 있어야 합니다.",
     svc_key_remove_offer: "백그라운드 서비스는 받은 키를 계속 사용하므로 삭제한 키로도 아직 접속될 수 있습니다.\n\n지금 \
                            백그라운드 서비스를 제거할까요? Windows가 관리자 권한을 요청합니다.",
     svc_key_note: " 백그라운드 서비스는 키를 업데이트하거나 제거하기 전까지 기존 키를 계속 사용합니다 ('이 PC 공유').",
@@ -806,6 +841,23 @@ fn svc_key(recorded: Option<&str>, mine: Option<&str>) -> SvcKey {
         Some(r) if mine == Some(r) => SvcKey::Mine,
         Some(_) => SvcKey::Other,
     }
+}
+
+/// After the stored key was replaced (`present`) or removed: what gives the service, whose key is
+/// `key`, the stored one or removes it. A reinstall while its key cannot be told: then an earlier
+/// safe-rdp, which recorded none, may have installed it, and its program is that version too.
+fn svc_key_update(present: bool, key: SvcKey) -> SvcOp {
+    match (present, key) {
+        (false, _) => SvcOp::Remove,
+        (true, SvcKey::Unknown) => SvcOp::Install,
+        (true, SvcKey::Other | SvcKey::Mine) => SvcOp::Rekey,
+    }
+}
+
+/// Whether the service, as found after a service command that did not succeed (`svc`, whose key
+/// is `key`), may still accept another key than the stored one.
+fn svc_lacks_key(svc: Svc, key: SvcKey) -> bool {
+    svc != Svc::NotInstalled && key != SvcKey::Mine
 }
 
 /// After the stored key changed from the one with fingerprint `old` to `new` (None: removed):
@@ -3474,10 +3526,11 @@ impl App {
             let me = st.me.as_ref().map(|d| d.name.as_str());
             let running = st.host.is_some();
             let (status, tone, detail): (String, Tone, String) = match &st.share {
-                Share::Off if st.svc == Svc::Running && svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) == SvcKey::Other => {
-                    (t.st_off.into(), Tone::Warn, t.st_service_old_key.into())
-                }
-                Share::Off if st.svc == Svc::Running => (t.st_off.into(), Tone::Muted, t.st_service_detail.into()),
+                Share::Off if st.svc == Svc::Running => match svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) {
+                    SvcKey::Mine => (t.st_off.into(), Tone::Muted, t.st_service_detail.into()),
+                    SvcKey::Other => (t.st_off.into(), Tone::Warn, t.st_service_old_key.into()),
+                    SvcKey::Unknown => (t.st_off.into(), Tone::Warn, t.st_service_unknown_key.into()),
+                },
                 Share::Off => (t.st_off.into(), Tone::Muted, t.st_off_detail.into()),
                 Share::Starting => (t.st_starting.into(), Tone::Accent, String::new()),
                 Share::WaitingForTailscale => (t.st_wait_ts.into(), Tone::Warn, t.st_wait_ts_detail.into()),
@@ -3547,11 +3600,12 @@ impl App {
         st.svc_busy || known.unwrap_or(st.svc != Svc::NotInstalled)
     }
 
-    /// The installed service lacks the stored key (as far as can be told), so the install
-    /// button gives it that key rather than reinstalling.
+    /// The installed service has another key than the stored one, so the install button gives it
+    /// that key rather than reinstalling. While its key cannot be told it stays a reinstall (see
+    /// `svc_key_update`).
     fn key_update_due(&self) -> bool {
         let st = self.st.borrow();
-        st.svc.installed() && st.key == KeyState::Present && svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) != SvcKey::Mine
+        st.svc.installed() && st.key == KeyState::Present && svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) == SvcKey::Other
     }
 
     fn update_service_ui(&self) {
@@ -3575,9 +3629,10 @@ impl App {
                 status.push_str(t.svc_key_status);
                 Tone::Warn
             }
+            // It may well accept a previous key.
             SvcKey::Unknown if installed && !busy => {
                 status.push_str(t.svc_key_unknown);
-                tone
+                Tone::Warn
             }
             _ => tone,
         };
@@ -3598,8 +3653,8 @@ impl App {
         if install && !self.require_key() {
             return;
         }
-        // While the service lacks the stored key, the install button gives it that key alone
-        // (see `update_service_ui`).
+        // While the service has another key than the stored one, the install button gives it
+        // that key alone (see `key_update_due`).
         let op = match install {
             false => SvcOp::Remove,
             true if self.key_update_due() => SvcOp::Rekey,
@@ -3655,25 +3710,34 @@ impl App {
     fn on_service_done(&self, op: SvcOp, result: Result<u32, Elevation>) {
         let t = self.t;
         let done = matches!(result, Ok(0));
+        self.st.borrow_mut().svc_busy = false;
+        // As the command left it, not as it was before: a failed command may still have given
+        // the service the key (and then not started it), or removed it.
+        self.on_service_status(service_info());
         let lacks_key = {
-            let mut st = self.st.borrow_mut();
-            st.svc_busy = false;
-            // As checked before the command ran: it changed nothing.
-            svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) != SvcKey::Mine
+            let st = self.st.borrow();
+            svc_lacks_key(st.svc, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
         };
         // Giving the service the key, or removing it, did not happen: say so where the key
         // was changed, too.
-        if !done && op != SvcOp::Install && lacks_key {
+        if !done && lacks_key {
             let mut text = get_text(self.c.k_msg);
             if !text.contains(t.svc_key_note.trim()) {
                 text.push_str(t.svc_key_note);
             }
             self.key_message(text.trim_start(), Tone::Warn);
         }
+        let not_remove = op != SvcOp::Remove;
         match result {
             Ok(0) | Err(Elevation::Cancelled) => {}
-            Ok(code) if code == service::EXIT_OTHER_KEY as u32 && op != SvcOp::Remove => {
+            Ok(code) if code == service::EXIT_OTHER_KEY as u32 && not_remove => {
                 message_box(self.hwnd, t.svc_other_key, MB_OK | MB_ICONWARNING);
+            }
+            Ok(code) if code == service::EXIT_NOT_STOPPED as u32 && not_remove => {
+                message_box(self.hwnd, t.svc_not_stopped, MB_OK | MB_ICONWARNING);
+            }
+            Ok(code) if code == service::EXIT_NOT_STARTED as u32 && not_remove => {
+                message_box(self.hwnd, t.svc_not_started, MB_OK | MB_ICONWARNING);
             }
             Ok(code) => {
                 message_box(self.hwnd, &(t.svc_failed)(code), MB_OK | MB_ICONWARNING);
@@ -3682,7 +3746,6 @@ impl App {
                 message_box(self.hwnd, &e, MB_OK | MB_ICONWARNING);
             }
         }
-        self.refresh_service();
     }
 
     // ----- Key
@@ -3767,14 +3830,22 @@ impl App {
     /// now under way.
     fn offer_service_update(&self, present: bool) -> bool {
         let t = self.t;
-        if self.st.borrow().svc_busy {
-            return false;
-        }
-        let offer = if present { t.svc_key_offer } else { t.svc_key_remove_offer };
+        let op = {
+            let st = self.st.borrow();
+            if st.svc_busy {
+                return false;
+            }
+            svc_key_update(present, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
+        };
+        let offer = match op {
+            SvcOp::Rekey => t.svc_key_offer,
+            SvcOp::Install => t.svc_key_reinstall_offer,
+            SvcOp::Remove => t.svc_key_remove_offer,
+        };
         if message_box(self.hwnd, offer, MB_YESNO | MB_ICONWARNING) != IDYES {
             return false;
         }
-        self.run_service_op(if present { SvcOp::Rekey } else { SvcOp::Remove })
+        self.run_service_op(op)
     }
 
     fn create_key(&self) {
@@ -4250,6 +4321,23 @@ mod tests {
     }
 
     #[test]
+    fn a_service_of_unknown_key_is_reinstalled() {
+        // Another key: given the stored one alone. No recorded key, as from a safe-rdp that
+        // predates the fingerprint: reinstalled, which replaces that old program too.
+        assert_eq!(svc_key_update(true, SvcKey::Other), SvcOp::Rekey);
+        assert_eq!(svc_key_update(true, SvcKey::Unknown), SvcOp::Install);
+        for key in [SvcKey::Mine, SvcKey::Other, SvcKey::Unknown] {
+            assert_eq!(svc_key_update(false, key), SvcOp::Remove);
+        }
+        // After a failed command, read again: a service given the key but not started has it.
+        assert!(!svc_lacks_key(Svc::Stopped, SvcKey::Mine));
+        assert!(svc_lacks_key(Svc::Stopped, SvcKey::Other));
+        assert!(svc_lacks_key(Svc::Running, SvcKey::Unknown));
+        assert!(svc_lacks_key(Svc::Unknown, SvcKey::Other), "may be installed");
+        assert!(!svc_lacks_key(Svc::NotInstalled, SvcKey::Unknown), "removed after all");
+    }
+
+    #[test]
     fn overrides() {
         assert_eq!(sharing_overrides(None, None), Ok((None, None)));
         assert_eq!(sharing_overrides(Some(" "), Some("")), Ok((None, None)));
@@ -4338,7 +4426,7 @@ mod tests {
             for s in [t.connect, t.start, t.stop, t.create, t.import, t.key_warning, t.svc_text, t.st_service_old_key, t.svc_key_offer] {
                 assert!(!s.is_empty());
             }
-            for s in [t.update_key, t.svc_other_key] {
+            for s in [t.update_key, t.svc_other_key, t.svc_not_stopped, t.svc_not_started, t.st_service_unknown_key] {
                 assert!(!s.is_empty());
             }
             // Added to other text.
@@ -4346,7 +4434,7 @@ mod tests {
                 assert!(s.starts_with(' ') && s.len() > 1, "{s}");
             }
             assert!(t.key_svc_confirm.starts_with("\n\n") && t.svc_key_remove_offer.contains("\n\n"));
-            for s in [t.svc_install_confirm, t.svc_reinstall_confirm, t.svc_rekey_confirm, t.svc_key_offer] {
+            for s in [t.svc_install_confirm, t.svc_reinstall_confirm, t.svc_rekey_confirm, t.svc_key_offer, t.svc_key_reinstall_offer] {
                 assert!(s.contains("\n\n"), "{s}");
             }
             // Wrapped source lines leave no runs of spaces behind.
@@ -4355,9 +4443,13 @@ mod tests {
                 t.remove_confirm,
                 t.key_svc_confirm,
                 t.svc_key_offer,
+                t.svc_key_reinstall_offer,
                 t.svc_key_remove_offer,
                 t.svc_text,
                 t.st_service_old_key,
+                t.st_service_unknown_key,
+                t.svc_not_stopped,
+                t.svc_not_started,
                 t.svc_install_confirm,
                 t.svc_reinstall_confirm,
                 t.svc_rekey_confirm,

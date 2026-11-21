@@ -64,6 +64,14 @@ const EXPECT_KEY_ARG: &str = "--expect-key";
 /// Exit code of `service install|rekey` refusing a key other than the expected one. The launcher
 /// runs them elevated and cannot see what they print, so this is how it learns why.
 pub const EXIT_OTHER_KEY: i32 = 3;
+/// Exit code of `service install|rekey` when the installed service did not stop: nothing was
+/// replaced, and it keeps the key it had.
+pub const EXIT_NOT_STOPPED: i32 = 4;
+/// Exit code of `service install|rekey` when the service got the new key (and its fingerprint was
+/// recorded, unless that failed) but could not be started.
+pub const EXIT_NOT_STARTED: i32 = 5;
+const NOT_STOPPED: &str = "the service did not stop within 20 s, so nothing was replaced and it keeps the key it had; try again \
+                           (restarting Windows stops it for sure)";
 
 static AGENT_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 static STATUS: AtomicUsize = AtomicUsize::new(0);
@@ -274,6 +282,21 @@ fn key_for_service(expect: Option<&str>) -> Result<Secret<32>> {
     std::process::exit(EXIT_OTHER_KEY);
 }
 
+/// Ends `service install|rekey` with exit code `code` after saying `msg` (see EXIT_OTHER_KEY).
+fn exit_with(code: i32, msg: &str) -> ! {
+    log!("error: {msg}");
+    std::process::exit(code);
+}
+
+/// The service was given the new key, but did not start (`e`).
+fn not_started_message(e: &str) -> String {
+    format!(
+        "the service was given the new key, but it could not be started ({e}). It accepts that key, and no earlier one, \
+         once it runs: start \"{DISPLAY_NAME}\" in Services (`safe-rdp service install` turns it back on if it is disabled \
+         there)"
+    )
+}
+
 fn reg_error(what: &str, code: u32) -> Error {
     Error::msg(format!("{what}: {}", std::io::Error::from_raw_os_error(code as i32)))
 }
@@ -363,14 +386,19 @@ fn netsh(args: &[&str]) -> bool {
 pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option<&str>) -> Result<()> {
     let scm = open_scm()?;
     let key = key_for_service(expect)?;
-    // The old fingerprint goes before the key it names: a recorded one is never wrong, at worst
-    // missing.
-    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
 
     if let Some(svc) = open_service(&scm) {
         log!("stopping the existing service...");
-        stop_and_wait(&svc);
+        // Its agent reads the key when it starts: one still running would keep the old key while
+        // the fingerprint recorded below named the new one.
+        if !stop_and_wait(&svc) {
+            drop(key);
+            exit_with(EXIT_NOT_STOPPED, NOT_STOPPED);
+        }
     }
+    // The old fingerprint goes before the key it names: a recorded one is never wrong, at worst
+    // missing.
+    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
 
     let key_path = keystore::save_service_key(&key)?;
     log!("service key stored in {} (SYSTEM/Administrators only)", key_path.display());
@@ -422,6 +450,7 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
         };
         // Its registry key exists now.
         record_key_fingerprint(&keys::fingerprint(&key));
+        drop(key);
         let mut desc = wide("Remote desktop host for Tailscale peers (safe-rdp).");
         let d = SERVICE_DESCRIPTIONW { lpDescription: desc.as_mut_ptr() };
         ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_DESCRIPTION, &d as *const _ as *const c_void);
@@ -463,7 +492,7 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
         }
 
         if StartServiceW(svc.0, 0, null()) == 0 {
-            return Err(Error::last_os("StartServiceW"));
+            exit_with(EXIT_NOT_STARTED, &not_started_message(&Error::last_os("StartServiceW").to_string()));
         }
     }
     log!("service '{SERVICE_NAME}' installed and started; logs: {}", keystore::service_dir().display());
@@ -484,20 +513,30 @@ pub fn rekey(expect: Option<&str>) -> Result<()> {
     let scm = open_scm()?;
     let svc = open_service(&scm).ok_or("the service is not installed; install it with `safe-rdp service install`")?;
     let key = key_for_service(expect)?;
-    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
+    // An earlier safe-rdp recorded none, and its service runs that earlier version.
+    let unrecorded = matches!(key_fingerprint(), Ok(None));
     log!("stopping the service...");
     // The agent reads the key when it starts: one still running would keep the old key.
     if !stop_and_wait(&svc) {
-        bail!("the service did not stop, so its key was not replaced; try again");
+        drop(key);
+        exit_with(EXIT_NOT_STOPPED, NOT_STOPPED);
     }
+    // As in `install`: never wrong, at worst missing.
+    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
     let key_path = keystore::save_service_key(&key)?;
     log!("service key replaced in {} (SYSTEM/Administrators only)", key_path.display());
     record_key_fingerprint(&keys::fingerprint(&key));
     drop(key);
     if unsafe { StartServiceW(svc.0, 0, null()) } == 0 {
-        return Err(Error::last_os("StartServiceW"));
+        exit_with(EXIT_NOT_STARTED, &not_started_message(&Error::last_os("StartServiceW").to_string()));
     }
     log!("service '{SERVICE_NAME}' started again with the new key");
+    if unrecorded {
+        log!(
+            "note: no key fingerprint was recorded before, as when an earlier safe-rdp installed the service; such a service \
+             still runs that version, which `safe-rdp service install` (with the options it was installed with) replaces"
+        );
+    }
     Ok(())
 }
 
@@ -943,6 +982,22 @@ mod tests {
         let m = other_key_message("admin", None, "891d3768f5c4f960");
         assert!(m.contains("no readable key") && m.contains("891d3768f5c4f960"), "{m}");
         assert!(PARAMETERS_KEY.contains(&format!(r"\Services\{SERVICE_NAME}\")));
+    }
+
+    #[test]
+    fn failures_say_whether_the_key_was_replaced() {
+        assert!(NOT_STOPPED.contains("did not stop") && NOT_STOPPED.contains("nothing was replaced") && NOT_STOPPED.contains("keeps the key it had"));
+        let m = not_started_message("StartServiceW failed: disabled");
+        assert!(m.contains("given the new key") && m.contains("could not be started") && m.contains("StartServiceW failed: disabled"), "{m}");
+        assert!(m.contains(DISPLAY_NAME) && m.contains("service install"), "{m}");
+        for s in [NOT_STOPPED, &m] {
+            assert!(!s.contains("  "), "{s}");
+        }
+        // The launcher tells them apart from success, from each other and from any other failure.
+        let codes = [0, 1, EXIT_OTHER_KEY, EXIT_NOT_STOPPED, EXIT_NOT_STARTED];
+        for (i, a) in codes.iter().enumerate() {
+            assert!(!codes[i + 1..].contains(a), "{codes:?}");
+        }
     }
 
     /// A registry key of a test's own under HKEY_CURRENT_USER\Software, removed on drop.
