@@ -7,6 +7,8 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::channel::{self, RecordReader, RecordWriter};
+use crate::codec::{Decoder, Rect};
+use crate::platform::mem::LockedBuf;
 use crate::proto::*;
 use crate::util::{Error, Result, Secret};
 use crate::{bail, log};
@@ -172,6 +174,11 @@ pub const BULK_DEPTH: usize = 8;
 /// clipboard queue up there (acks keep just the newest, mouse moves merge), so this many
 /// waiting means the host stopped reading: the queue gives up rather than grow without end.
 pub const CONTROL_DEPTH: usize = 4096;
+/// Bytes of text (clipboard, mostly) allowed to wait among those control messages: eight full
+/// clipboards. Counting entries alone would let a host that stops reading hold `CONTROL_DEPTH`
+/// clipboard texts of up to 1 MiB each, a host-set text echoed back by a local clipboard
+/// manager being one way to make them.
+pub const CONTROL_BYTES: usize = 8 << 20;
 /// Why a session ends when its `OutQueue` gave up.
 pub const STALLED: &str = "the host stopped reading what this viewer sends";
 /// Size of one file-data message on the wire: small enough that input queued behind it
@@ -194,9 +201,20 @@ struct OutState {
     /// The newest frame acknowledgement not sent yet: the host keeps only the latest, and one
     /// per frame would let a host that floods frames and reads slowly fill the queue.
     ack: Option<u32>,
+    /// `held_bytes` of the messages in `control`.
+    control_bytes: usize,
     closed: bool,
-    /// Closed because `CONTROL_DEPTH` control messages were waiting.
+    /// Closed because `CONTROL_DEPTH` control messages (or `CONTROL_BYTES`) were waiting.
     stalled: bool,
+}
+
+/// Bytes `m` holds beyond its fixed fields (text and data), as counted against `CONTROL_BYTES`.
+fn held_bytes(m: &ClientMsg) -> usize {
+    match m {
+        ClientMsg::Clipboard(t) | ClientMsg::FileBegin { name: t, .. } => t.len(),
+        ClientMsg::FileData { data, .. } => data.len(),
+        _ => 0,
+    }
 }
 
 /// What `OutQueue::next` produced.
@@ -219,7 +237,8 @@ impl OutQueue {
     /// Queues a control message; false once the queue is closed. A mouse move replaces a
     /// mouse move still waiting at the end of the queue, so a slow link does not replay a
     /// backlog of stale positions, and an ack replaces any waiting ack. With `CONTROL_DEPTH`
-    /// messages waiting the queue closes as `stalled`: the caller should end the session.
+    /// messages or `CONTROL_BYTES` of text waiting the queue closes as `stalled`: the caller
+    /// should end the session. (One message is always taken while nothing waits.)
     pub fn send(&self, m: ClientMsg) -> bool {
         let mut s = lock(&self.state);
         if s.closed {
@@ -229,12 +248,14 @@ impl OutQueue {
             (_, &ClientMsg::Ack(id)) => s.ack = Some(id),
             (Some(last @ ClientMsg::MouseMove { .. }), ClientMsg::MouseMove { .. }) => *last = m,
             _ => {
-                if s.control.len() >= CONTROL_DEPTH {
+                let bytes = held_bytes(&m);
+                if s.control.len() >= CONTROL_DEPTH || (!s.control.is_empty() && s.control_bytes + bytes > CONTROL_BYTES) {
                     s.stalled = true;
                     drop(s);
                     self.close();
                     return false;
                 }
+                s.control_bytes += bytes;
                 s.control.push_back(m)
             }
         }
@@ -273,6 +294,7 @@ impl OutQueue {
                 return Next::Msg(ClientMsg::Ack(id));
             }
             if let Some(m) = s.control.pop_front() {
+                s.control_bytes -= held_bytes(&m);
                 return Next::Msg(m);
             }
             if let Some(m) = s.bulk.pop_front() {
@@ -293,6 +315,7 @@ impl OutQueue {
         s.closed = true;
         s.ack = None;
         s.control.clear();
+        s.control_bytes = 0;
         s.bulk.clear();
         self.ready.notify_all();
         self.space.notify_all();
@@ -327,10 +350,10 @@ impl ResizePacer {
 }
 
 /// The framebuffer's lock, shared by the UI thread (painting) and a session's reader
-/// (decoding). The reader takes it again right after each message, and a mutex is not fair,
-/// so under a stream of messages the UI thread (on Windows also the keyboard hook it serves)
-/// could wait through message after message. The UI thread announces its wait instead, and
-/// the reader lets it in before decoding the next message.
+/// (copying in what it decoded, `TileDecoder`). The reader takes it again right after each
+/// band it copies, and a mutex is not fair, so under a stream of messages the UI thread (on
+/// Windows also the keyboard hook it serves) could wait through band after band. The UI
+/// thread announces its wait instead, and the reader lets it in before the next band.
 pub struct FrameLock<T> {
     m: Mutex<T>,
     ui_waiting: AtomicBool,
@@ -344,7 +367,7 @@ impl<T> FrameLock<T> {
         FrameLock { m: Mutex::new(v), ui_waiting: AtomicBool::new(false) }
     }
 
-    /// Locks on the UI thread: waits for the message being decoded, not for every one after it.
+    /// Locks on the UI thread: waits for the band being copied, not for every one after it.
     pub fn ui(&self) -> LockResult<MutexGuard<'_, T>> {
         self.ui_waiting.store(true, Ordering::SeqCst);
         let g = self.m.lock();
@@ -360,6 +383,99 @@ impl<T> FrameLock<T> {
         }
         self.m.lock()
     }
+}
+
+/// Screen area a host may have decoded per second, in screens: twice the most a real host
+/// sends (120 frames a second at most, each covering the screen at most twice). More only
+/// keeps the viewer decoding, so it is treated as protocol abuse and ends the session.
+pub const DECODE_SCREENS: u32 = 480;
+/// How far a host may get ahead of that pace (frames held up on the link arrive together).
+pub const DECODE_BURST: Duration = Duration::from_secs(1);
+/// Bytes a reader copies into the framebuffer per turn at its lock (about a millisecond).
+pub const COPY_BYTES: usize = 4 << 20;
+
+/// Paces decoded screen area (see `DECODE_SCREENS`).
+pub struct DecodeBudget {
+    /// When everything decoded so far is paid off at the allowed pace.
+    due: Instant,
+}
+
+impl DecodeBudget {
+    pub fn new(now: Instant) -> DecodeBudget {
+        DecodeBudget { due: now }
+    }
+
+    /// `pixels` of a `screen`-pixel screen were decoded at `now`: false once the host is more
+    /// than `DECODE_BURST` ahead of the allowed pace.
+    pub fn spend(&mut self, now: Instant, pixels: usize, screen: usize) -> bool {
+        let per_second = DECODE_SCREENS as f64 * screen.max(1) as f64;
+        self.due = self.due.max(now) + Duration::from_secs_f64(pixels as f64 / per_second);
+        self.due - now <= DECODE_BURST
+    }
+}
+
+/// A session reader's decoding. Each tiles message is decoded into the reader's own copy of
+/// the screen without any lock held, and only the rects it drew are then copied into the
+/// shared framebuffer, `COPY_BYTES` per turn at the lock (`copy`). A host can make one message
+/// take a second to decode (two screens of 64 Mpx), and the UI thread, which on Windows also
+/// serves the keyboard hook of the whole desktop, must never wait that long for the lock.
+pub struct TileDecoder {
+    dec: Decoder,
+    /// The reader's copy of the remote screen, `w`x`h` BGRA.
+    back: LockedBuf,
+    w: usize,
+    h: usize,
+    budget: DecodeBudget,
+}
+
+impl TileDecoder {
+    pub fn new() -> Result<TileDecoder> {
+        Ok(TileDecoder { dec: Decoder::new()?, back: LockedBuf::new(0), w: 0, h: 0, budget: DecodeBudget::new(Instant::now()) })
+    }
+
+    /// Decodes tiles message `p` for a `w`x`h` screen (a size the caller accepted) into the
+    /// reader's copy; returns the bounding box of what it drew, for `copy` to bring over.
+    pub fn decode(&mut self, p: &[u8], w: usize, h: usize) -> Result<Option<Rect>> {
+        check_screen_size(w, h)?;
+        if (self.w, self.h) != (w, h) {
+            // The old copy is wiped and freed before the new one is allocated.
+            self.back = LockedBuf::new(0);
+            self.back = LockedBuf::new(w * h * 4);
+            (self.w, self.h) = (w, h);
+        }
+        let bbox = self.dec.apply(p, self.back.as_mut_slice(), w, h)?;
+        let pixels = self.dec.rects().iter().map(|r| r.w * r.h).sum();
+        if !self.budget.spend(Instant::now(), pixels, w * h) {
+            bail!("the host sends far more screen updates than a real host can");
+        }
+        Ok(bbox)
+    }
+
+    /// Copies the rects the latest `decode` drew into `fb` (the same size), from `*at` (rect,
+    /// row) on, about `COPY_BYTES` per call; true once everything is copied.
+    pub fn copy(&self, fb: &mut [u8], at: &mut (usize, usize)) -> bool {
+        fb.len() != self.back.len() || copy_rects(self.back.as_slice(), fb, self.w, self.dec.rects(), at, COPY_BYTES)
+    }
+}
+
+/// Copies the rows of `rects` from `src` to `dst` (both BGRA, `w` pixels wide) from `*at`
+/// (rect index, row within it) on, stopping once `limit` bytes were copied (always at least
+/// one row); true once the last row is done.
+fn copy_rects(src: &[u8], dst: &mut [u8], w: usize, rects: &[Rect], at: &mut (usize, usize), limit: usize) -> bool {
+    let mut copied = 0;
+    while let Some(r) = rects.get(at.0) {
+        while at.1 < r.h {
+            if copied >= limit {
+                return false;
+            }
+            let o = ((r.y + at.1) * w + r.x) * 4;
+            dst[o..o + r.w * 4].copy_from_slice(&src[o..o + r.w * 4]);
+            copied += r.w * 4;
+            at.1 += 1;
+        }
+        *at = (at.0 + 1, 0);
+    }
+    true
 }
 
 /// How a session ended, as far as reconnecting is concerned.
@@ -579,6 +695,109 @@ mod tests {
         let q = OutQueue::default();
         q.close();
         assert!(!q.send(key(0)) && !q.stalled());
+    }
+
+    #[test]
+    fn queued_text_is_bounded_in_bytes() {
+        let q = OutQueue::default();
+        let text = || ClientMsg::Clipboard("x".repeat(MAX_CLIPBOARD));
+        let full = CONTROL_BYTES / MAX_CLIPBOARD;
+        for _ in 0..full {
+            assert!(q.send(text()));
+        }
+        // Small messages still fit; the writer taking a text makes room for another.
+        assert!(q.send(ClientMsg::Refresh));
+        assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Clipboard(_))));
+        assert!(q.send(text()));
+        assert!(!q.stalled());
+        // Far fewer than `CONTROL_DEPTH` entries, but the bytes are what a host must not pile up.
+        assert!(!q.send(text()));
+        assert!(q.stalled());
+        assert_eq!(q.next(Duration::ZERO), Next::Closed);
+        // One message is always taken while nothing waits, however large.
+        let q = OutQueue::default();
+        assert!(q.send(ClientMsg::FileData { id: 1, data: vec![0; CONTROL_BYTES + 1] }));
+        assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::FileData { .. })));
+        assert!(q.send(text()) && q.send(ClientMsg::Key { vk: 1, scan: 0, flags: 0 }) && !q.stalled());
+    }
+
+    #[test]
+    fn decoding_is_paced_by_screen_area() {
+        let t0 = Instant::now();
+        let screen = 1000;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // A host at the limit keeps going for a minute.
+        let mut b = DecodeBudget::new(t0);
+        let per_ms = DECODE_SCREENS as usize * screen / 1000;
+        for ms in 0..60_000 {
+            assert!(b.spend(at(ms), per_ms, screen), "at {ms} ms");
+        }
+        // Twice as fast is cut off once its lead passes `DECODE_BURST`.
+        let mut b = DecodeBudget::new(t0);
+        let cut = (0..10_000).find(|&ms| !b.spend(at(ms), 2 * per_ms, screen)).expect("never cut off");
+        assert!((900..=1100).contains(&cut), "cut off after {cut} ms");
+        // A burst of a whole second's worth is fine, and a quiet host earns it back.
+        let mut b = DecodeBudget::new(t0);
+        assert!(b.spend(t0, DECODE_SCREENS as usize * screen, screen));
+        assert!(!b.spend(t0, screen, screen));
+        let mut b = DecodeBudget::new(t0);
+        assert!(b.spend(t0, DECODE_SCREENS as usize * screen, screen));
+        assert!(b.spend(at(1000), DECODE_SCREENS as usize * screen, screen));
+    }
+
+    fn solid(x: usize, y: usize, w: usize, h: usize, v: u8) -> crate::codec::EncodedRect {
+        crate::codec::EncodedRect { rect: Rect { x, y, w, h }, enc: crate::codec::ENC_SOLID, data: vec![v, v, v] }
+    }
+
+    #[test]
+    fn tiles_are_decoded_aside_and_copied_in_bands() {
+        let (w, h) = (64, 48);
+        let mut td = TileDecoder::new().unwrap();
+        let msg = crate::codec::pack(1, w, h, &[solid(0, 0, 8, 4, 10), solid(30, 20, 20, 25, 20)]).remove(0);
+        let bbox = td.decode(&msg[1..], w, h).unwrap();
+        assert_eq!(bbox, Some(Rect { x: 0, y: 0, w: 50, h: 45 }));
+        // Rows are copied up to the limit at a time (at least one), and only the rects drawn.
+        let mut fb = vec![7u8; w * h * 4];
+        let (mut at, mut calls) = ((0, 0), 0);
+        while !copy_rects(td.back.as_slice(), &mut fb, w, td.dec.rects(), &mut at, 20 * 4 * 3) {
+            calls += 1;
+            assert!(calls < 100);
+        }
+        // Three wide rows' worth per call: the 4 short rows and 2 wide ones, then 3 wide rows
+        // per call; the 9th call copies the last 2 and is done.
+        assert_eq!(calls, 8);
+        for (x, y) in (0..h).flat_map(|y| (0..w).map(move |x| (x, y))) {
+            let want = if x < 8 && y < 4 {
+                [10, 10, 10, 255]
+            } else if (30..50).contains(&x) && (20..45).contains(&y) {
+                [20, 20, 20, 255]
+            } else {
+                [7; 4]
+            };
+            assert_eq!(fb[(y * w + x) * 4..][..4], want, "pixel {x},{y}");
+        }
+        let mut again = vec![7u8; w * h * 4];
+        let mut at = (0, 0);
+        assert!(td.copy(&mut again, &mut at));
+        assert_eq!(again, fb);
+        // A framebuffer of another size is left alone.
+        let mut other = vec![7u8; 16];
+        assert!(td.copy(&mut other, &mut (0, 0)) && other == [7; 16]);
+        // A new size gets a new copy of the screen.
+        let msg = crate::codec::pack(2, 16, 8, &[solid(0, 0, 16, 8, 30)]).remove(0);
+        assert_eq!(td.decode(&msg[1..], 16, 8).unwrap(), Some(Rect { x: 0, y: 0, w: 16, h: 8 }));
+        assert_eq!(td.back.len(), 16 * 8 * 4);
+        assert!(td.decode(&msg[1..], 8193, 8192).is_err());
+    }
+
+    #[test]
+    fn a_host_cannot_keep_the_decoder_busy() {
+        let (w, h) = (16, 16);
+        let mut td = TileDecoder::new().unwrap();
+        // Two whole screens per message, as fast as the decoder goes.
+        let msg = crate::codec::pack(1, w, h, &[solid(0, 0, w, h, 1), solid(0, 0, w, h, 2)]).remove(0);
+        let r = (0..100_000).try_for_each(|_| td.decode(&msg[1..], w, h).map(drop));
+        assert!(r.is_err_and(|e| e.to_string().contains("far more screen updates")));
     }
 
     #[test]

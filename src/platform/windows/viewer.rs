@@ -18,13 +18,13 @@ use super::clipboard::Clipboard;
 use super::mem::LockedBuf;
 use super::toolbar::{self, Bar, BarModel, Feature, Overlay, ToastAction, Toasts, Tone, Txt, tr, trf};
 use crate::channel::{RecordReader, RecordWriter};
-use crate::codec::{self, Decoder, Rect};
+use crate::codec::{self, Rect};
 use crate::files;
 use crate::proto::*;
 use crate::util::{Error, Result, Secret, wide};
 use crate::viewer::{self as core, Connection, EndKind, Next, OutQueue, ViewerOptions};
 use crate::{bail, log};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::net::{Shutdown, TcpStream};
@@ -56,6 +56,8 @@ const WM_APP_LAYOUT: u32 = WM_APP + 5;
 
 const T_TICK: usize = 1;
 const T_RECONNECT: usize = 2;
+/// A frame waits for its turn to be painted (`show_frame`).
+const T_FRAME: usize = 3;
 const TICK_MS: u32 = 250;
 
 const MOD_CTRL: u8 = 1;
@@ -117,9 +119,10 @@ struct App {
     /// Height of the docked bar above the remote image (0 in full screen).
     top: AtomicI32,
     cursor: AtomicU8,
-    /// A WM_APP_FRAME / WM_APP_CURSOR is waiting (see `post_once`).
+    /// A WM_APP_FRAME / WM_APP_CURSOR / WM_APP_EVENT is waiting (see `post_once`).
     frame_posted: AtomicBool,
     cursor_posted: AtomicBool,
+    events_posted: AtomicBool,
     hook_active: AtomicBool,
     mods: AtomicU8,
     swallowed: Mutex<HashSet<u16>>,
@@ -165,9 +168,7 @@ impl App {
 
     /// Queues an event for the UI thread.
     fn post(&self, ev: Event) {
-        if enqueue(&mut lock(&self.events), ev) {
-            unsafe { PostMessageW(self.hwnd(), WM_APP_EVENT, 0, 0) };
-        }
+        post_event(&self.events, &self.events_posted, self.hwnd(), ev);
     }
 
     /// The framebuffer, locked on the UI thread / on a session's reader (`core::FrameLock`).
@@ -187,6 +188,27 @@ impl App {
 fn post_once(hwnd: HWND, pending: &AtomicBool, msg: u32) {
     if !pending.swap(true, Ordering::SeqCst) && unsafe { PostMessageW(hwnd, msg, 0, 0) } == 0 {
         pending.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Queues `ev` for the UI thread and wakes it. One WM_APP_EVENT handles many events, so a
+/// wakeup is posted only while none waits (`post_once`; `dispatch_events` clears `posted`
+/// before taking the first event): a host whose events outpace the UI thread cannot fill the
+/// posted queue, which would refuse the viewer's own posts and hold back its timers.
+fn post_event(events: &Mutex<VecDeque<Event>>, posted: &AtomicBool, hwnd: HWND, ev: Event) {
+    enqueue(&mut lock(events), ev);
+    post_once(hwnd, posted, WM_APP_EVENT);
+}
+
+/// Takes up to `EVENTS_PER_WAKE` events off the UI queue for `handle`; if more remain, another
+/// WM_APP_EVENT follows (through `post_once`, so still at most one waits).
+fn drain_events(events: &Mutex<VecDeque<Event>>, posted: &AtomicBool, hwnd: HWND, mut handle: impl FnMut(Event)) {
+    for _ in 0..EVENTS_PER_WAKE {
+        let Some(ev) = lock(events).pop_front() else { return };
+        handle(ev);
+    }
+    if !lock(events).is_empty() {
+        post_once(hwnd, posted, WM_APP_EVENT);
     }
 }
 
@@ -537,6 +559,7 @@ fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<
         cursor: AtomicU8::new(Cursor::Arrow as u8),
         frame_posted: AtomicBool::new(false),
         cursor_posted: AtomicBool::new(false),
+        events_posted: AtomicBool::new(false),
         hook_active: AtomicBool::new(false),
         mods: AtomicU8::new(0),
         swallowed: Mutex::new(HashSet::new()),
@@ -718,7 +741,7 @@ fn read_session(
 ) -> std::result::Result<(), Ending> {
     let app = APP.get().unwrap();
     let fatal = |e: Error| (EndKind::Fatal, e);
-    let mut dec = Decoder::new().map_err(fatal)?;
+    let mut dec = core::TileDecoder::new().map_err(fatal)?;
     loop {
         let rec = reader.recv().map_err(|e| (core::classify_link_error(&e), e))?;
         if s.is_ended() {
@@ -768,7 +791,7 @@ fn read_session(
 }
 
 /// Applies one tiles message of session `s`; returns true when it completed a frame.
-fn apply_tiles(app: &App, s: &Session, dec: &mut Decoder, p: &[u8]) -> Result<bool> {
+fn apply_tiles(app: &App, s: &Session, dec: &mut core::TileDecoder, p: &[u8]) -> Result<bool> {
     let hdr = codec::parse_header(p)?;
     let size = (hdr.width, hdr.height);
     // A new size gets its buffer allocated and page-locked, and the old one wiped (up to
@@ -799,25 +822,38 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut Decoder, p: &[u8]) -> Result<bo
         app.fb_w.store(fb.w as u32, Ordering::SeqCst);
         app.fb_h.store(fb.h as u32, Ordering::SeqCst);
     }
-    let (fw, fh) = (fb.w, fb.h);
-    if let Some(b) = dec.apply(p, fb.px.as_mut_slice(), fw, fh)? {
-        fb.dirty = Some(match fb.dirty {
-            None => b,
-            Some(d) => {
-                let (x0, y0) = (d.x.min(b.x), d.y.min(b.y));
-                let (x1, y1) = ((d.x + d.w).max(b.x + b.w), (d.y + d.h).max(b.y + b.h));
-                Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
-            }
-        });
-    }
     drop(fb);
+    // A replaced (or unneeded) buffer is wiped with the lock released, and before this reader
+    // makes its own copy of the screen at the new size.
+    drop((old, fresh));
+    // Decoded without the lock (`core::TileDecoder`): only copying the rects drawn takes it,
+    // a band at a time, so the UI thread waits for one band at most.
+    if let Some(b) = dec.decode(p, hdr.width, hdr.height)? {
+        let mut at = (0, 0);
+        loop {
+            let mut fb = app.reader_fb();
+            // Resized again meanwhile (by an older session's reader): this message is outdated.
+            if (fb.w, fb.h) != size {
+                break;
+            }
+            if dec.copy(fb.px.as_mut_slice(), &mut at) {
+                fb.dirty = Some(match fb.dirty {
+                    None => b,
+                    Some(d) => {
+                        let (x0, y0) = (d.x.min(b.x), d.y.min(b.y));
+                        let (x1, y1) = ((d.x + d.w).max(b.x + b.w), (d.y + d.h).max(b.y + b.h));
+                        Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                    }
+                });
+                break;
+            }
+        }
+    }
     if hdr.last {
         // Acked on this session's own queue: never on a newer session after a reconnect.
         s.send(ClientMsg::Ack(hdr.frame));
         post_once(app.hwnd(), &app.frame_posted, WM_APP_FRAME);
     }
-    // A replaced (or unneeded) buffer is wiped only now: lock released, frame on its way.
-    drop((old, fresh));
     Ok(hdr.last)
 }
 
@@ -1354,7 +1390,12 @@ impl Ui {
                 _ => {}
             }
         }
-        self.refresh_bar();
+        // An answer to a click shows at once. What the host changes by itself, as often as it
+        // likes, shows with the next tick's refresh: a relayout of the bar per `State` would let
+        // a host keep this thread busy.
+        if requested {
+            self.refresh_bar();
+        }
     }
 
     /// Changes a host setting (optimistically; `ServerMsg::State` confirms or corrects it).
@@ -1665,14 +1706,13 @@ fn dim(px: &mut [u8]) {
 /// loop (and with it the keyboard hook) keeps running in between.
 fn dispatch_events(hwnd: HWND) {
     let app = APP.get().unwrap();
-    for _ in 0..EVENTS_PER_WAKE {
-        let Some(ev) = lock(&app.events).pop_front() else { return };
+    // Cleared before the first event is taken, so an event queued meanwhile gets a wakeup of
+    // its own; also from the tick, so a wakeup that went astray cannot leave events waiting.
+    app.events_posted.store(false, Ordering::SeqCst);
+    drain_events(&app.events, &app.events_posted, hwnd, |ev| {
         let after = with_ui(|ui| ui.handle(ev)).unwrap_or(After::Nothing);
         follow_up(hwnd, after);
-    }
-    if !lock(&app.events).is_empty() {
-        unsafe { PostMessageW(hwnd, WM_APP_EVENT, 0, 0) };
-    }
+    });
 }
 
 fn follow_up(hwnd: HWND, after: After) {
@@ -1910,8 +1950,91 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
     (r.right - r.left, r.bottom - r.top)
 }
 
+/// Frames are repainted at most this often (a host sends at most 120 a second).
+const FRAME_GAP: Duration = Duration::from_millis(8);
+/// Smooth (HALFTONE) scaling takes 5-8 ns per source pixel painted, or per window pixel when
+/// enlarging: about 40 ms for a whole 4K frame, 300 ms for 8192x8192. One paint smooths at
+/// most this many (15-25 ms); the rest of the update follows in the next WM_PAINT, and input
+/// and the keyboard hook get their turn in between.
+const PAINT_PIXELS: i64 = 3 << 20;
+/// A remote screen shown at less than a quarter of its width and height (a thumbnail) is
+/// scaled by dropping pixels (COLORONCOLOR, a few ms at any size) instead of smoothed, so an
+/// enormous screen announced by a host does not make every frame cost a smoothing of all of it.
+const SMOOTH_MAX_SHRINK: i64 = 16;
+
+/// Paces repaints for new frames (`show_frame`). UI thread only.
+#[derive(Clone, Copy)]
+struct Pace {
+    /// When the latest paint started.
+    painted: Option<Instant>,
+    /// Part of a smoothed update is still to be painted (`paint_band`).
+    banding: bool,
+    /// A frame arrived while banding: shown after the last band.
+    waiting: bool,
+    /// `T_FRAME` is set.
+    timer: bool,
+}
+
+thread_local! {
+    static PACE: Cell<Pace> = const { Cell::new(Pace { painted: None, banding: false, waiting: false, timer: false }) };
+}
+
+/// How long a new frame waits to be painted after a paint that started at `painted`.
+fn frame_wait(now: Instant, painted: Option<Instant>) -> Duration {
+    painted.map_or(Duration::ZERO, |t| (t + FRAME_GAP).saturating_duration_since(now))
+}
+
+/// Whether an image of `src` pixels shown on `dst` window pixels is smoothed.
+fn smooth(src: i64, dst: i64) -> bool {
+    src <= SMOOTH_MAX_SHRINK * dst
+}
+
+/// Splits a smoothed paint of `update` (window coordinates) into the band to paint now and the
+/// rest, when the part of it inside `image` (showing `src` pixels on `dst`) is more than
+/// `PAINT_PIXELS` of work; `None` if it all fits.
+fn paint_band(update: &RECT, image: &RECT, src: i64, dst: i64) -> Option<(RECT, RECT)> {
+    let (left, right) = (update.left.max(image.left), update.right.min(image.right));
+    let (top, bottom) = (update.top.max(image.top), update.bottom.min(image.bottom));
+    if left >= right || top >= bottom || dst <= 0 {
+        return None;
+    }
+    let row = (right - left) as i64 * src.max(dst) / dst;
+    let rows = (PAINT_PIXELS / row.max(1)).max(1);
+    if rows >= (bottom - top) as i64 {
+        return None;
+    }
+    let split = top + rows as i32;
+    Some((RECT { left, top, right, bottom: split }, RECT { left, top: split, right, bottom }))
+}
+
+/// Shows the frames decoded since the last call: invalidates what they changed, at most once
+/// per `FRAME_GAP`, and not while a smoothed update is still being painted in bands (or the
+/// next frame's invalidation would restart it at the top every time, and the bottom would
+/// never be painted); then after its last band.
+fn show_frame(hwnd: HWND) {
+    let mut p = PACE.get();
+    let now = Instant::now();
+    // (Bands follow each other at once; one that never came, say for a minimized window,
+    // holds frames back for a second at most.)
+    if p.banding && p.painted.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1)) {
+        p.waiting = true;
+    } else if !p.timer {
+        let wait = frame_wait(now, p.painted);
+        // Windows rounds the delay up to its timer resolution.
+        p.timer = !wait.is_zero() && unsafe { SetTimer(hwnd, T_FRAME, wait.as_millis().max(1) as u32, None) } != 0;
+        if !p.timer {
+            PACE.set(Pace { banding: false, waiting: false, ..p });
+            invalidate_dirty(hwnd);
+            return;
+        }
+    }
+    PACE.set(p);
+}
+
 fn paint(hwnd: HWND) {
     let app = APP.get().unwrap();
+    let started = Instant::now();
+    let mut rest = None;
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
@@ -1947,13 +2070,34 @@ fn paint(hwnd: HWND) {
             if dw == fw && dh == fh {
                 SetDIBitsToDevice(hdc, d.left, d.top, fw as u32, fh as u32, 0, 0, 0, fh as u32, bits, &bmi, DIB_RGB_COLORS);
             } else {
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, null_mut());
+                let (src, dst) = (fw as i64 * fh as i64, dw as i64 * dh as i64);
+                if smooth(src, dst) {
+                    SetStretchBltMode(hdc, HALFTONE);
+                    SetBrushOrgEx(hdc, 0, 0, null_mut());
+                    // Smoothing costs what the clip region covers: paint one band of a large update.
+                    if let Some((band, more)) = paint_band(&ps.rcPaint, &d, src, dst) {
+                        IntersectClipRect(hdc, band.left, band.top, band.right, band.bottom);
+                        rest = Some(more);
+                    }
+                } else {
+                    SetStretchBltMode(hdc, COLORONCOLOR);
+                }
                 StretchDIBits(hdc, d.left, d.top, dw, dh, 0, 0, fw, fh, bits, &bmi, DIB_RGB_COLORS, SRCCOPY);
             }
         }
         drop(fb);
         EndPaint(hwnd, &ps);
+        if let Some(r) = &rest {
+            InvalidateRect(hwnd, r, 0);
+        }
+    }
+    let mut p = PACE.get();
+    p.painted = Some(started);
+    p.banding = rest.is_some();
+    let show = !p.banding && std::mem::take(&mut p.waiting);
+    PACE.set(p);
+    if show {
+        show_frame(hwnd);
     }
 }
 
@@ -2488,7 +2632,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_ERASEBKGND => 1,
             WM_APP_FRAME => {
                 app.frame_posted.store(false, Ordering::SeqCst);
-                invalidate_dirty(hwnd);
+                show_frame(hwnd);
                 0
             }
             WM_SIZE => {
@@ -2527,6 +2671,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     }
                     T_RECONNECT => {
                         with_ui(|ui| ui.launch_attempt());
+                    }
+                    T_FRAME => {
+                        KillTimer(hwnd, T_FRAME);
+                        PACE.set(Pace { timer: false, ..PACE.get() });
+                        show_frame(hwnd);
                     }
                     _ => {}
                 }
@@ -2862,6 +3011,105 @@ mod tests {
         assert_eq!(msg.message, WM_APP_FRAME);
         unsafe { KillTimer(null_mut(), timer) };
         take(WM_TIMER);
+    }
+
+    /// Removes every queued `kind` message of this thread; how many there were.
+    fn take_all(hwnd: HWND, kind: u32) -> usize {
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        let mut n = 0;
+        while unsafe { PeekMessageW(&mut msg, hwnd, kind, kind, PM_REMOVE) } != 0 {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn a_state_flood_leaves_one_wakeup_waiting() {
+        // A message-only window (never shown) owned by this thread stands in for the viewer's.
+        let hwnd = unsafe {
+            let class = wide("SafeRdpTestEvents");
+            let hinst = GetModuleHandleW(null());
+            let wc = WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: hinst, lpszClassName: class.as_ptr(), ..std::mem::zeroed() };
+            RegisterClassW(&wc);
+            CreateWindowExW(0, class.as_ptr(), null(), 0, 0, 0, 0, 0, HWND_MESSAGE, null_mut(), hinst, null())
+        };
+        assert!(!hwnd.is_null());
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let posted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        // The reader: every `State` of two settings, flipping between two values, as fast as it can.
+        let reader = {
+            let (events, posted, stop, target) = (events.clone(), posted.clone(), stop.clone(), hwnd as usize);
+            std::thread::spawn(move || {
+                let mut sent = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    for (key, value) in [(SET_QUALITY, 0), (SET_DOWNSCALE, 1), (SET_QUALITY, 1), (SET_DOWNSCALE, 2)] {
+                        post_event(&events, &posted, target as HWND, Event::State { generation: 1, key, value, states: 1 });
+                        sent += 1;
+                    }
+                }
+                sent
+            })
+        };
+        // The UI thread handles each event far more slowly than the reader sends them.
+        let (mut wakeups, mut handled, mut most_waiting) = (0, 0u64, 0);
+        let until = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < until {
+            let waiting = take_all(hwnd, WM_APP_EVENT);
+            most_waiting = most_waiting.max(waiting);
+            if waiting > 0 {
+                wakeups += 1;
+                posted.store(false, Ordering::SeqCst);
+                drain_events(&events, &posted, hwnd, |_| {
+                    handled += 1;
+                    let t = Instant::now();
+                    while t.elapsed() < Duration::from_micros(200) {}
+                });
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        let sent = reader.join().unwrap();
+        assert!(most_waiting <= 1, "{most_waiting} wakeups waited at once");
+        assert!(wakeups > 10 && handled < sent, "{wakeups} wakeups, {handled} of {sent} states handled");
+        // The viewer's own posts still get in.
+        assert_ne!(unsafe { PostMessageW(hwnd, WM_APP_FULLSCREEN, 0, 0) }, 0);
+        assert_eq!(take_all(hwnd, WM_APP_FULLSCREEN), 1);
+        take_all(hwnd, WM_APP_EVENT);
+        unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn repaints_are_paced_and_banded() {
+        let t0 = Instant::now();
+        assert_eq!(frame_wait(t0, None), Duration::ZERO);
+        assert_eq!(frame_wait(t0 + Duration::from_millis(3), Some(t0)), FRAME_GAP - Duration::from_millis(3));
+        assert_eq!(frame_wait(t0 + FRAME_GAP * 2, Some(t0)), Duration::ZERO);
+        // Smoothed down to a quarter of the width and height; a thumbnail drops pixels instead.
+        assert!(smooth(3840 * 2160, 1920 * 1080) && smooth(7680 * 4320, 1920 * 1080));
+        assert!(!smooth(8192 * 8192, 1920 * 1080) && !smooth(7680 * 4320, 1280 * 720));
+        assert!(smooth(1280 * 720, 2560 * 1440));
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let image = rect(0, 40, 1920, 1120);
+        // A small update is painted whole.
+        assert!(paint_band(&rect(10, 50, 200, 300), &image, 3840 * 2160, 1920 * 1080).is_none());
+        // A whole 4K frame in a 1080p window: four source pixels behind each window pixel.
+        let all = rect(0, 0, 1920, 1200);
+        let (band, rest) = paint_band(&all, &image, 3840 * 2160, 1920 * 1080).unwrap();
+        let rows = PAINT_PIXELS / (1920 * 4);
+        assert_eq!((band.left, band.top, band.right, band.bottom), (0, 40, 1920, 40 + rows as i32));
+        assert_eq!((rest.left, rest.top, rest.right, rest.bottom), (0, 40 + rows as i32, 1920, 1120));
+        // Band after band makes its way down to the bottom.
+        let (mut update, mut bands) = (all, 0);
+        while let Some((_, rest)) = paint_band(&update, &image, 3840 * 2160, 1920 * 1080) {
+            (update, bands) = (rest, bands + 1);
+        }
+        assert_eq!(bands, 2, "three paints");
+        // Enlarging costs per window pixel; a band is at least one row; nothing outside the image.
+        assert!(paint_band(&rect(0, 40, 1920, 1120), &image, 1280 * 720, 1920 * 1080).is_none());
+        let narrow = rect(0, 0, 4, 4);
+        let (band, _) = paint_band(&narrow, &narrow, 8192 * 8192, 16).unwrap();
+        assert_eq!(band.bottom - band.top, 1);
+        assert!(paint_band(&rect(0, 0, 1920, 40), &image, 3840 * 2160, 1920 * 1080).is_none());
     }
 
     #[test]

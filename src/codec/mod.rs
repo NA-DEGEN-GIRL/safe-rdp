@@ -536,6 +536,8 @@ pub fn parse_header(payload: &[u8]) -> Result<TilesHeader> {
 pub struct Decoder {
     decomp: Decompressor,
     scratch: Vec<u8>,
+    /// The rects the latest `apply` drew.
+    rects: Vec<Rect>,
 }
 
 impl Drop for Decoder {
@@ -546,7 +548,12 @@ impl Drop for Decoder {
 
 impl Decoder {
     pub fn new() -> Result<Decoder> {
-        Ok(Decoder { decomp: Decompressor::new()?, scratch: Vec::new() })
+        Ok(Decoder { decomp: Decompressor::new()?, scratch: Vec::new(), rects: Vec::new() })
+    }
+
+    /// The rects the latest successful `apply` drew, in order.
+    pub fn rects(&self) -> &[Rect] {
+        &self.rects
     }
 
     /// Applies the rects in `payload` to `fb` (BGRA, `fbw*fbh*4`); returns the dirty bounding box.
@@ -561,6 +568,7 @@ impl Decoder {
         let count = r.u16()?;
         let mut bbox: Option<Rect> = None;
         let mut area = 0;
+        self.rects.clear();
         for _ in 0..count {
             let (x, y, w, h) = (r.u16()? as usize, r.u16()? as usize, r.u16()? as usize, r.u16()? as usize);
             let enc = r.u8()?;
@@ -599,6 +607,7 @@ impl Decoder {
                 ENC_LOSSY => lossy::decode(data, fb, fbw, nr)?,
                 _ => bail!("unknown tile encoding {enc}"),
             }
+            self.rects.push(nr);
             bbox = Some(match bbox {
                 None => nr,
                 Some(b) => {
