@@ -483,7 +483,9 @@ fn use_korean() -> bool {
 // ---------------------------------------------------------------------------------------
 // Options, settings and command lines (no Win32 here)
 
-#[derive(Clone, Debug, PartialEq)]
+/// Everything starts off. As on the command line, clipboard and sound are the viewer's own
+/// opt-in: that the host must allow them too protects nothing from a host that wants them.
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ConnectOptions {
     fullscreen: bool,
     clipboard: bool,
@@ -496,22 +498,6 @@ struct ConnectOptions {
     scale: usize,
     /// Index into `MONITOR_ARGS`.
     monitor: usize,
-}
-
-impl Default for ConnectOptions {
-    fn default() -> Self {
-        // Clipboard and sound only work when the host allows them too.
-        ConnectOptions {
-            fullscreen: false,
-            clipboard: true,
-            audio: true,
-            privacy: false,
-            view_only: false,
-            quality: 0,
-            scale: 0,
-            monitor: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -528,6 +514,10 @@ impl Default for ShareOptions {
         ShareOptions { control: true, clipboard: false, files: false, audio: false, privacy: false }
     }
 }
+
+/// Format of `launcher.txt`. Before version 2 the viewer's clipboard and sound started ticked
+/// and were saved back after every connection, so an "on" saved then was not the user's choice.
+const SETTINGS_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Settings {
@@ -567,9 +557,14 @@ impl Settings {
     fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
         let mut fields = s.fields();
+        let mut version = 0;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             let (k, v) = (k.trim(), v.trim());
+            if k == "version" {
+                version = v.parse().unwrap_or(0);
+                continue;
+            }
             match fields.iter_mut().find(|(name, _)| *name == k).map(|(_, f)| f) {
                 Some(Field::Flag(b)) => match v {
                     "1" => **b = true,
@@ -584,12 +579,17 @@ impl Settings {
                 None => {}
             }
         }
+        if version < SETTINGS_VERSION {
+            // Saved by a launcher that ticked them by default: back to off until the user opts in.
+            let d = ConnectOptions::default();
+            (s.connect.clipboard, s.connect.audio) = (d.clipboard, d.audio);
+        }
         s
     }
 
     fn format(&self) -> String {
         let mut copy = self.clone();
-        let mut out = String::new();
+        let mut out = format!("version={SETTINGS_VERSION}\n");
         for (name, f) in copy.fields() {
             let v = match f {
                 Field::Flag(b) => usize::from(*b),
@@ -3575,14 +3575,40 @@ mod tests {
         let text = s.format();
         assert!(text.contains("quality=2\n") && text.contains("share_control=0\n"));
         assert_eq!(Settings::parse(&text), s);
+        // What the user ticks is kept.
+        s.connect.clipboard = true;
+        s.connect.audio = true;
+        assert_eq!(Settings::parse(&s.format()), s);
     }
 
     #[test]
     fn settings_ignore_garbage() {
-        let s = Settings::parse("quality=9\nscale=-1\nmonitor=x\nfullscreen=yes\nunknown=1\nno equals sign\n clipboard = 0 \r\n");
+        let s = Settings::parse(
+            "version=2\nquality=9\nscale=-1\nmonitor=x\nfullscreen=yes\nunknown=1\nno equals sign\n clipboard = 1 \r\n",
+        );
         let mut want = Settings::default();
-        want.connect.clipboard = false;
+        want.connect.clipboard = true;
         assert_eq!(s, want);
+    }
+
+    #[test]
+    fn viewer_clipboard_and_sound_are_opt_in() {
+        let d = Settings::default();
+        assert!(!d.connect.clipboard && !d.connect.audio);
+        assert_eq!(viewer_args("100.64.0.2", &d.connect), ["connect", "100.64.0.2"]);
+        // Earlier launchers ticked both by default and saved them after every connection: such
+        // a file turns them off again, and keeps everything else.
+        let old = "fullscreen=1\nclipboard=1\nsound=1\nprivacy=1\nquality=1\nshare_clipboard=1\n";
+        let s = Settings::parse(old);
+        assert!(!s.connect.clipboard && !s.connect.audio);
+        assert!(s.connect.fullscreen && s.connect.privacy && s.share.clipboard);
+        assert_eq!(s.connect.quality, 1);
+        assert_eq!(Settings::parse(&format!("version=1\n{old}")), s);
+        // Saved since: kept, in any order.
+        let s = Settings::parse(&format!("{old}version=2\n"));
+        assert!(s.connect.clipboard && s.connect.audio);
+        assert!(Settings::parse(&format!("version=3\n{old}")).connect.clipboard);
+        assert!(d.format().starts_with("version=2\n"));
     }
 
     #[test]
