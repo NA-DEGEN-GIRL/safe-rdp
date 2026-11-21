@@ -8,7 +8,10 @@
 //!
 //! The viewer and host run as separate processes, so a failure there never takes the launcher
 //! down. The host is tied to the launcher with a kill-on-close job object: sharing never
-//! outlives the window that shows it. Plain Win32 with common controls v6 (`app.manifest`),
+//! outlives the window that shows it. A host keeps the key it started with, so sharing is
+//! restarted (or stopped) whenever the stored key changes, here or in a terminal; the service
+//! keeps the key it was installed with, so changing the key here offers to reinstall it.
+//! Plain Win32 with common controls v6 (`app.manifest`),
 //! per-monitor DPI aware; Korean strings when the Windows display language is Korean.
 //!
 //! Testing knobs: `SAFE_RDP_LANG=en|ko` picks the language; `SAFE_RDP_LAUNCHER_BIND=<ip>` and
@@ -60,8 +63,11 @@ const INSTANCE_MUTEX: &str = "Local\\SafeRdpLauncher";
 const WM_APP_EVENT: u32 = WM_APP + 1;
 const TIMER_DEVICES: usize = 1;
 const TIMER_CLIPBOARD: usize = 2;
+const TIMER_KEY: usize = 3;
 const DEVICE_REFRESH_MS: u32 = 15_000;
 const CLIPBOARD_CLEAR_MS: u32 = 60_000;
+/// How often a running host's key is compared with the stored one.
+const KEY_CHECK_MS: u32 = 2_000;
 /// Time a stopping host gets to exit on its own (its stdin is closed first) before it is killed.
 const STOP_GRACE: Duration = Duration::from_millis(1500);
 const MAX_LOG_LINES: usize = 400;
@@ -164,6 +170,7 @@ struct Text {
     st_off: &'static str,
     st_off_detail: &'static str,
     st_service_detail: &'static str,
+    st_service_old_key: &'static str,
     st_starting: &'static str,
     st_wait_ts: &'static str,
     st_wait_ts_detail: &'static str,
@@ -191,6 +198,8 @@ struct Text {
     svc_status: fn(&str) -> String,
     /// checking, not installed, running, stopped, changing, unknown
     svc_states: [&'static str; 6],
+    /// Added to the status while the service still holds a replaced or removed key.
+    svc_key_status: &'static str,
     svc_install_confirm: &'static str,
     svc_uninstall_confirm: &'static str,
     svc_failed: fn(u32) -> String,
@@ -216,6 +225,13 @@ struct Text {
     key_warning: &'static str,
     replace_confirm: &'static str,
     remove_confirm: &'static str,
+    /// Added to the two above when the service is installed.
+    key_svc_confirm: &'static str,
+    svc_key_offer: &'static str,
+    svc_key_remove_offer: &'static str,
+    svc_key_note: &'static str,
+    sharing_restarts: &'static str,
+    sharing_stopped: &'static str,
     created: &'static str,
     imported: &'static str,
     same_key: &'static str,
@@ -282,6 +298,7 @@ static EN: Text = Text {
     st_off: "Not sharing",
     st_off_detail: "Start sharing to let your other PCs connect. Only devices in your tailnet that have the same key can.",
     st_service_detail: "The background service is running, so this PC can already be reached.",
+    st_service_old_key: "The background service is running and still accepts the previous key. Reinstall or remove it below.",
     st_starting: "Starting…",
     st_wait_ts: "Waiting for Tailscale…",
     st_wait_ts_detail: "Sharing begins as soon as Tailscale is connected.",
@@ -302,14 +319,16 @@ static EN: Text = Text {
     activity: "Activity",
     svc_title: "Background service",
     svc_text: "Install the service to reach this PC at any time: it starts with Windows, works before anyone signs in, on the \
-               lock screen and on UAC prompts, and uses the key of the account that installs it. Connections are only \
-               accepted from Tailscale addresses. Installing or removing it needs administrator rights.",
+               lock screen and on UAC prompts, and uses the key of the account that installs it (reinstall it after changing \
+               that key). Connections are only accepted from Tailscale addresses. Installing or removing it needs administrator \
+               rights.",
     svc_sas: "Allow sending Ctrl+Alt+Del (changes a Windows policy)",
     install: "Install",
     reinstall: "Reinstall",
     uninstall: "Remove",
     svc_status: |s| format!("Status: {s}"),
     svc_states: ["checking…", "not installed", "running", "stopped", "changing…", "unknown"],
+    svc_key_status: " · still uses the previous key",
     svc_install_confirm: "Install the background service?\n\nIt uses the key stored for your account and the options ticked under \
                           \"While sharing, allow\". Windows will ask for administrator permission.",
     svc_uninstall_confirm: "Remove the background service?\n\nAfterwards this PC can only be reached while you share it from this window.",
@@ -337,8 +356,20 @@ static EN: Text = Text {
     copy: "Copy",
     hide: "Hide",
     key_warning: "Enter it on your other PC (Key → Import). A copy is removed from the clipboard after one minute.",
-    replace_confirm: "Replace the stored key?\n\nYour other PCs cannot connect to or from this PC until they have the new key.",
-    remove_confirm: "Remove the key from this PC?\n\nThis PC cannot connect or share until you create or import a key again.",
+    replace_confirm: "Replace the stored key?\n\nYour other PCs cannot connect to or from this PC until they have the new key. If this \
+                      window is sharing this PC, sharing restarts with the new key and anyone connected is disconnected.",
+    remove_confirm: "Remove the key from this PC?\n\nThis PC cannot connect or share until you create or import a key again. If this \
+                     window is sharing this PC, sharing stops and anyone connected is disconnected.",
+    key_svc_confirm: "\n\nThe background service is installed and keeps the key it was installed with until it is reinstalled or \
+                      removed; you can do that next.",
+    svc_key_offer: "The background service keeps the key it was installed with, so it still accepts the previous key.\n\nReinstall \
+                    it now with the new key and the options ticked under \"While sharing, allow\"? Windows will ask for \
+                    administrator permission.",
+    svc_key_remove_offer: "The background service keeps the key it was installed with, so it still accepts the removed key.\n\n\
+                           Remove the background service now? Windows will ask for administrator permission.",
+    svc_key_note: " The background service still accepts the previous key until you reinstall or remove it (Share this PC).",
+    sharing_restarts: " Sharing restarts with the new key; anyone connected was disconnected.",
+    sharing_stopped: " Sharing from this window stopped; anyone connected was disconnected.",
     created: "New key created. Copy it to your other PC.",
     imported: "Key imported. This PC can now connect to and share with your other PCs.",
     same_key: "This key is already stored.",
@@ -405,6 +436,7 @@ static KO: Text = Text {
     st_off: "공유하지 않음",
     st_off_detail: "공유를 시작하면 다른 PC에서 접속할 수 있습니다. 같은 키를 가진 내 tailnet 기기만 접속할 수 있습니다.",
     st_service_detail: "백그라운드 서비스가 실행 중이므로 이미 이 PC에 접속할 수 있습니다.",
+    st_service_old_key: "백그라운드 서비스가 실행 중이며 아직 이전 키로도 접속할 수 있습니다. 아래에서 다시 설치하거나 제거하세요.",
     st_starting: "시작하는 중…",
     st_wait_ts: "Tailscale 연결을 기다리는 중…",
     st_wait_ts_detail: "Tailscale이 연결되면 바로 공유를 시작합니다.",
@@ -425,13 +457,15 @@ static KO: Text = Text {
     activity: "활동 기록",
     svc_title: "백그라운드 서비스",
     svc_text: "서비스를 설치하면 언제든 이 PC에 접속할 수 있습니다. Windows와 함께 시작되고, 로그인 전 화면·잠금 화면·UAC 창에서도 \
-               동작하며, 설치한 계정의 키를 사용합니다. 접속은 Tailscale 주소에서만 받습니다. 설치와 제거에는 관리자 권한이 필요합니다.",
+               동작하며, 설치한 계정의 키를 사용합니다 (키를 바꾼 뒤에는 다시 설치하세요). 접속은 Tailscale 주소에서만 받습니다. \
+               설치와 제거에는 관리자 권한이 필요합니다.",
     svc_sas: "Ctrl+Alt+Del 보내기 허용 (Windows 정책 변경)",
     install: "설치",
     reinstall: "다시 설치",
     uninstall: "제거",
     svc_status: |s| format!("상태: {s}"),
     svc_states: ["확인 중…", "설치 안 됨", "실행 중", "중지됨", "변경 중…", "알 수 없음"],
+    svc_key_status: " · 아직 이전 키 사용",
     svc_install_confirm: "백그라운드 서비스를 설치할까요?\n\n현재 계정에 저장된 키와 '공유 중 허용할 기능'에서 선택한 옵션을 사용합니다. \
                           Windows가 관리자 권한을 요청합니다.",
     svc_uninstall_confirm: "백그라운드 서비스를 제거할까요?\n\n이후에는 이 창에서 공유하는 동안에만 이 PC에 접속할 수 있습니다.",
@@ -458,8 +492,19 @@ static KO: Text = Text {
     copy: "복사",
     hide: "숨기기",
     key_warning: "다른 PC의 '보안 키 → 가져오기'에 입력하세요. 복사한 키는 1분 뒤 클립보드에서 지워집니다.",
-    replace_confirm: "저장된 키를 바꿀까요?\n\n다른 PC에도 새 키를 넣기 전까지는 서로 접속할 수 없습니다.",
-    remove_confirm: "이 PC에서 키를 삭제할까요?\n\n다시 키를 만들거나 가져오기 전까지 접속하거나 공유할 수 없습니다.",
+    replace_confirm: "저장된 키를 바꿀까요?\n\n다른 PC에도 새 키를 넣기 전까지는 서로 접속할 수 없습니다. 이 창에서 공유 중이면 새 \
+                      키로 공유를 다시 시작하며 접속한 사람의 연결이 끊어집니다.",
+    remove_confirm: "이 PC에서 키를 삭제할까요?\n\n다시 키를 만들거나 가져오기 전까지 접속하거나 공유할 수 없습니다. 이 창에서 공유 \
+                     중이면 공유가 중지되고 접속한 사람의 연결이 끊어집니다.",
+    key_svc_confirm: "\n\n백그라운드 서비스가 설치되어 있으며, 다시 설치하거나 제거하기 전까지 설치할 때의 키를 계속 사용합니다. \
+                      이어서 바로 다시 설치하거나 제거할 수 있습니다.",
+    svc_key_offer: "백그라운드 서비스는 설치할 때의 키를 계속 사용하므로 아직 이전 키로도 접속할 수 있습니다.\n\n지금 새 키와 \
+                    '공유 중 허용할 기능'에서 선택한 옵션으로 다시 설치할까요? Windows가 관리자 권한을 요청합니다.",
+    svc_key_remove_offer: "백그라운드 서비스는 설치할 때의 키를 계속 사용하므로 아직 삭제한 키로도 접속할 수 있습니다.\n\n지금 \
+                           백그라운드 서비스를 제거할까요? Windows가 관리자 권한을 요청합니다.",
+    svc_key_note: " 백그라운드 서비스는 다시 설치하거나 제거하기 전까지 이전 키로도 접속을 받습니다 ('이 PC 공유').",
+    sharing_restarts: " 공유를 새 키로 다시 시작합니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
+    sharing_stopped: " 이 창의 공유를 중지했습니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
     created: "새 키를 만들었습니다. 다른 PC로 복사하세요.",
     imported: "키를 가져왔습니다. 이제 다른 PC와 서로 접속하고 공유할 수 있습니다.",
     same_key: "이미 저장된 키입니다.",
@@ -484,7 +529,9 @@ fn use_korean() -> bool {
 // ---------------------------------------------------------------------------------------
 // Options, settings and command lines (no Win32 here)
 
-#[derive(Clone, Debug, PartialEq)]
+/// Everything starts off. As on the command line, clipboard and sound are the viewer's own
+/// opt-in: that the host must allow them too protects nothing from a host that wants them.
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ConnectOptions {
     fullscreen: bool,
     clipboard: bool,
@@ -497,22 +544,6 @@ struct ConnectOptions {
     scale: usize,
     /// Index into `MONITOR_ARGS`.
     monitor: usize,
-}
-
-impl Default for ConnectOptions {
-    fn default() -> Self {
-        // Clipboard and sound only work when the host allows them too.
-        ConnectOptions {
-            fullscreen: false,
-            clipboard: true,
-            audio: true,
-            privacy: false,
-            view_only: false,
-            quality: 0,
-            scale: 0,
-            monitor: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -529,6 +560,10 @@ impl Default for ShareOptions {
         ShareOptions { control: true, clipboard: false, files: false, audio: false, privacy: false }
     }
 }
+
+/// Format of `launcher.txt`. Before version 2 the viewer's clipboard and sound started ticked
+/// and were saved back after every connection, so an "on" saved then was not the user's choice.
+const SETTINGS_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Settings {
@@ -568,9 +603,14 @@ impl Settings {
     fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
         let mut fields = s.fields();
+        let mut version = 0;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             let (k, v) = (k.trim(), v.trim());
+            if k == "version" {
+                version = v.parse().unwrap_or(0);
+                continue;
+            }
             match fields.iter_mut().find(|(name, _)| *name == k).map(|(_, f)| f) {
                 Some(Field::Flag(b)) => match v {
                     "1" => **b = true,
@@ -585,12 +625,17 @@ impl Settings {
                 None => {}
             }
         }
+        if version < SETTINGS_VERSION {
+            // Saved by a launcher that ticked them by default: back to off until the user opts in.
+            let d = ConnectOptions::default();
+            (s.connect.clipboard, s.connect.audio) = (d.clipboard, d.audio);
+        }
         s
     }
 
     fn format(&self) -> String {
         let mut copy = self.clone();
-        let mut out = String::new();
+        let mut out = format!("version={SETTINGS_VERSION}\n");
         for (name, f) in copy.fields() {
             let v = match f {
                 Field::Flag(b) => usize::from(*b),
@@ -819,6 +864,32 @@ fn write_data_file(name: &str, text: &str) {
     }
 }
 
+/// The stored key file as it is (a DPAPI blob, never the key itself), to notice that it changed.
+fn read_key_file() -> std::io::Result<Vec<u8>> {
+    let path = keystore::user_key_path().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut data = Vec::new();
+    // A key file is a few hundred bytes; never read more than enough to see that it differs.
+    std::fs::File::open(path)?.take(64 << 10).read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// Whether the key file now differs from `started`, the file a running host was started with.
+/// A file caught empty in the middle of being rewritten, or one that cannot be read right now,
+/// is no change (yet); a file that is gone is.
+fn key_file_changed(started: &[u8], now: &std::io::Result<Vec<u8>>) -> bool {
+    match now {
+        Ok(data) => !data.is_empty() && data.as_slice() != started,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// After the stored key changed: the host generation whose exit should start sharing again,
+/// now with the stored key. That is the host running now, or the one an earlier restart still
+/// waits for; with no key left, nothing restarts.
+fn restart_after_key_change(present: bool, running: Option<u64>, pending: Option<u64>) -> Option<u64> {
+    if present { running.or(pending) } else { None }
+}
+
 /// Overwrites a string's bytes (for key text) before it is freed.
 fn wipe_string(s: &mut str) {
     // SAFETY: zero bytes are valid UTF-8.
@@ -838,6 +909,8 @@ enum Event {
     Devices(Result<tailscale::Status, Problem>),
     HostLine(u64, String),
     HostExit(u64),
+    /// A host that `stop_sharing` stopped has exited (its port is free again).
+    HostStopped(u64),
     Viewer { host: String, entry: String, update: ViewerUpdate },
     Service(Result<String, String>),
     ServiceDone { install: bool, result: Result<u32, Elevation> },
@@ -1275,6 +1348,11 @@ struct State {
     recent: Vec<String>,
     host: Option<HostProc>,
     host_gen: u64,
+    /// The key file as it was just before the running host read it (`read_key_file`).
+    host_key: Option<Vec<u8>>,
+    /// Start sharing again once the host of this generation has exited: it was stopped because
+    /// the stored key changed.
+    restart_after: Option<u64>,
     host_error: Option<String>,
     listen: Option<String>,
     share: Share,
@@ -1282,6 +1360,13 @@ struct State {
     log: VecDeque<String>,
     svc: Svc,
     svc_busy: bool,
+    /// The installed service still holds a key that has since been replaced or removed here
+    /// (it keeps the key it was installed with).
+    svc_old_key: bool,
+    /// Counts changes of the stored key.
+    key_gen: u64,
+    /// `key_gen` when the running service install or removal started.
+    svc_op_gen: u64,
 }
 
 struct Controls {
@@ -1882,6 +1967,8 @@ fn run_window() -> crate::util::Result<()> {
             recent: Vec::new(),
             host: None,
             host_gen: 0,
+            host_key: None,
+            restart_after: None,
             host_error: None,
             listen: None,
             share: Share::Off,
@@ -1889,6 +1976,9 @@ fn run_window() -> crate::util::Result<()> {
             log: VecDeque::new(),
             svc: Svc::Checking,
             svc_busy: false,
+            svc_old_key: false,
+            key_gen: 0,
+            svc_op_gen: 0,
         }),
         notifier: Notifier { tx, hwnd: hwnd as usize },
         rx,
@@ -2756,6 +2846,7 @@ impl App {
                 }
             }
             TIMER_CLIPBOARD => self.clear_clipboard(),
+            TIMER_KEY => self.check_key_file(),
             _ => {}
         }
     }
@@ -2767,6 +2858,7 @@ impl App {
                 Event::Devices(r) => self.on_devices(r),
                 Event::HostLine(generation, line) => log_changed |= self.on_host_line(generation, &line),
                 Event::HostExit(generation) => self.on_host_exit(generation),
+                Event::HostStopped(generation) => self.on_host_stopped(generation),
                 Event::Viewer { host, entry, update } => self.on_viewer(&host, &entry, update),
                 Event::Service(r) => self.on_service_status(r),
                 Event::ServiceDone { install, result } => self.on_service_done(install, result),
@@ -3036,6 +3128,8 @@ impl App {
         if !self.require_key() {
             return;
         }
+        // Read before the host reads the key: any change after this is then noticed.
+        let key_file = read_key_file().ok();
         let opts = self.share_options();
         let bind = std::env::var("SAFE_RDP_LAUNCHER_BIND").ok();
         let port = std::env::var("SAFE_RDP_LAUNCHER_PORT").ok();
@@ -3056,6 +3150,7 @@ impl App {
             let mut st = self.st.borrow_mut();
             st.host_gen += 1;
             st.host = Some(HostProc { child, stdin });
+            st.host_key = key_file;
             st.host_error = None;
             st.listen = None;
             st.share = Share::Starting;
@@ -3076,27 +3171,121 @@ impl App {
         if !read {
             self.stop_sharing();
         }
+        unsafe { SetTimer(self.hwnd, TIMER_KEY, KEY_CHECK_MS, None) };
         self.show_log();
         self.update_share_ui();
         self.save_settings();
     }
 
     fn stop_sharing(&self) {
-        let proc = {
+        let (proc, generation) = {
             let mut st = self.st.borrow_mut();
             let p = st.host.take();
             if p.is_some() {
                 st.share = Share::Stopping;
             }
-            p
+            (p, st.host_gen)
         };
+        let n = self.notifier.clone();
         if let Some(p) = proc
-            && !spawn_thread("host-stop", move || stop_host(p, STOP_GRACE))
+            && !spawn_thread("host-stop", move || {
+                stop_host(p, STOP_GRACE);
+                n.send(Event::HostStopped(generation));
+            })
         {
             // Could not stop it in the background: the job object still ends it with us.
-            self.st.borrow_mut().share = Share::Failed("cannot stop the host process".into());
+            let mut st = self.st.borrow_mut();
+            st.share = Share::Failed("cannot stop the host process".into());
+            // Nothing reports when it has exited, so a restart could not wait for its port.
+            st.restart_after = None;
         }
         self.update_share_ui();
+    }
+
+    /// A host that `stop_sharing` stopped has exited: starts the one a key change asked for.
+    fn on_host_stopped(&self, generation: u64) {
+        let restart = {
+            let mut st = self.st.borrow_mut();
+            if st.restart_after != Some(generation) {
+                return;
+            }
+            st.restart_after = None;
+            // Unless sharing was started again meanwhile, or no usable key is left.
+            st.host.is_none() && st.key == KeyState::Present
+        };
+        if restart {
+            self.start_sharing();
+            if self.st.borrow().host.is_some() {
+                self.log_note("the stored key changed: sharing restarted with the new key");
+            }
+        }
+    }
+
+    /// The stored key was replaced or removed (`present`: a key is stored now), here or
+    /// elsewhere. A host keeps the key it started with, so the one this window runs is stopped,
+    /// and started again with the new key once it has exited; `svc`: the service is installed,
+    /// and it keeps the key it was installed with. True if sharing restarts or stopped.
+    fn key_replaced(&self, present: bool, svc: bool) -> bool {
+        let (running, restarts) = {
+            let mut st = self.st.borrow_mut();
+            let running = st.host.is_some().then_some(st.host_gen);
+            st.restart_after = restart_after_key_change(present, running, st.restart_after);
+            st.key_gen += 1;
+            st.svc_old_key |= svc;
+            (running.is_some(), st.restart_after.is_some())
+        };
+        if running {
+            if !present {
+                self.log_note("the stored key was removed or cannot be read: sharing stopped");
+            }
+            self.stop_sharing();
+        }
+        self.update_service_ui();
+        self.update_share_ui();
+        running || restarts
+    }
+
+    /// While a host runs: notices that the stored key changed behind this window's back (for
+    /// example `safe-rdp keygen --force` or `key forget` in a terminal) and restarts or stops
+    /// sharing, since the host keeps the key it started with.
+    fn check_key_file(&self) {
+        let changed = {
+            let st = self.st.borrow();
+            match (&st.host, &st.host_key) {
+                (None, _) => None,
+                (Some(_), Some(started)) => Some(key_file_changed(started, &read_key_file())),
+                (Some(_), None) => Some(false),
+            }
+        };
+        match changed {
+            None => unsafe {
+                KillTimer(self.hwnd, TIMER_KEY);
+            },
+            Some(false) => {}
+            Some(true) => {
+                // A key on display is no longer the stored one.
+                if self.st.borrow().key_shown {
+                    self.hide_key();
+                }
+                let key = key_state();
+                self.st.borrow_mut().key = key;
+                self.update_key_ui();
+                let svc = self.service_installed();
+                self.key_replaced(key == KeyState::Present, svc);
+            }
+        }
+    }
+
+    /// Adds a line of the window's own to the activity log.
+    fn log_note(&self, line: &str) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.log.push_back(line.into());
+            while st.log.len() > MAX_LOG_LINES {
+                st.log.pop_front();
+            }
+        }
+        self.show_log();
     }
 
     /// Returns true if the log changed.
@@ -3181,6 +3370,7 @@ impl App {
             let me = st.me.as_ref().map(|d| d.name.as_str());
             let running = st.host.is_some();
             let (status, tone, detail): (String, Tone, String) = match &st.share {
+                Share::Off if st.svc == Svc::Running && st.svc_old_key => (t.st_off.into(), Tone::Warn, t.st_service_old_key.into()),
                 Share::Off if st.svc == Svc::Running => (t.st_off.into(), Tone::Muted, t.st_service_detail.into()),
                 Share::Off => (t.st_off.into(), Tone::Muted, t.st_off_detail.into()),
                 Share::Starting => (t.st_starting.into(), Tone::Accent, String::new()),
@@ -3232,16 +3422,30 @@ impl App {
                 Ok("starting" | "stopping") => Svc::Changing,
                 _ => Svc::Unknown,
             };
+            if st.svc == Svc::NotInstalled {
+                st.svc_old_key = false;
+            }
         }
         self.update_service_ui();
         self.update_share_ui();
     }
 
+    /// Whether the background service is installed, asked now rather than taken from the last
+    /// refresh, since it keeps the key it was installed with whatever happens to the stored one.
+    /// When that cannot be told, anything but a known "not installed" counts.
+    fn service_installed(&self) -> bool {
+        let r = service::status().map_err(|e| e.to_string());
+        let known = r.as_deref().ok().map(|s| s != "not installed");
+        self.on_service_status(r);
+        let st = self.st.borrow();
+        st.svc_busy || known.unwrap_or(st.svc != Svc::NotInstalled)
+    }
+
     fn update_service_ui(&self) {
         let t = self.t;
-        let (svc, busy) = {
+        let (svc, busy, old_key) = {
             let st = self.st.borrow();
-            (st.svc, st.svc_busy)
+            (st.svc, st.svc_busy, st.svc_old_key)
         };
         let (index, tone) = match svc {
             Svc::Checking => (0, Tone::Muted),
@@ -3251,8 +3455,15 @@ impl App {
             Svc::Changing => (4, Tone::Accent),
             Svc::Unknown => (5, Tone::Muted),
         };
-        self.say(self.c.s_svc_status, &(t.svc_status)(t.svc_states[index]), tone);
         let installed = matches!(svc, Svc::Running | Svc::Stopped | Svc::Changing);
+        let mut status = (t.svc_status)(t.svc_states[index]);
+        let tone = if old_key && installed {
+            status.push_str(t.svc_key_status);
+            Tone::Warn
+        } else {
+            tone
+        };
+        self.say(self.c.s_svc_status, &status, tone);
         set_text(self.c.s_install, if installed { t.reinstall } else { t.install });
         enable(self.c.s_install, !busy && svc != Svc::Checking);
         enable(self.c.s_uninstall, !busy && installed);
@@ -3267,6 +3478,12 @@ impl App {
         if !confirm(self.hwnd, if install { t.svc_install_confirm } else { t.svc_uninstall_confirm }) {
             return;
         }
+        self.run_service_op(install);
+    }
+
+    /// Installs the service (with the options ticked under "While sharing, allow") or removes
+    /// it, in an elevated process.
+    fn run_service_op(&self, install: bool) {
         let args = if install {
             service_install_args(&self.share_options(), is_checked(self.c.s_sas))
         } else {
@@ -3277,6 +3494,7 @@ impl App {
             let mut st = self.st.borrow_mut();
             st.svc_busy = true;
             st.svc = Svc::Changing;
+            st.svc_op_gen = st.key_gen;
         }
         self.update_service_ui();
         let (owner, n, params) = (self.hwnd as usize, self.notifier.clone(), args.join(" "));
@@ -3288,7 +3506,24 @@ impl App {
 
     fn on_service_done(&self, install: bool, result: Result<u32, Elevation>) {
         let t = self.t;
-        self.st.borrow_mut().svc_busy = false;
+        let done = matches!(result, Ok(0));
+        let old_key = {
+            let mut st = self.st.borrow_mut();
+            st.svc_busy = false;
+            // Installed (with the stored key) or removed after the last key change.
+            if done && st.svc_op_gen == st.key_gen {
+                st.svc_old_key = false;
+            }
+            st.svc_old_key
+        };
+        if old_key && !done {
+            // Say so where the key was changed, too.
+            let mut text = get_text(self.c.k_msg);
+            if !text.contains(t.svc_key_note.trim()) {
+                text.push_str(t.svc_key_note);
+            }
+            self.key_message(text.trim_start(), Tone::Warn);
+        }
         match result {
             Ok(0) | Err(Elevation::Cancelled) => {}
             Ok(code) => {
@@ -3351,9 +3586,47 @@ impl App {
         self.layout();
     }
 
+    /// Asks before the stored key is replaced or removed; `svc`: the service is installed.
+    fn confirm_key_change(&self, text: &str, svc: bool) -> bool {
+        confirm(self.hwnd, &format!("{text}{}", if svc { self.t.key_svc_confirm } else { "" }))
+    }
+
+    /// After this window replaced or removed the stored key: restarts or stops the host it runs
+    /// and, when the service is installed (`svc`), offers to reinstall it with the new key or to
+    /// remove it, right away. Reports `done` (in `tone`) along with what that changed.
+    fn key_changed_here(&self, done: &str, tone: Tone, svc: bool) {
+        let t = self.t;
+        let present = self.st.borrow().key == KeyState::Present;
+        let (mut text, mut tone) = (done.to_string(), tone);
+        if self.key_replaced(present, svc) {
+            text.push_str(if present { t.sharing_restarts } else { t.sharing_stopped });
+        }
+        if svc && !self.offer_service_update(present) {
+            text.push_str(t.svc_key_note);
+            tone = Tone::Warn;
+        }
+        self.key_message(&text, tone);
+    }
+
+    /// Offers to reinstall the service with the stored key (`present`) or to remove it. True if
+    /// that is now under way.
+    fn offer_service_update(&self, present: bool) -> bool {
+        let t = self.t;
+        if self.st.borrow().svc_busy {
+            return false;
+        }
+        let offer = if present { t.svc_key_offer } else { t.svc_key_remove_offer };
+        if message_box(self.hwnd, offer, MB_YESNO | MB_ICONWARNING) != IDYES {
+            return false;
+        }
+        self.run_service_op(present);
+        true
+    }
+
     fn create_key(&self) {
         let t = self.t;
-        if self.st.borrow().key == KeyState::Present && !confirm(self.hwnd, t.replace_confirm) {
+        let svc = self.service_installed();
+        if self.st.borrow().key == KeyState::Present && !self.confirm_key_change(t.replace_confirm, svc) {
             return;
         }
         let saved = keys::generate().and_then(|k| keystore::save_user_key(&k).map(|_| k));
@@ -3364,7 +3637,7 @@ impl App {
                 self.display_key(&text);
                 wipe_string(&mut text);
                 self.update_key_ui();
-                self.key_message(t.created, Tone::Good);
+                self.key_changed_here(t.created, Tone::Good, svc);
             }
             Err(e) => self.key_message(&(t.key_failed)(&e.to_string()), Tone::Bad),
         }
@@ -3455,15 +3728,14 @@ impl App {
             }
         };
         let current = self.st.borrow().key;
-        if current == KeyState::Present {
-            if keystore::load_user_key().is_ok_and(|old| old.0 == k.0) {
-                scrub_edit(h);
-                self.key_message(t.same_key, Tone::Muted);
-                return;
-            }
-            if !confirm(self.hwnd, t.replace_confirm) {
-                return;
-            }
+        if current == KeyState::Present && keystore::load_user_key().is_ok_and(|old| old.0 == k.0) {
+            scrub_edit(h);
+            self.key_message(t.same_key, Tone::Muted);
+            return;
+        }
+        let svc = self.service_installed();
+        if current == KeyState::Present && !self.confirm_key_change(t.replace_confirm, svc) {
+            return;
         }
         match keystore::save_user_key(&k) {
             Ok(_) => {
@@ -3473,7 +3745,7 @@ impl App {
                     self.hide_key();
                 }
                 self.update_key_ui();
-                self.key_message(t.imported, Tone::Good);
+                self.key_changed_here(t.imported, Tone::Good, svc);
             }
             Err(e) => self.key_message(&(t.key_failed)(&e.to_string()), Tone::Bad),
         }
@@ -3481,7 +3753,8 @@ impl App {
 
     fn remove_key(&self) {
         let t = self.t;
-        if !confirm(self.hwnd, t.remove_confirm) {
+        let svc = self.service_installed();
+        if !self.confirm_key_change(t.remove_confirm, svc) {
             return;
         }
         if self.st.borrow().key_shown {
@@ -3491,7 +3764,11 @@ impl App {
             Ok(removed) => {
                 self.st.borrow_mut().key = key_state();
                 self.update_key_ui();
-                self.key_message(if removed { t.removed } else { t.nothing_removed }, Tone::Muted);
+                if removed {
+                    self.key_changed_here(t.removed, Tone::Muted, svc);
+                } else {
+                    self.key_message(t.nothing_removed, Tone::Muted);
+                }
             }
             Err(e) => self.key_message(&(t.key_failed)(&e.to_string()), Tone::Bad),
         }
@@ -3576,14 +3853,66 @@ mod tests {
         let text = s.format();
         assert!(text.contains("quality=2\n") && text.contains("share_control=0\n"));
         assert_eq!(Settings::parse(&text), s);
+        // What the user ticks is kept.
+        s.connect.clipboard = true;
+        s.connect.audio = true;
+        assert_eq!(Settings::parse(&s.format()), s);
     }
 
     #[test]
     fn settings_ignore_garbage() {
-        let s = Settings::parse("quality=9\nscale=-1\nmonitor=x\nfullscreen=yes\nunknown=1\nno equals sign\n clipboard = 0 \r\n");
+        let s = Settings::parse(
+            "version=2\nquality=9\nscale=-1\nmonitor=x\nfullscreen=yes\nunknown=1\nno equals sign\n clipboard = 1 \r\n",
+        );
         let mut want = Settings::default();
-        want.connect.clipboard = false;
+        want.connect.clipboard = true;
         assert_eq!(s, want);
+    }
+
+    #[test]
+    fn viewer_clipboard_and_sound_are_opt_in() {
+        let d = Settings::default();
+        assert!(!d.connect.clipboard && !d.connect.audio);
+        assert_eq!(viewer_args("100.64.0.2", &d.connect), ["connect", "100.64.0.2"]);
+        // Earlier launchers ticked both by default and saved them after every connection: such
+        // a file turns them off again, and keeps everything else.
+        let old = "fullscreen=1\nclipboard=1\nsound=1\nprivacy=1\nquality=1\nshare_clipboard=1\n";
+        let s = Settings::parse(old);
+        assert!(!s.connect.clipboard && !s.connect.audio);
+        assert!(s.connect.fullscreen && s.connect.privacy && s.share.clipboard);
+        assert_eq!(s.connect.quality, 1);
+        assert_eq!(Settings::parse(&format!("version=1\n{old}")), s);
+        // Saved since: kept, in any order.
+        let s = Settings::parse(&format!("{old}version=2\n"));
+        assert!(s.connect.clipboard && s.connect.audio);
+        assert!(Settings::parse(&format!("version=3\n{old}")).connect.clipboard);
+        assert!(d.format().starts_with("version=2\n"));
+    }
+
+    #[test]
+    fn key_file_changes_are_noticed() {
+        use std::io::{Error, ErrorKind};
+        let started = b"blob-1".to_vec();
+        assert!(!key_file_changed(&started, &Ok(started.clone())));
+        assert!(key_file_changed(&started, &Ok(b"blob-2".to_vec())));
+        assert!(key_file_changed(&started, &Ok(b"blob-".to_vec())));
+        // Removed: the host must stop.
+        assert!(key_file_changed(&started, &Err(Error::from(ErrorKind::NotFound))));
+        // Caught while it is being rewritten, or locked for a moment: look again later.
+        assert!(!key_file_changed(&started, &Ok(Vec::new())));
+        assert!(!key_file_changed(&started, &Err(Error::from(ErrorKind::PermissionDenied))));
+    }
+
+    #[test]
+    fn sharing_restarts_after_the_host_that_had_the_old_key() {
+        // Running host 4: restart once it has exited.
+        assert_eq!(restart_after_key_change(true, Some(4), None), Some(4));
+        // Host 4 is still stopping after an earlier change: it is the one to wait for.
+        assert_eq!(restart_after_key_change(true, None, Some(4)), Some(4));
+        assert_eq!(restart_after_key_change(true, None, None), None);
+        // No key left: nothing restarts, not even a restart that was already waiting.
+        assert_eq!(restart_after_key_change(false, Some(5), None), None);
+        assert_eq!(restart_after_key_change(false, None, Some(4)), None);
     }
 
     #[test]
@@ -3825,8 +4154,17 @@ mod tests {
     #[test]
     fn both_languages_are_complete() {
         for t in [&EN, &KO] {
-            for s in [t.connect, t.start, t.stop, t.create, t.import, t.key_warning, t.svc_text] {
+            for s in [t.connect, t.start, t.stop, t.create, t.import, t.key_warning, t.svc_text, t.st_service_old_key, t.svc_key_offer] {
                 assert!(!s.is_empty());
+            }
+            // Added to other text.
+            for s in [t.svc_key_status, t.svc_key_note, t.sharing_restarts, t.sharing_stopped] {
+                assert!(s.starts_with(' ') && s.len() > 1, "{s}");
+            }
+            assert!(t.key_svc_confirm.starts_with("\n\n") && t.svc_key_remove_offer.contains("\n\n"));
+            // Wrapped source lines leave no runs of spaces behind.
+            for s in [t.replace_confirm, t.remove_confirm, t.key_svc_confirm, t.svc_key_offer, t.svc_key_remove_offer, t.svc_text] {
+                assert!(!s.contains("  "), "{s}");
             }
             assert!((t.ts_count)(1, 3).contains('1') && (t.ts_count)(1, 3).contains('3'));
             assert!((t.connect_failed)("pc", "boom").contains("pc") && (t.connect_failed)("pc", "boom").contains("boom"));
