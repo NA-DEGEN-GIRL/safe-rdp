@@ -2047,12 +2047,11 @@ const VK_MASK: u16 = 0xe8;
 /// kbd.h `SCANCODE_SIMULATED`: Windows sets it on keys it makes up itself, such as the Left
 /// Ctrl it adds to Right Alt on layouts with AltGr (scancode 0x21D).
 const SCANCODE_SIMULATED: u16 = 0x200;
+/// That Left Ctrl's scancode, under which it is tracked (`routes`).
+const ALTGR_CTRL: u16 = 0x1d | SCANCODE_SIMULATED;
 /// `dwExtraInfo` of the keys the viewer presses on the local system itself (`press_locally`);
 /// the hook lets them through. Another program sending it only keeps its keys on this PC.
 const LOCAL_TAG: usize = 0x5352_4450;
-/// Re-install the keyboard hook every 5 s (in ticks): Windows silently drops a low-level hook
-/// that once misses its time limit, for instance while this thread paints a very large frame.
-const REHOOK_TICKS: u32 = 20;
 /// Key events the hook remembers, so the window can tell which messages it handled already.
 const HOOK_SEEN: usize = 32;
 
@@ -2103,6 +2102,7 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool, hooked: bool)
     }
     // Not a key of the keyboard (AltGr's Left Ctrl): the host's own layout decides what AltGr
     // does, and as Ctrl here it would turn AltGr+Enter and AltGr+End into the hotkeys.
+    let scan = if up && vk == VK_LCONTROL { left_ctrl_release(&lock(&app.routes), scan) } else { scan };
     let simulated = is_simulated(vk, scan);
     let bit = if simulated { 0 } else { mod_bit(vk) };
     if bit != 0 {
@@ -2256,6 +2256,50 @@ fn sided_vk(vk: u16, scan: u16, extended: bool) -> u16 {
     }
 }
 
+/// Whether a Ctrl key message (`msg`, `wp`, `lp`, stamped `time`) is the Left Ctrl Windows
+/// makes up for AltGr. The message has no room for its scancode's mark (`SCANCODE_SIMULATED`)
+/// that the hook sees, but Windows posts it right before the Right Alt it goes with, for the
+/// press and for the release, with the same time: it is told by the message after it (`next`),
+/// as browsers do.
+fn altgr_ctrl(msg: u32, wp: WPARAM, lp: LPARAM, time: u32, next: &MSG) -> bool {
+    let up = |m: u32| matches!(m, WM_KEYUP | WM_SYSKEYUP);
+    let extended = |lp: LPARAM| (lp >> 24) & 1 != 0;
+    wp as u16 == VK_CONTROL
+        && !extended(lp)
+        && matches!(next.message, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
+        && up(next.message) == up(msg)
+        && next.wParam as u16 == VK_MENU
+        && extended(next.lParam)
+        && next.time == time
+}
+
+/// `altgr_ctrl` with the next key message in the queue, which stays there.
+fn altgr_ctrl_queued(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, time: u32) -> bool {
+    if wp as u16 != VK_CONTROL {
+        return false;
+    }
+    let mut next = MSG::default();
+    // Input only: a character an earlier key left in the queue (posted, so it comes before
+    // input) is not the message after this one.
+    let queued = unsafe { PeekMessageW(&mut next, hwnd, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE | PM_QS_INPUT) != 0 };
+    queued && altgr_ctrl(msg, wp, lp, time, &next)
+}
+
+/// The scancode a Left Ctrl release is handled under, `ALTGR_CTRL` for AltGr's. A window
+/// message cannot always tell the two apart (`altgr_ctrl`: the Right Alt may not be queued
+/// yet), so a release whose own press is not held goes where the other one's went: a press
+/// taken for a real Left Ctrl went to the host and set Ctrl here, and is released as one.
+fn left_ctrl_release(routes: &HashMap<u16, bool>, scan: u16) -> u16 {
+    let held = |key: u16| routes.contains_key(&key);
+    if is_simulated(VK_LCONTROL, scan) {
+        if !held(scan) && held(VK_LCONTROL) { modifier_scan(VK_LCONTROL).0 } else { scan }
+    } else if !held(VK_LCONTROL) && held(ALTGR_CTRL) {
+        ALTGR_CTRL
+    } else {
+        scan
+    }
+}
+
 /// Whether a key event goes to the local desktop instead of the host. In a window the
 /// Windows key with everything pressed while it is held (Win+D, Win+E, ...) and Alt+Tab /
 /// Alt+Esc / Ctrl+Esc stay local (like mstsc's default); in full screen everything goes to
@@ -2291,8 +2335,9 @@ fn mod_bit(vk: u16) -> u8 {
 /// The low-level keyboard hook. It belongs to the UI thread, which also runs its callback.
 struct KeyHook {
     handle: HHOOK,
-    ticks: u32,
-    /// A key message reached the window without passing the hook: Windows dropped it.
+    /// A key message reached the window without passing the hook: Windows dropped it (it does
+    /// so silently once the hook misses its time limit, for instance while this thread paints a
+    /// very large frame), or it could not be installed.
     missed: bool,
     /// Times of the latest key events the hook saw (`KBDLLHOOKSTRUCT::time`, which is what
     /// `GetMessageTime` reports for the message of an event it passed on).
@@ -2301,7 +2346,7 @@ struct KeyHook {
 
 impl KeyHook {
     const fn new() -> KeyHook {
-        KeyHook { handle: null_mut(), ticks: 0, missed: false, seen: VecDeque::new() }
+        KeyHook { handle: null_mut(), missed: false, seen: VecDeque::new() }
     }
 
     fn saw(&mut self, time: u32) {
@@ -2319,14 +2364,12 @@ impl KeyHook {
         seen
     }
 
-    /// Counts a timer tick: true when the hook is to be re-installed.
+    /// At a timer tick: true when the hook is to be installed afresh, which is only after it
+    /// missed a key. Not while it works: a fresh hook goes ahead of those other programs
+    /// installed since (a key remapper, a screen reader), and a key held across the switch
+    /// would meet a different hook for its press and for its release.
     fn due(&mut self) -> bool {
-        self.ticks += 1;
-        if !self.missed && self.ticks < REHOOK_TICKS {
-            return false;
-        }
-        self.ticks = 0;
-        true
+        std::mem::take(&mut self.missed)
     }
 }
 
@@ -2367,7 +2410,7 @@ fn unhook_keyboard(app: &App) {
     }
 }
 
-/// From the timer: re-installs the hook every few seconds, and at once when it missed a key.
+/// From the timer: installs the hook afresh once it missed a key (`KeyHook::due`).
 fn rehook(app: &App) {
     if with_hook(KeyHook::due) == Some(true) {
         hook_keyboard(app);
@@ -2387,8 +2430,16 @@ unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
             if let (false, Some(app)) = (ours, APP.get()) {
                 let hwnd = app.hwnd();
                 if !hwnd.is_null() && GetForegroundWindow() == hwnd {
-                    let up = k.flags & LLKHF_UP != 0;
-                    if on_key(app, k.vkCode as u16, k.scanCode as u16, k.flags & LLKHF_EXTENDED != 0, up, true) {
+                    let (vk, up) = (k.vkCode as u16, k.flags & LLKHF_UP != 0);
+                    // The release of a key held down on this PC goes on to it as well, whatever
+                    // went to the host: its press reached the system past the hook (Windows had
+                    // dropped it, or the key went down before the viewer had the focus), and
+                    // swallowed, it would leave the key down here. Its message is then known as
+                    // passed on (`KeyHook::handled`), so the host still gets it once. (In the
+                    // hook, the key's state is still the one before this event.)
+                    if on_key(app, vk, k.scanCode as u16, k.flags & LLKHF_EXTENDED != 0, up, true)
+                        && !(up && GetAsyncKeyState(vk as i32) < 0)
+                    {
                         return 1;
                     }
                 }
@@ -2588,13 +2639,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 // Handled here unless the low-level hook saw the key first and passed it on:
                 // every key while there is no hook (it could not be installed, or Windows
-                // dropped it until the next re-install), with system shortcuts staying local.
-                let seen = app.hook_active.load(Ordering::SeqCst)
-                    && with_hook(|h| h.handled(GetMessageTime() as u32)).unwrap_or(false);
+                // dropped it), with system shortcuts staying local. Such a key has the hook
+                // installed afresh at the next tick.
+                let time = GetMessageTime() as u32;
+                let seen = with_hook(|h| h.handled(time)).unwrap_or(false) && app.hook_active.load(Ordering::SeqCst);
                 if !seen && GetForegroundWindow() == hwnd {
-                    let scan = ((lp >> 16) & 0xff) as u16;
+                    let mut scan = ((lp >> 16) & 0xff) as u16;
                     let extended = (lp >> 24) & 1 != 0;
                     let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                    // Named as the hook names it, so that it is no Ctrl here or on the host.
+                    if altgr_ctrl_queued(hwnd, msg, wp, lp, time) {
+                        scan |= SCANCODE_SIMULATED;
+                    }
                     if on_key(app, sided_vk(wp as u16, scan, extended), scan, extended, up, false) {
                         return 0;
                     }
@@ -3036,6 +3092,65 @@ mod tests {
         assert!(r.is_empty());
     }
 
+    fn key_msg(message: u32, vk: u16, scan: isize, extended: bool, time: u32) -> MSG {
+        let lp = 1 | scan << 16 | (extended as isize) << 24;
+        MSG { message, wParam: vk as WPARAM, lParam: lp, time, ..MSG::default() }
+    }
+
+    #[test]
+    fn altgr_left_ctrl_is_told_from_window_messages_too() {
+        let altgr = |c: &MSG, next: &MSG| altgr_ctrl(c.message, c.wParam, c.lParam, c.time, next);
+        let ctrl = key_msg(WM_KEYDOWN, VK_CONTROL, 0x1d, false, 100);
+        let ralt = key_msg(WM_KEYDOWN, VK_MENU, 0x38, true, 100);
+        assert!(altgr(&ctrl, &ralt));
+        assert!(altgr(&key_msg(WM_KEYUP, VK_CONTROL, 0x1d, false, 300), &key_msg(WM_SYSKEYUP, VK_MENU, 0x38, true, 300)));
+        // A real Left Ctrl: a Right Alt at another time, a Left Alt, a release, a character
+        // (Ctrl+R is 0x12, VK_MENU's number) or nothing after it.
+        assert!(!altgr(&ctrl, &key_msg(WM_KEYDOWN, VK_MENU, 0x38, true, 101)));
+        assert!(!altgr(&ctrl, &key_msg(WM_SYSKEYDOWN, VK_MENU, 0x38, false, 100)));
+        assert!(!altgr(&ctrl, &key_msg(WM_KEYUP, VK_MENU, 0x38, true, 100)));
+        assert!(!altgr(&ctrl, &key_msg(WM_CHAR, VK_MENU, 0x13, true, 100)));
+        assert!(!altgr(&ctrl, &MSG::default()));
+        // Right Ctrl never is.
+        assert!(!altgr(&key_msg(WM_KEYDOWN, VK_CONTROL, 0x1d, true, 100), &ralt));
+        // Named as the hook names it: Left Ctrl with the marked scancode, which is not tracked
+        // as Ctrl and never sent.
+        let scan = 0x1d | SCANCODE_SIMULATED;
+        assert_eq!((sided_vk(VK_CONTROL, scan, false), scan), (VK_LCONTROL, ALTGR_CTRL));
+        assert!(is_simulated(VK_LCONTROL, scan));
+    }
+
+    #[test]
+    fn a_left_ctrl_is_released_where_its_press_went() {
+        let mut r = HashMap::new();
+        // AltGr pressed while the hook was gone and released through a fresh one: its Left
+        // Ctrl is the same key both times, and nothing is left held.
+        assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
+        assert_eq!(left_ctrl_release(&r, ALTGR_CTRL), ALTGR_CTRL);
+        assert!(!stays_local(false, MOD_ALT, ALTGR_CTRL, true, true, &mut r));
+        assert!(r.is_empty());
+        // Its press taken for a real Left Ctrl (the Right Alt was not queued yet) went to the
+        // host and set Ctrl: the release, told apart, still lets go of it there and here.
+        assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
+        let scan = left_ctrl_release(&r, ALTGR_CTRL);
+        assert!(!is_simulated(VK_LCONTROL, scan));
+        assert_eq!((scan, mod_bit(VK_LCONTROL)), (0x1d, MOD_CTRL));
+        assert!(!stays_local(false, 0, VK_LCONTROL, true, true, &mut r));
+        assert!(r.is_empty());
+        // And the other way round: its release taken for a real one ends its own route.
+        assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
+        assert_eq!(left_ctrl_release(&r, 0x1d), ALTGR_CTRL);
+        assert!(!stays_local(false, 0, ALTGR_CTRL, true, true, &mut r));
+        assert!(r.is_empty());
+        // Both held (a real Left Ctrl with AltGr), or neither: each release is what it says.
+        assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, ALTGR_CTRL, false, true, &mut r));
+        assert_eq!(left_ctrl_release(&r, ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_release(&r, 0x1d), 0x1d);
+        assert_eq!(left_ctrl_release(&HashMap::new(), ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_release(&HashMap::new(), 0x1d), 0x1d);
+    }
+
     #[test]
     fn a_dropped_hook_is_noticed_and_replaced() {
         let mut h = KeyHook::new();
@@ -3046,12 +3161,31 @@ mod tests {
         assert!(h.handled(HOOK_SEEN as u32 + 4));
         assert!(h.handled(5));
         assert!(!h.missed);
-        // Re-installed every REHOOK_TICKS ticks ...
-        assert!((1..REHOOK_TICKS).all(|_| !h.due()));
-        assert!(h.due());
-        // ... and at the next tick once a key reached the window without passing it.
+        // A working hook stays, however long: a fresh one would go ahead of other programs'.
+        assert!((0..1000).all(|_| !h.due()));
+        // At the next tick once a key reached the window without passing it, and only then.
         assert!(!h.handled(4));
         assert!(h.missed && h.due());
+        assert!(!h.due());
+        // A hook that could not be installed is tried again once a key comes.
+        let mut none = KeyHook::new();
+        assert!(!none.due());
+        assert!(!none.handled(7) && none.due());
+    }
+
+    #[test]
+    fn a_key_held_across_a_new_hook_is_released_once() {
+        let (mut h, mut r, a) = (KeyHook::new(), HashMap::new(), b'A' as u16);
+        // Pressed while the hook was gone: sent to the host from the window message.
+        assert!(!h.handled(500));
+        assert!(!stays_local(false, 0, a, false, true, &mut r));
+        assert!(h.due());
+        // Released through the fresh hook: sent once more, as the release (and passed on to
+        // this PC, which saw the press). Its message then is no key of its own.
+        h.saw(900);
+        assert!(!stays_local(false, 0, a, true, true, &mut r));
+        assert!(h.handled(900) && !h.due());
+        assert!(r.is_empty());
     }
 
     #[test]
