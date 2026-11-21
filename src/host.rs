@@ -1170,6 +1170,13 @@ impl Input {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the receiving thread ended"),
             }
+            // Releases Windows refused, an earlier session's included, go out soon after the
+            // input desktop is back, also when the viewer sends no input. Not only on the
+            // timeout: a viewer's frame acks may keep it from ever coming.
+            #[cfg(windows)]
+            if !self.host.opts.view_only {
+                self.inj.retry_owed();
+            }
         }
         Ok(())
     }
