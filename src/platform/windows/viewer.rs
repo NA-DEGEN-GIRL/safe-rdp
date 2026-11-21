@@ -1706,11 +1706,18 @@ fn create_window(target: &str, opts: &ViewerOptions) -> Result<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(null());
         let class = wide("SafeRdpViewer");
+        // Shared icons from the resource build.rs embeds (null in test builds: the default icon).
+        let icon = |metric| {
+            let size = GetSystemMetrics(metric);
+            LoadImageW(hinst, super::launcher::ICON_ID as usize as *const u16, IMAGE_ICON, size, size, LR_SHARED) as HICON
+        };
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst,
+            hIcon: icon(SM_CXICON),
+            hIconSm: icon(SM_CXSMICON),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: GetStockObject(BLACK_BRUSH),
             lpszClassName: class.as_ptr(),

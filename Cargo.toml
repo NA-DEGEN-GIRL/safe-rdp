@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Minimal, hardened remote desktop for Windows and Linux over Tailscale"
 license = "MIT"
+repository = "https://github.com/NA-DEGEN-GIRL/safe-rdp"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61.2"

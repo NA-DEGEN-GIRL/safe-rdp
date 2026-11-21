@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- The same drawing as the application icon in build.rs; keep the two in step. -->
+  <defs>
+    <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="256" y2="256">
+      <stop offset="0" stop-color="#3a78f0"/>
+      <stop offset="1" stop-color="#1a3a9e"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e3eeff"/>
+      <stop offset="1" stop-color="#b4ceff"/>
+    </linearGradient>
+    <clipPath id="clip">
+      <rect x="7.68" y="7.68" width="240.64" height="240.64" rx="53.76"/>
+    </clipPath>
+  </defs>
+  <rect x="7.68" y="7.68" width="240.64" height="240.64" rx="53.76" fill="url(#tile)"/>
+  <g fill="#fff">
+    <rect x="25.6" y="40.96" width="179.2" height="112.64" rx="17.92"/>
+    <rect x="87.04" y="153.6" width="30.72" height="20.48"/>
+    <rect x="56.32" y="174.08" width="92.16" height="15.36" rx="7.68"/>
+  </g>
+  <rect x="37.12" y="52.48" width="156.16" height="89.6" rx="7.68" fill="url(#screen)"/>
+  <circle cx="185.6" cy="180.48" r="61.44" fill="url(#tile)" clip-path="url(#clip)"/>
+  <circle cx="185.6" cy="180.48" r="49.92" fill="#12b981"/>
+  <path d="M175.29 178.44V169.68a10.31 10.31 0 0 1 20.62 0v8.76" fill="none" stroke="#fff" stroke-width="5.84"/>
+  <rect x="166.14" y="176.49" width="38.91" height="28.02" rx="3.89" fill="#fff"/>
+  <circle cx="185.6" cy="188.26" r="3.89" fill="#12b981"/>
+  <rect x="184.04" y="188.26" width="3.11" height="9.25" fill="#12b981"/>
+</svg>
