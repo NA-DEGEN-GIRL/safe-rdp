@@ -60,7 +60,8 @@ HOST OPTIONS:
   --quality <q>            Picture quality for viewers that do not ask: lossless | balanced | low
   --clipboard              Allow text clipboard sharing (viewer must opt in too)
   --files                  Allow file transfer (uploads to Downloads/safe-rdp, pulling copied files)
-  --transfer-dir <path>    Save uploads here instead
+  --transfer-dir <path>    Save uploads here instead (service: a full path; uploads are saved
+                           there as the user signed in on the console)
   --audio                  Allow viewers to listen to this machine's sound
   --privacy                Allow viewers to blank this screen and lock local input while connected
   --view-only              Ignore keyboard and mouse from viewers
@@ -129,10 +130,12 @@ fn dispatch(args: &[String]) -> Result<()> {
             let mut cli = parse_host(rest, true)?;
             if cli.opts.files && cli.opts.transfer_dir.is_none() {
                 // SYSTEM's own Downloads folder is no place for uploads: keep them in the
-                // service's admin-only directory unless --transfer-dir says otherwise.
+                // service's admin-only directory unless --transfer-dir says otherwise (that
+                // folder is then written as the user signed in on the console).
                 let dir = dir.join("incoming");
                 std::fs::create_dir_all(&dir)?;
                 cli.opts.transfer_dir = Some(dir);
+                cli.opts.own_transfer_dir = true;
             }
             let key = keystore::load_service_key()?;
             platform::init_process();
@@ -155,6 +158,10 @@ fn dispatch(args: &[String]) -> Result<()> {
                 let cli = parse_host(&rest[1..], true)?;
                 if cli.key_file.is_some() {
                     bail!("--key-file is not supported for the service; it uses this user's stored key");
+                }
+                // The agent runs in System32: a relative folder would end up there.
+                if cli.opts.transfer_dir.as_deref().is_some_and(|d| !d.is_absolute()) {
+                    bail!("--transfer-dir needs a full path (such as D:\\Uploads) for the service");
                 }
                 platform::service::install(&rest[1..], cli.opts.port, cli.opts.sas)
             }
