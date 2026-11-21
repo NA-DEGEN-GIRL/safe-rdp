@@ -188,8 +188,24 @@ fn stop_and_wait(svc: &Sc) {
     }
 }
 
+/// netsh.exe in System32, by full path: a bare name is looked up in this executable's own folder
+/// first, and install/uninstall run elevated from wherever the user keeps safe-rdp.exe.
+fn netsh_path() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; MAX_PATH as usize];
+    // The length without the terminator, or the size needed if the buffer is too small.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    dir.is_absolute().then(|| dir.join("netsh.exe"))
+}
+
 fn netsh(args: &[&str]) -> bool {
-    std::process::Command::new("netsh")
+    let Some(exe) = netsh_path() else { return false };
+    std::process::Command::new(exe)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -725,6 +741,14 @@ mod tests {
         let (name, rest) = agent_stop_event(rest);
         assert_eq!((name, rest.len()), (None, 5));
         assert_eq!(agent_stop_event(&["--stop-event".to_string()]).0, None);
+    }
+
+    #[test]
+    fn netsh_is_run_from_system32_by_full_path() {
+        // Never by bare name, which finds a netsh.exe beside this executable first.
+        let p = netsh_path().expect("system directory");
+        assert!(p.is_absolute() && p.is_file(), "{}", p.display());
+        assert!(p.to_string_lossy().to_ascii_lowercase().ends_with(r"\system32\netsh.exe"), "{}", p.display());
     }
 
     /// What the stand-in agent of `start_agent` may open: SYSTEM and the owner (this test).
