@@ -15,9 +15,10 @@
 //!   a transfer whose file cannot be marked is refused;
 //! * nothing is saved into the folder the running program was started from, where Windows looks
 //!   for its DLLs (and the programs it runs) first;
-//! * a file is accepted only if its volume keeps a reserve of free space (`reserve`) once it and
-//!   every other transfer still arriving are complete; a transfer that would eat into the reserve
-//!   after all (something else filled the disk) is stopped.
+//! * a file is accepted only if its volume keeps a reserve of free space (`Reserve`: a small one,
+//!   a larger one for the service's own folder) once it and every other transfer still arriving
+//!   are complete; a transfer that would eat into the reserve after all (something else filled
+//!   the disk) is stopped.
 
 use crate::bail;
 use crate::crypto::Sha256;
@@ -36,9 +37,13 @@ const PART_PREFIX: &str = ".srdp-";
 const PART_SUFFIX: &str = ".part";
 /// A partial file nothing wrote to for this long was left behind by a crash or a kill.
 const STALE_PART: Duration = Duration::from_secs(24 * 3600);
-/// Free space a received file never takes from its volume: 5% of it, within these bounds.
-const MIN_RESERVE: u64 = 1 << 30;
-const MAX_RESERVE: u64 = 16 << 30;
+/// Free space a received file never takes from its volume (`Reserve`): 1% of it, within these
+/// bounds...
+const MIN_RESERVE: u64 = 256 << 20;
+const MAX_RESERVE: u64 = 2 << 30;
+/// ...or 5% of it, within these, for the service's own folder.
+const MIN_SERVICE_RESERVE: u64 = 1 << 30;
+const MAX_SERVICE_RESERVE: u64 = 16 << 30;
 /// How often (in bytes received) a transfer looks at the free space again.
 const SPACE_RECHECK: u64 = 64 << 20;
 
@@ -111,22 +116,54 @@ fn is_program_dir(dir: &Path) -> bool {
     std::fs::canonicalize(dir).is_ok_and(|d| d == exe_dir)
 }
 
-/// Free space a received file must leave on a volume of `total` bytes.
-fn reserve(total: u64) -> u64 {
-    (total / 20).clamp(MIN_RESERVE, MAX_RESERVE)
+/// The refusal for a folder `is_program_dir` found, saying what to do about it. Its reader may
+/// sit at the other computer (a refused upload), hence "the program receiving this file".
+fn program_dir_refusal(dir: &Path) -> String {
+    let exe = std::env::current_exe().ok().and_then(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let exe = exe.unwrap_or_else(|| "safe-rdp".into());
+    format!(
+        "the {exe} receiving this file runs from {}, where received files are saved, and nothing is saved next to a running program: move {exe} to another folder (the Desktop, for example), start it there and try again",
+        dir.display()
+    )
+}
+
+/// Free space a received file must leave on its volume.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reserve {
+    /// 1% of the volume, 256 MiB to 2 GiB: no transfer runs a disk full, and a small file still
+    /// fits on a nearly full one while gigabytes are free.
+    Ordinary,
+    /// 5% of the volume, 1 to 16 GiB: the service's own folder, on the system volume, which a
+    /// viewer can fill even at the sign-in screen and only an administrator can empty.
+    ServiceFolder,
+}
+
+impl Reserve {
+    /// Bytes to leave free on a volume of `total` bytes.
+    fn of(self, total: u64) -> u64 {
+        match self {
+            Reserve::Ordinary => (total / 100).clamp(MIN_RESERVE, MAX_RESERVE),
+            Reserve::ServiceFolder => (total / 20).clamp(MIN_SERVICE_RESERVE, MAX_SERVICE_RESERVE),
+        }
+    }
 }
 
 /// Whether `need` more bytes fit on a volume with `space` = (free, total) bytes and still leave
-/// its reserve; otherwise the reserve. A volume that reports no size cannot be judged.
-fn room(space: Option<(u64, u64)>, need: u64) -> std::result::Result<(), u64> {
+/// `keep`; otherwise the bytes `keep` asks for. A volume that reports no size cannot be judged.
+fn room(space: Option<(u64, u64)>, need: u64, keep: Reserve) -> std::result::Result<(), u64> {
     match space {
-        Some((free, total)) if total > 0 && free.saturating_sub(need) < reserve(total) => Err(reserve(total)),
+        Some((free, total)) if total > 0 && free.saturating_sub(need) < keep.of(total) => Err(keep.of(total)),
         _ => Ok(()),
     }
 }
 
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+/// `bytes` for a message: whole MiB below 1 GiB, GiB to one decimal from there.
+fn amount(bytes: u64) -> String {
+    if bytes < 1 << 30 {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+    }
 }
 
 /// Free and total bytes of the volume that holds the open file `f`, by its handle: whatever its
@@ -215,6 +252,8 @@ pub struct Incoming {
     promised: u64,
     /// `received` at which the free space is looked at again.
     next_check: u64,
+    /// Free space the volume keeps while this file arrives.
+    reserve: Reserve,
     dir: PathBuf,
     part: PathBuf,
     file: Option<File>,
@@ -222,7 +261,13 @@ pub struct Incoming {
 }
 
 impl Incoming {
+    /// Starts receiving `name` into `dir`, leaving the volume the `Ordinary` reserve.
     pub fn begin(dir: &Path, id: u32, size: u64, name: &str) -> Result<Incoming> {
+        Incoming::begin_keeping(dir, id, size, name, Reserve::Ordinary)
+    }
+
+    /// `begin`, leaving the volume `reserve` instead.
+    pub fn begin_keeping(dir: &Path, id: u32, size: u64, name: &str, reserve: Reserve) -> Result<Incoming> {
         if !valid_file_name(name) {
             bail!("invalid file name");
         }
@@ -234,7 +279,7 @@ impl Incoming {
             bail!("file too large");
         }
         if is_program_dir(dir) {
-            bail!("{} holds the running safe-rdp program, and nothing received is saved next to it; run safe-rdp from another folder", dir.display());
+            bail!("{}", program_dir_refusal(dir));
         }
         remove_stale_parts(dir);
         let mut r = [0u8; 8];
@@ -264,14 +309,15 @@ impl Incoming {
             received: 0,
             promised: size,
             next_check: SPACE_RECHECK,
+            reserve,
             dir: dir.to_path_buf(),
             part,
             file: Some(file),
             hash,
         };
         // On the volume the part is on, whatever `dir` leads to.
-        if let Err(keep) = room(space(inc.file.as_ref().unwrap()), need) {
-            bail!("not enough disk space for {name} ({size} bytes): at least {} has to stay free", gib(keep));
+        if let Err(keep) = room(space(inc.file.as_ref().unwrap()), need, reserve) {
+            bail!("not enough disk space for {name} ({size} bytes): at least {} has to stay free", amount(keep));
         }
         // Marked before any data arrives (dropping `inc` on failure removes the part): the stream
         // moves with the data on rename, whatever name the file ends up with.
@@ -295,8 +341,8 @@ impl Incoming {
         if self.received >= self.next_check {
             self.next_check = self.received.saturating_add(SPACE_RECHECK);
             // Something else may have filled the disk since this transfer was admitted.
-            if let Err(keep) = room(space(self.file.as_ref().unwrap()), PROMISED.load(Ordering::SeqCst)) {
-                bail!("{}: stopped, the disk is nearly full (at least {} has to stay free)", self.name, gib(keep));
+            if let Err(keep) = room(space(self.file.as_ref().unwrap()), PROMISED.load(Ordering::SeqCst), self.reserve) {
+                bail!("{}: stopped, the disk is nearly full (at least {} has to stay free)", self.name, amount(keep));
             }
         }
         Ok(())
@@ -632,18 +678,21 @@ mod tests {
         let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
         let parts = |d: &Path| names(d).into_iter().filter(|n| n.starts_with(PART_PREFIX)).count();
         let before = parts(&exe_dir);
+        // The refusal names the program and its folder, and says what to do, on either computer.
+        let exe = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
         let e = refused(&exe_dir, "dxgi.dll");
-        assert!(e.contains("running safe-rdp program"), "{e}");
+        let what = format!("the {exe} receiving this file runs from {}", exe_dir.display());
+        assert!(e.starts_with(&what) && e.contains(&format!("move {exe} to another folder")), "{e}");
         // However the folder is spelled.
         let other = exe_dir.join("..").join(exe_dir.file_name().unwrap()).join(".");
-        assert!(refused(&other, "netsh.exe").contains("running safe-rdp program"));
+        assert!(refused(&other, "netsh.exe").contains("next to a running program"));
         assert_eq!(parts(&exe_dir), before, "a partial file was created");
         // Or reached through a link.
         #[cfg(windows)]
         {
             let t = tmpdir("exe-link");
             if junction(&t.join("j"), &exe_dir) {
-                assert!(refused(&t.join("j"), "wtsapi32.dll").contains("running safe-rdp program"));
+                assert!(refused(&t.join("j"), "wtsapi32.dll").contains("next to a running program"));
                 std::fs::remove_dir(t.join("j")).unwrap();
             }
             let _ = std::fs::remove_dir_all(&t);
@@ -657,20 +706,63 @@ mod tests {
     #[test]
     fn received_files_leave_a_reserve() {
         const G: u64 = 1 << 30;
-        assert_eq!(reserve(0), G);
-        assert_eq!(reserve(4 * G), G);
-        assert_eq!(reserve(100 * G), 5 * G);
-        assert_eq!(reserve(100_000 * G), 16 * G);
-        // 100 GiB volume with 10 GiB free: 5 GiB fit, one byte more does not.
-        assert_eq!(room(Some((10 * G, 100 * G)), 5 * G), Ok(()));
-        assert_eq!(room(Some((10 * G, 100 * G)), 5 * G + 1), Err(5 * G));
+        const M: u64 = 1 << 20;
+        let (any, service) = (Reserve::Ordinary, Reserve::ServiceFolder);
+        assert_eq!(any.of(0), 256 * M);
+        assert_eq!(any.of(16 * G), 256 * M);
+        assert_eq!(any.of(100 * G), G);
+        assert_eq!(any.of(238 * G), 2 * G);
+        assert_eq!(any.of(100_000 * G), 2 * G);
+        assert_eq!(service.of(0), G);
+        assert_eq!(service.of(4 * G), G);
+        assert_eq!(service.of(100 * G), 5 * G);
+        assert_eq!(service.of(100_000 * G), 16 * G);
+        // 100 GiB volume with 10 GiB free: 9 GiB fit, one byte more does not; in the service's
+        // own folder 5 GiB do.
+        assert_eq!(room(Some((10 * G, 100 * G)), 9 * G, any), Ok(()));
+        assert_eq!(room(Some((10 * G, 100 * G)), 9 * G + 1, any), Err(G));
+        assert_eq!(room(Some((10 * G, 100 * G)), 5 * G, service), Ok(()));
+        assert_eq!(room(Some((10 * G, 100 * G)), 5 * G + 1, service), Err(5 * G));
+        // A small file still fits on a nearly full disk while gigabytes are free: a 238 GiB laptop
+        // disk with 9 GiB left, a 119 GiB tablet with 5, a 20 GiB server with 900 MiB.
+        assert_eq!(room(Some((9 * G, 238 * G)), 20 << 10, any), Ok(()));
+        assert_eq!(room(Some((5 * G, 119 * G)), 50 << 10, any), Ok(()));
+        assert_eq!(room(Some((900 * M, 20 * G)), M, any), Ok(()));
         // Already below the reserve: not even an empty file.
-        assert_eq!(room(Some((4 * G, 100 * G)), 0), Err(5 * G));
-        assert_eq!(room(Some((G, 100 * G)), u64::MAX), Err(5 * G));
+        assert_eq!(room(Some((G / 2, 100 * G)), 0, any), Err(G));
+        assert_eq!(room(Some((4 * G, 100 * G)), 0, service), Err(5 * G));
+        assert_eq!(room(Some((G, 100 * G)), u64::MAX, any), Err(G));
         // A volume that reports nothing cannot be judged.
-        assert_eq!(room(None, u64::MAX), Ok(()));
-        assert_eq!(room(Some((0, 0)), u64::MAX), Ok(()));
-        assert_eq!(gib(5 * G + G / 2), "5.5 GiB");
+        assert_eq!(room(None, u64::MAX, service), Ok(()));
+        assert_eq!(room(Some((0, 0)), u64::MAX, service), Ok(()));
+        assert_eq!(amount(5 * G + G / 2), "5.5 GiB");
+        assert_eq!(amount(2 * G), "2.0 GiB");
+        assert_eq!(amount(256 * M), "256 MiB");
+    }
+
+    #[test]
+    fn each_transfer_keeps_its_reserve() {
+        let dir = tmpdir("reserve");
+        let inc = Incoming::begin(&dir, 1, 10, "x.bin").unwrap();
+        assert_eq!(inc.reserve, Reserve::Ordinary);
+        let (free, total) = space(inc.file.as_ref().unwrap()).unwrap();
+        drop(inc);
+        // The service's folder keeps its larger reserve, at the start and as data arrives.
+        match Incoming::begin_keeping(&dir, 2, 10, "y.bin", Reserve::ServiceFolder) {
+            Ok(inc) => assert_eq!(inc.reserve, Reserve::ServiceFolder),
+            Err(e) => assert!(e.to_string().contains(&amount(Reserve::ServiceFolder.of(total))), "{e}"),
+        }
+        // More than is free never fits (where the largest file allowed is more than that).
+        if free < MAX_FILE_SIZE {
+            for keep in [Reserve::Ordinary, Reserve::ServiceFolder] {
+                match Incoming::begin_keeping(&dir, 3, free + 1, "big.bin", keep) {
+                    Ok(_) => panic!("{} bytes fit where {free} are free", free + 1),
+                    Err(e) => assert!(e.to_string().contains("has to stay free"), "{e}"),
+                }
+            }
+        }
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

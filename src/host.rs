@@ -1082,17 +1082,18 @@ impl Input {
     }
 
     /// Creates the partial file of an upload. A host running as SYSTEM (the service's agent)
-    /// takes uploads only while somebody is signed in on the console, like pulls, and saves them
-    /// as that user unless they go to the service's own folder.
+    /// saves uploads as the user signed in on the console, like pulls, and so takes them only
+    /// while somebody is; into the service's own folder it saves them itself, also at the
+    /// sign-in screen, leaving that folder's volume the larger reserve.
     fn open_upload(&mut self, id: u32, size: u64, name: &str) -> Result<Upload> {
-        let user = FileUser::get()?;
         let own = self.host.opts.own_transfer_dir;
-        let user = (!own).then_some(user);
+        let user = upload_user(own, FileUser::get)?;
         let file = as_user(user.as_ref(), || -> Result<Incoming> {
             let dir = self.upload_dir()?;
             if own {
                 let arriving = self.uploads.values().map(|u| u.file.size - u.file.received()).sum();
                 own_dir_room(&dir, arriving, size, OWN_DIR_BYTES, OWN_DIR_FILES)?;
+                return Incoming::begin_keeping(&dir, id, size, name, files::Reserve::ServiceFolder);
             }
             Incoming::begin(&dir, id, size, name)
         })??;
@@ -1160,6 +1161,13 @@ impl Upload {
         let Upload { file, user } = self;
         as_user(user.as_ref(), || file.finish(sha256))?
     }
+}
+
+/// Who an upload is saved as: the host itself (None) in the service's own folder (`own`), which
+/// only SYSTEM and administrators can change, so no console user is looked up and uploads arrive
+/// at the sign-in screen too; otherwise the console user (`get`), and no upload without one.
+fn upload_user<U>(own: bool, get: impl FnOnce() -> Result<U>) -> Result<Option<U>> {
+    if own { Ok(None) } else { get().map(Some) }
 }
 
 /// Runs `f` as `user`, or as the host itself.
@@ -1895,6 +1903,20 @@ mod tests {
         own_dir_room(&dir, 0, 0, 100, 4).unwrap();
         assert!(own_dir_room(&dir.join("missing"), 0, 0, 100, 4).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_services_own_folder_needs_nobody_signed_in() {
+        let nobody = || -> Result<u32> { Err("nobody is signed in on the host".into()) };
+        let looked_up = std::cell::Cell::new(false);
+        let user = upload_user(true, || {
+            looked_up.set(true);
+            nobody()
+        });
+        assert!(matches!(user, Ok(None)) && !looked_up.get());
+        // Any other folder is written as the console user, so it takes uploads only with one.
+        assert!(upload_user(false, nobody).unwrap_err().to_string().contains("nobody is signed in"));
+        assert!(matches!(upload_user(false, || Ok(7)), Ok(Some(7))));
     }
 
     #[test]
