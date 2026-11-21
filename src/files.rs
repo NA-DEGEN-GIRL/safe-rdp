@@ -752,14 +752,11 @@ mod tests {
             Ok(inc) => assert_eq!(inc.reserve, Reserve::ServiceFolder),
             Err(e) => assert!(e.to_string().contains(&amount(Reserve::ServiceFolder.of(total))), "{e}"),
         }
-        // More than is free never fits (where the largest file allowed is more than that).
-        if free < MAX_FILE_SIZE {
-            for keep in [Reserve::Ordinary, Reserve::ServiceFolder] {
-                match Incoming::begin_keeping(&dir, 3, free + 1, "big.bin", keep) {
-                    Ok(_) => panic!("{} bytes fit where {free} are free", free + 1),
-                    Err(e) => assert!(e.to_string().contains("has to stay free"), "{e}"),
-                }
-            }
+        // More than is free never fits. Asked of room() alone: a transfer announcing that much
+        // would count it in PROMISED until refused, and tests running alongside would then
+        // find no room for theirs.
+        for keep in [Reserve::Ordinary, Reserve::ServiceFolder] {
+            assert_eq!(room(Some((free, total)), free + 1, keep), Err(keep.of(total)), "{} bytes fit where {free} are free", free + 1);
         }
         assert!(names(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
