@@ -111,6 +111,11 @@ pub fn load_user_key() -> Result<Secret<32>> {
     unwrap_key(dpapi_unprotect(&data)?)
 }
 
+/// The fingerprint (`keys::fingerprint`) of the stored key; None without a readable one.
+pub fn user_key_fingerprint() -> Option<String> {
+    load_user_key().ok().map(|k| crate::keys::fingerprint(&k))
+}
+
 pub fn forget_user_key() -> Result<bool> {
     let path = user_key_path()?;
     if !path.exists() {

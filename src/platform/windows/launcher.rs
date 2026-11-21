@@ -9,8 +9,9 @@
 //! The viewer and host run as separate processes, so a failure there never takes the launcher
 //! down. The host is tied to the launcher with a kill-on-close job object: sharing never
 //! outlives the window that shows it. A host keeps the key it started with, so sharing is
-//! restarted (or stopped) whenever the stored key changes, here or in a terminal; the service
-//! keeps the key it was installed with, so changing the key here offers to reinstall it.
+//! restarted (or stopped) whenever the stored key changes, here or in a terminal. The service
+//! keeps the key it was given: the fingerprint it recorded is compared with the stored key's,
+//! and changing the key here offers to give the service the new one (its options stay).
 //! Plain Win32 with common controls v6 (`app.manifest`),
 //! per-monitor DPI aware; Korean strings when the Windows display language is Korean.
 //!
@@ -194,16 +195,23 @@ struct Text {
     svc_sas: &'static str,
     install: &'static str,
     reinstall: &'static str,
+    /// The install button while the service lacks the stored key.
+    update_key: &'static str,
     uninstall: &'static str,
     svc_status: fn(&str) -> String,
     /// checking, not installed, running, stopped, changing, unknown
     svc_states: [&'static str; 6],
-    /// Added to the status while the service still holds a replaced or removed key.
+    /// Added to the status while the service has another key than the stored one.
     svc_key_status: &'static str,
+    /// Added to the status while that cannot be told.
+    svc_key_unknown: &'static str,
     svc_install_confirm: &'static str,
+    svc_reinstall_confirm: &'static str,
+    svc_rekey_confirm: &'static str,
     svc_uninstall_confirm: &'static str,
     svc_failed: fn(u32) -> String,
-    svc_install_hint: &'static str,
+    /// The elevated command refused the approving account's key (`service::EXIT_OTHER_KEY`).
+    svc_other_key: &'static str,
     close_sharing: &'static str,
     key_title: &'static str,
     key_sub: &'static str,
@@ -298,7 +306,8 @@ static EN: Text = Text {
     st_off: "Not sharing",
     st_off_detail: "Start sharing to let your other PCs connect. Only devices in your tailnet that have the same key can.",
     st_service_detail: "The background service is running, so this PC can already be reached.",
-    st_service_old_key: "The background service is running and still accepts the previous key. Reinstall or remove it below.",
+    st_service_old_key: "The background service is running with another key than yours (perhaps a previous one). Update its key \
+                         or remove it below.",
     st_starting: "Starting…",
     st_wait_ts: "Waiting for Tailscale…",
     st_wait_ts_detail: "Sharing begins as soon as Tailscale is connected.",
@@ -319,22 +328,33 @@ static EN: Text = Text {
     activity: "Activity",
     svc_title: "Background service",
     svc_text: "Install the service to reach this PC at any time: it starts with Windows, works before anyone signs in, on the \
-               lock screen and on UAC prompts, and uses the key of the account that installs it (reinstall it after changing \
-               that key). Connections are only accepted from Tailscale addresses. Installing or removing it needs administrator \
-               rights.",
+               lock screen and on UAC prompts, and uses the key of the account that installs it (update its key after \
+               changing that key). Connections are only accepted from Tailscale addresses. Installing or removing it needs \
+               administrator rights.",
     svc_sas: "Allow sending Ctrl+Alt+Del (changes a Windows policy)",
     install: "Install",
     reinstall: "Reinstall",
+    update_key: "Update key",
     uninstall: "Remove",
     svc_status: |s| format!("Status: {s}"),
     svc_states: ["checking…", "not installed", "running", "stopped", "changing…", "unknown"],
-    svc_key_status: " · still uses the previous key",
+    svc_key_status: " · not using your key",
+    svc_key_unknown: " · key unknown",
     svc_install_confirm: "Install the background service?\n\nIt uses the key stored for your account and the options ticked under \
-                          \"While sharing, allow\". Windows will ask for administrator permission.",
+                          \"While sharing, allow\". Windows will ask for administrator permission; if another account approves \
+                          it, that account needs the same key.",
+    svc_reinstall_confirm: "Reinstall the background service?\n\nIt then uses the key stored for your account and only the options \
+                            ticked under \"While sharing, allow\": settings it was installed with in a terminal, such as its port, \
+                            allowed addresses or upload folder, are dropped. Windows will ask for administrator permission; if \
+                            another account approves it, that account needs the same key.",
+    svc_rekey_confirm: "Give the background service the key stored for your account?\n\nOnly its key changes; its other settings \
+                        stay as they are. It restarts, which disconnects anyone connected through it. Windows will ask for \
+                        administrator permission; if another account approves it, that account needs the same key.",
     svc_uninstall_confirm: "Remove the background service?\n\nAfterwards this PC can only be reached while you share it from this window.",
     svc_failed: |c| format!("The service command failed (exit code {c})."),
-    svc_install_hint: "\n\nThe service uses the key of the account that approves the administrator prompt, so that \
-                       account needs a key too.",
+    svc_other_key: "Nothing was changed: the account that approved the administrator prompt does not have your current key, \
+                    and the service gets the key of that account. Import your key into that account first (sign in to it and \
+                    use Key → Import), or approve with an account that has it, then try again.",
     close_sharing: "This PC is being shared. Closing safe-rdp stops sharing and disconnects anyone viewing it.\n\nClose anyway?",
     key_title: "Security key",
     key_sub: "Your PCs use this key to recognize each other. Every PC needs the same key.",
@@ -360,14 +380,15 @@ static EN: Text = Text {
                       window is sharing this PC, sharing restarts with the new key and anyone connected is disconnected.",
     remove_confirm: "Remove the key from this PC?\n\nThis PC cannot connect or share until you create or import a key again. If this \
                      window is sharing this PC, sharing stops and anyone connected is disconnected.",
-    key_svc_confirm: "\n\nThe background service is installed and keeps the key it was installed with until it is reinstalled or \
+    key_svc_confirm: "\n\nThe background service is installed and keeps the key it was given until it gets the new one or is \
                       removed; you can do that next.",
-    svc_key_offer: "The background service keeps the key it was installed with, so it still accepts the previous key.\n\nReinstall \
-                    it now with the new key and the options ticked under \"While sharing, allow\"? Windows will ask for \
-                    administrator permission.",
-    svc_key_remove_offer: "The background service keeps the key it was installed with, so it still accepts the removed key.\n\n\
+    svc_key_offer: "The background service keeps the key it was given, so it does not use the new key yet and may still accept \
+                    the previous one.\n\nGive it the new key now? Only its key changes; its other settings stay as they are. \
+                    Windows will ask for administrator permission; if another account approves it, that account needs the new \
+                    key too.",
+    svc_key_remove_offer: "The background service keeps the key it was given, so it may still accept the removed key.\n\n\
                            Remove the background service now? Windows will ask for administrator permission.",
-    svc_key_note: " The background service still accepts the previous key until you reinstall or remove it (Share this PC).",
+    svc_key_note: " The background service keeps the key it had until you update its key or remove it (Share this PC).",
     sharing_restarts: " Sharing restarts with the new key; anyone connected was disconnected.",
     sharing_stopped: " Sharing from this window stopped; anyone connected was disconnected.",
     created: "New key created. Copy it to your other PC.",
@@ -436,7 +457,8 @@ static KO: Text = Text {
     st_off: "공유하지 않음",
     st_off_detail: "공유를 시작하면 다른 PC에서 접속할 수 있습니다. 같은 키를 가진 내 tailnet 기기만 접속할 수 있습니다.",
     st_service_detail: "백그라운드 서비스가 실행 중이므로 이미 이 PC에 접속할 수 있습니다.",
-    st_service_old_key: "백그라운드 서비스가 실행 중이며 아직 이전 키로도 접속할 수 있습니다. 아래에서 다시 설치하거나 제거하세요.",
+    st_service_old_key: "백그라운드 서비스가 내 키가 아닌 다른 키(이전 키일 수 있음)로 실행 중입니다. 아래에서 키를 업데이트하거나 \
+                         서비스를 제거하세요.",
     st_starting: "시작하는 중…",
     st_wait_ts: "Tailscale 연결을 기다리는 중…",
     st_wait_ts_detail: "Tailscale이 연결되면 바로 공유를 시작합니다.",
@@ -457,20 +479,30 @@ static KO: Text = Text {
     activity: "활동 기록",
     svc_title: "백그라운드 서비스",
     svc_text: "서비스를 설치하면 언제든 이 PC에 접속할 수 있습니다. Windows와 함께 시작되고, 로그인 전 화면·잠금 화면·UAC 창에서도 \
-               동작하며, 설치한 계정의 키를 사용합니다 (키를 바꾼 뒤에는 다시 설치하세요). 접속은 Tailscale 주소에서만 받습니다. \
-               설치와 제거에는 관리자 권한이 필요합니다.",
+               동작하며, 설치한 계정의 키를 사용합니다 (키를 바꾼 뒤에는 서비스의 키도 업데이트하세요). 접속은 Tailscale 주소에서만 \
+               받습니다. 설치와 제거에는 관리자 권한이 필요합니다.",
     svc_sas: "Ctrl+Alt+Del 보내기 허용 (Windows 정책 변경)",
     install: "설치",
     reinstall: "다시 설치",
+    update_key: "키 업데이트",
     uninstall: "제거",
     svc_status: |s| format!("상태: {s}"),
     svc_states: ["확인 중…", "설치 안 됨", "실행 중", "중지됨", "변경 중…", "알 수 없음"],
-    svc_key_status: " · 아직 이전 키 사용",
+    svc_key_status: " · 내 키를 쓰지 않음",
+    svc_key_unknown: " · 키 확인 불가",
     svc_install_confirm: "백그라운드 서비스를 설치할까요?\n\n현재 계정에 저장된 키와 '공유 중 허용할 기능'에서 선택한 옵션을 사용합니다. \
-                          Windows가 관리자 권한을 요청합니다.",
+                          Windows가 관리자 권한을 요청하며, 다른 계정이 승인한다면 그 계정에도 같은 키가 있어야 합니다.",
+    svc_reinstall_confirm: "백그라운드 서비스를 다시 설치할까요?\n\n현재 계정에 저장된 키와 '공유 중 허용할 기능'에서 선택한 옵션만 \
+                            사용하므로, 터미널에서 설치할 때 지정한 포트·허용 주소·업로드 폴더 같은 설정은 사라집니다. Windows가 \
+                            관리자 권한을 요청하며, 다른 계정이 승인한다면 그 계정에도 같은 키가 있어야 합니다.",
+    svc_rekey_confirm: "백그라운드 서비스에 현재 계정에 저장된 키를 넣을까요?\n\n키만 바뀌고 다른 설정은 그대로 유지됩니다. 서비스가 \
+                        다시 시작되므로 서비스로 접속해 있던 사람은 연결이 끊어집니다. Windows가 관리자 권한을 요청하며, 다른 \
+                        계정이 승인한다면 그 계정에도 같은 키가 있어야 합니다.",
     svc_uninstall_confirm: "백그라운드 서비스를 제거할까요?\n\n이후에는 이 창에서 공유하는 동안에만 이 PC에 접속할 수 있습니다.",
     svc_failed: |c| format!("서비스 명령이 실패했습니다 (종료 코드 {c})."),
-    svc_install_hint: "\n\n서비스는 관리자 권한을 승인한 계정의 키를 사용하므로 그 계정에도 키가 있어야 합니다.",
+    svc_other_key: "아무것도 바꾸지 않았습니다. 관리자 권한을 승인한 계정에 현재 키가 없습니다 (서비스는 승인한 계정의 키를 \
+                    받습니다). 먼저 그 계정으로 로그인해 '보안 키 → 가져오기'로 키를 넣거나, 같은 키가 있는 계정으로 승인한 뒤 \
+                    다시 시도하세요.",
     close_sharing: "이 PC를 공유하는 중입니다. safe-rdp를 닫으면 공유가 중지되고 접속한 사람의 연결이 끊어집니다.\n\n그래도 닫을까요?",
     key_title: "보안 키",
     key_sub: "내 PC들은 이 키로 서로를 확인합니다. 모든 PC에 같은 키가 있어야 합니다.",
@@ -496,13 +528,14 @@ static KO: Text = Text {
                       키로 공유를 다시 시작하며 접속한 사람의 연결이 끊어집니다.",
     remove_confirm: "이 PC에서 키를 삭제할까요?\n\n다시 키를 만들거나 가져오기 전까지 접속하거나 공유할 수 없습니다. 이 창에서 공유 \
                      중이면 공유가 중지되고 접속한 사람의 연결이 끊어집니다.",
-    key_svc_confirm: "\n\n백그라운드 서비스가 설치되어 있으며, 다시 설치하거나 제거하기 전까지 설치할 때의 키를 계속 사용합니다. \
-                      이어서 바로 다시 설치하거나 제거할 수 있습니다.",
-    svc_key_offer: "백그라운드 서비스는 설치할 때의 키를 계속 사용하므로 아직 이전 키로도 접속할 수 있습니다.\n\n지금 새 키와 \
-                    '공유 중 허용할 기능'에서 선택한 옵션으로 다시 설치할까요? Windows가 관리자 권한을 요청합니다.",
-    svc_key_remove_offer: "백그라운드 서비스는 설치할 때의 키를 계속 사용하므로 아직 삭제한 키로도 접속할 수 있습니다.\n\n지금 \
+    key_svc_confirm: "\n\n백그라운드 서비스가 설치되어 있으며, 새 키를 넣거나 제거하기 전까지 받은 키를 계속 사용합니다. 이어서 \
+                      바로 할 수 있습니다.",
+    svc_key_offer: "백그라운드 서비스는 받은 키를 계속 사용하므로 아직 새 키를 쓰지 않으며 이전 키로도 접속될 수 있습니다.\n\n\
+                    지금 서비스에 새 키를 넣을까요? 키만 바뀌고 다른 설정은 그대로 유지됩니다. Windows가 관리자 권한을 \
+                    요청하며, 다른 계정이 승인한다면 그 계정에도 새 키가 있어야 합니다.",
+    svc_key_remove_offer: "백그라운드 서비스는 받은 키를 계속 사용하므로 삭제한 키로도 아직 접속될 수 있습니다.\n\n지금 \
                            백그라운드 서비스를 제거할까요? Windows가 관리자 권한을 요청합니다.",
-    svc_key_note: " 백그라운드 서비스는 다시 설치하거나 제거하기 전까지 이전 키로도 접속을 받습니다 ('이 PC 공유').",
+    svc_key_note: " 백그라운드 서비스는 키를 업데이트하거나 제거하기 전까지 기존 키를 계속 사용합니다 ('이 PC 공유').",
     sharing_restarts: " 공유를 새 키로 다시 시작합니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
     sharing_stopped: " 이 창의 공유를 중지했습니다. 접속해 있던 사람은 연결이 끊어졌습니다.",
     created: "새 키를 만들었습니다. 다른 PC로 복사하세요.",
@@ -739,13 +772,51 @@ fn host_args(o: &ShareOptions, bind: Option<IpAddr>, port: Option<u16>) -> Vec<S
 }
 
 /// Arguments for the elevated `service install` (plain tokens, so joining with spaces is safe).
-fn service_install_args(o: &ShareOptions, sas: bool) -> Vec<String> {
-    let mut a = vec!["service".to_string(), "install".to_string()];
+/// `key`: the fingerprint of the stored key. The elevated process finds the key of the account
+/// that approved the prompt, which for a standard user is another one: it refuses any other key.
+fn service_install_args(o: &ShareOptions, sas: bool, key: &str) -> Vec<String> {
+    let mut a = vec!["service".to_string(), "install".to_string(), "--expect-key".to_string(), key.to_string()];
     a.extend(share_flags(o));
     if sas {
         a.push("--enable-sas".into());
     }
     a
+}
+
+/// Arguments for the elevated `service rekey`, which leaves the service's options alone.
+fn service_rekey_args(key: &str) -> Vec<String> {
+    ["service", "rekey", "--expect-key", key].map(String::from).to_vec()
+}
+
+/// Which key the installed service has, as far as the fingerprint it recorded tells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SvcKey {
+    /// The stored one.
+    Mine,
+    /// Another one (or no key is stored).
+    Other,
+    /// It recorded none (as an earlier safe-rdp did not), or that cannot be read.
+    Unknown,
+}
+
+/// `recorded`: the fingerprint the service recorded; `mine`: that of the stored key.
+fn svc_key(recorded: Option<&str>, mine: Option<&str>) -> SvcKey {
+    match recorded {
+        None => SvcKey::Unknown,
+        Some(r) if mine == Some(r) => SvcKey::Mine,
+        Some(_) => SvcKey::Other,
+    }
+}
+
+/// After the stored key changed from the one with fingerprint `old` to `new` (None: removed):
+/// whether the service, which recorded `recorded`, should get the new key or be removed.
+fn svc_needs_update(recorded: Option<&str>, old: Option<&str>, new: Option<&str>) -> bool {
+    match (recorded, new) {
+        (Some(r), Some(n)) => r != n,
+        // Unless it has some key that was never the removed one.
+        (Some(r), None) => old.is_none_or(|o| o == r),
+        (None, _) => true,
+    }
 }
 
 /// `SAFE_RDP_LAUNCHER_BIND` / `SAFE_RDP_LAUNCHER_PORT`, for testing sharing on another address.
@@ -912,8 +983,36 @@ enum Event {
     /// A host that `stop_sharing` stopped has exited (its port is free again).
     HostStopped(u64),
     Viewer { host: String, entry: String, update: ViewerUpdate },
-    Service(Result<String, String>),
-    ServiceDone { install: bool, result: Result<u32, Elevation> },
+    Service(ServiceInfo),
+    ServiceDone { op: SvcOp, result: Result<u32, Elevation> },
+}
+
+/// What a check of the service found.
+struct ServiceInfo {
+    /// `service status`.
+    status: Result<String, String>,
+    /// The fingerprint the service recorded for its key (unreadable counts as none).
+    key: Option<String>,
+    /// The fingerprint of the stored key.
+    mine: Option<String>,
+}
+
+fn service_info() -> ServiceInfo {
+    ServiceInfo {
+        status: service::status().map_err(|e| e.to_string()),
+        key: service::key_fingerprint().ok().flatten(),
+        mine: keystore::user_key_fingerprint(),
+    }
+}
+
+/// An elevated service command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SvcOp {
+    /// `service install` with the options ticked under "While sharing, allow".
+    Install,
+    /// `service rekey`: the stored key, nothing else.
+    Rekey,
+    Remove,
 }
 
 enum ViewerUpdate {
@@ -1335,6 +1434,12 @@ enum Svc {
     Unknown,
 }
 
+impl Svc {
+    fn installed(self) -> bool {
+        matches!(self, Svc::Running | Svc::Stopped | Svc::Changing)
+    }
+}
+
 struct State {
     banner: Option<Banner>,
     key: KeyState,
@@ -1360,13 +1465,10 @@ struct State {
     log: VecDeque<String>,
     svc: Svc,
     svc_busy: bool,
-    /// The installed service still holds a key that has since been replaced or removed here
-    /// (it keeps the key it was installed with).
-    svc_old_key: bool,
-    /// Counts changes of the stored key.
-    key_gen: u64,
-    /// `key_gen` when the running service install or removal started.
-    svc_op_gen: u64,
+    /// The fingerprint the installed service recorded for the key it was given, and that of the
+    /// stored key, both as of the last check of the service (`ServiceInfo`).
+    svc_key: Option<String>,
+    key_fp: Option<String>,
 }
 
 struct Controls {
@@ -1976,9 +2078,8 @@ fn run_window() -> crate::util::Result<()> {
             log: VecDeque::new(),
             svc: Svc::Checking,
             svc_busy: false,
-            svc_old_key: false,
-            key_gen: 0,
-            svc_op_gen: 0,
+            svc_key: None,
+            key_fp: None,
         }),
         notifier: Notifier { tx, hwnd: hwnd as usize },
         rx,
@@ -2844,6 +2945,11 @@ impl App {
                 if self.page.get() == Page::Connect && unsafe { IsIconic(self.hwnd) } == 0 {
                     self.refresh_devices();
                 }
+                // Notices the service being given another key (or installed, or removed) in a
+                // terminal, and the key being changed there.
+                if self.page.get() == Page::Share && unsafe { IsIconic(self.hwnd) } == 0 {
+                    self.refresh_service();
+                }
             }
             TIMER_CLIPBOARD => self.clear_clipboard(),
             TIMER_KEY => self.check_key_file(),
@@ -2861,7 +2967,7 @@ impl App {
                 Event::HostStopped(generation) => self.on_host_stopped(generation),
                 Event::Viewer { host, entry, update } => self.on_viewer(&host, &entry, update),
                 Event::Service(r) => self.on_service_status(r),
-                Event::ServiceDone { install, result } => self.on_service_done(install, result),
+                Event::ServiceDone { op, result } => self.on_service_done(op, result),
             }
         }
         if log_changed {
@@ -3223,15 +3329,12 @@ impl App {
 
     /// The stored key was replaced or removed (`present`: a key is stored now), here or
     /// elsewhere. A host keeps the key it started with, so the one this window runs is stopped,
-    /// and started again with the new key once it has exited; `svc`: the service is installed,
-    /// and it keeps the key it was installed with. True if sharing restarts or stopped.
-    fn key_replaced(&self, present: bool, svc: bool) -> bool {
+    /// and started again with the new key once it has exited. True if sharing restarts or stopped.
+    fn key_replaced(&self, present: bool) -> bool {
         let (running, restarts) = {
             let mut st = self.st.borrow_mut();
             let running = st.host.is_some().then_some(st.host_gen);
             st.restart_after = restart_after_key_change(present, running, st.restart_after);
-            st.key_gen += 1;
-            st.svc_old_key |= svc;
             (running.is_some(), st.restart_after.is_some())
         };
         if running {
@@ -3270,8 +3373,9 @@ impl App {
                 let key = key_state();
                 self.st.borrow_mut().key = key;
                 self.update_key_ui();
-                let svc = self.service_installed();
-                self.key_replaced(key == KeyState::Present, svc);
+                self.key_replaced(key == KeyState::Present);
+                // Whether the service has the key stored now.
+                self.refresh_service();
             }
         }
     }
@@ -3370,7 +3474,9 @@ impl App {
             let me = st.me.as_ref().map(|d| d.name.as_str());
             let running = st.host.is_some();
             let (status, tone, detail): (String, Tone, String) = match &st.share {
-                Share::Off if st.svc == Svc::Running && st.svc_old_key => (t.st_off.into(), Tone::Warn, t.st_service_old_key.into()),
+                Share::Off if st.svc == Svc::Running && svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) == SvcKey::Other => {
+                    (t.st_off.into(), Tone::Warn, t.st_service_old_key.into())
+                }
                 Share::Off if st.svc == Svc::Running => (t.st_off.into(), Tone::Muted, t.st_service_detail.into()),
                 Share::Off => (t.st_off.into(), Tone::Muted, t.st_off_detail.into()),
                 Share::Starting => (t.st_starting.into(), Tone::Accent, String::new()),
@@ -3406,46 +3512,53 @@ impl App {
             return;
         }
         let n = self.notifier.clone();
-        spawn_thread("service-status", move || n.send(Event::Service(service::status().map_err(|e| e.to_string()))));
+        spawn_thread("service-status", move || n.send(Event::Service(service_info())));
     }
 
-    fn on_service_status(&self, r: Result<String, String>) {
+    fn on_service_status(&self, info: ServiceInfo) {
         {
             let mut st = self.st.borrow_mut();
             if st.svc_busy {
                 return;
             }
-            st.svc = match r.as_deref() {
+            st.svc = match info.status.as_deref() {
                 Ok("not installed") => Svc::NotInstalled,
                 Ok("running") => Svc::Running,
                 Ok(s) if s.starts_with("stopped") => Svc::Stopped,
                 Ok("starting" | "stopping") => Svc::Changing,
                 _ => Svc::Unknown,
             };
-            if st.svc == Svc::NotInstalled {
-                st.svc_old_key = false;
-            }
+            st.svc_key = info.key;
+            st.key_fp = info.mine;
         }
         self.update_service_ui();
         self.update_share_ui();
     }
 
     /// Whether the background service is installed, asked now rather than taken from the last
-    /// refresh, since it keeps the key it was installed with whatever happens to the stored one.
-    /// When that cannot be told, anything but a known "not installed" counts.
+    /// refresh, since it keeps the key it was given whatever happens to the stored one; also
+    /// reads again which key it has and which one is stored. When that cannot be told, anything
+    /// but a known "not installed" counts.
     fn service_installed(&self) -> bool {
-        let r = service::status().map_err(|e| e.to_string());
-        let known = r.as_deref().ok().map(|s| s != "not installed");
-        self.on_service_status(r);
+        let info = service_info();
+        let known = info.status.as_deref().ok().map(|s| s != "not installed");
+        self.on_service_status(info);
         let st = self.st.borrow();
         st.svc_busy || known.unwrap_or(st.svc != Svc::NotInstalled)
     }
 
+    /// The installed service lacks the stored key (as far as can be told), so the install
+    /// button gives it that key rather than reinstalling.
+    fn key_update_due(&self) -> bool {
+        let st = self.st.borrow();
+        st.svc.installed() && st.key == KeyState::Present && svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) != SvcKey::Mine
+    }
+
     fn update_service_ui(&self) {
         let t = self.t;
-        let (svc, busy, old_key) = {
+        let (svc, busy, key) = {
             let st = self.st.borrow();
-            (st.svc, st.svc_busy, st.svc_old_key)
+            (st.svc, st.svc_busy, svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()))
         };
         let (index, tone) = match svc {
             Svc::Checking => (0, Tone::Muted),
@@ -3455,16 +3568,26 @@ impl App {
             Svc::Changing => (4, Tone::Accent),
             Svc::Unknown => (5, Tone::Muted),
         };
-        let installed = matches!(svc, Svc::Running | Svc::Stopped | Svc::Changing);
+        let installed = svc.installed();
         let mut status = (t.svc_status)(t.svc_states[index]);
-        let tone = if old_key && installed {
-            status.push_str(t.svc_key_status);
-            Tone::Warn
-        } else {
-            tone
+        let tone = match key {
+            SvcKey::Other if installed && !busy => {
+                status.push_str(t.svc_key_status);
+                Tone::Warn
+            }
+            SvcKey::Unknown if installed && !busy => {
+                status.push_str(t.svc_key_unknown);
+                tone
+            }
+            _ => tone,
         };
         self.say(self.c.s_svc_status, &status, tone);
-        set_text(self.c.s_install, if installed { t.reinstall } else { t.install });
+        let install = match installed {
+            false => t.install,
+            true if self.key_update_due() => t.update_key,
+            true => t.reinstall,
+        };
+        set_text(self.c.s_install, install);
         enable(self.c.s_install, !busy && svc != Svc::Checking);
         enable(self.c.s_uninstall, !busy && installed);
         enable(self.c.s_sas, !busy);
@@ -3475,49 +3598,72 @@ impl App {
         if install && !self.require_key() {
             return;
         }
-        if !confirm(self.hwnd, if install { t.svc_install_confirm } else { t.svc_uninstall_confirm }) {
-            return;
+        // While the service lacks the stored key, the install button gives it that key alone
+        // (see `update_service_ui`).
+        let op = match install {
+            false => SvcOp::Remove,
+            true if self.key_update_due() => SvcOp::Rekey,
+            true => SvcOp::Install,
+        };
+        let text = match op {
+            SvcOp::Install if self.st.borrow().svc.installed() => t.svc_reinstall_confirm,
+            SvcOp::Install => t.svc_install_confirm,
+            SvcOp::Rekey => t.svc_rekey_confirm,
+            SvcOp::Remove => t.svc_uninstall_confirm,
+        };
+        if confirm(self.hwnd, text) {
+            self.run_service_op(op);
         }
-        self.run_service_op(install);
     }
 
-    /// Installs the service (with the options ticked under "While sharing, allow") or removes
-    /// it, in an elevated process.
-    fn run_service_op(&self, install: bool) {
-        let args = if install {
-            service_install_args(&self.share_options(), is_checked(self.c.s_sas))
-        } else {
-            vec!["service".into(), "uninstall".into()]
+    /// Installs the service (with the options ticked under "While sharing, allow"), gives it the
+    /// stored key, or removes it, in an elevated process. False if that could not be started.
+    fn run_service_op(&self, op: SvcOp) -> bool {
+        let args = match op {
+            SvcOp::Remove => vec!["service".into(), "uninstall".into()],
+            _ => {
+                let Some(key) = keystore::user_key_fingerprint() else {
+                    // The key is gone or unreadable since it was last looked at.
+                    self.st.borrow_mut().key = key_state();
+                    self.update_key_ui();
+                    self.require_key();
+                    return false;
+                };
+                if op == SvcOp::Rekey {
+                    service_rekey_args(&key)
+                } else {
+                    service_install_args(&self.share_options(), is_checked(self.c.s_sas), &key)
+                }
+            }
         };
         self.save_settings();
         {
             let mut st = self.st.borrow_mut();
             st.svc_busy = true;
             st.svc = Svc::Changing;
-            st.svc_op_gen = st.key_gen;
         }
         self.update_service_ui();
         let (owner, n, params) = (self.hwnd as usize, self.notifier.clone(), args.join(" "));
-        if !spawn_thread("service-op", move || n.send(Event::ServiceDone { install, result: run_elevated(owner, &params) })) {
+        if !spawn_thread("service-op", move || n.send(Event::ServiceDone { op, result: run_elevated(owner, &params) })) {
             self.st.borrow_mut().svc_busy = false;
             self.refresh_service();
+            return false;
         }
+        true
     }
 
-    fn on_service_done(&self, install: bool, result: Result<u32, Elevation>) {
+    fn on_service_done(&self, op: SvcOp, result: Result<u32, Elevation>) {
         let t = self.t;
         let done = matches!(result, Ok(0));
-        let old_key = {
+        let lacks_key = {
             let mut st = self.st.borrow_mut();
             st.svc_busy = false;
-            // Installed (with the stored key) or removed after the last key change.
-            if done && st.svc_op_gen == st.key_gen {
-                st.svc_old_key = false;
-            }
-            st.svc_old_key
+            // As checked before the command ran: it changed nothing.
+            svc_key(st.svc_key.as_deref(), st.key_fp.as_deref()) != SvcKey::Mine
         };
-        if old_key && !done {
-            // Say so where the key was changed, too.
+        // Giving the service the key, or removing it, did not happen: say so where the key
+        // was changed, too.
+        if !done && op != SvcOp::Install && lacks_key {
             let mut text = get_text(self.c.k_msg);
             if !text.contains(t.svc_key_note.trim()) {
                 text.push_str(t.svc_key_note);
@@ -3526,12 +3672,11 @@ impl App {
         }
         match result {
             Ok(0) | Err(Elevation::Cancelled) => {}
+            Ok(code) if code == service::EXIT_OTHER_KEY as u32 && op != SvcOp::Remove => {
+                message_box(self.hwnd, t.svc_other_key, MB_OK | MB_ICONWARNING);
+            }
             Ok(code) => {
-                let mut text = (t.svc_failed)(code);
-                if install {
-                    text.push_str(t.svc_install_hint);
-                }
-                message_box(self.hwnd, &text, MB_OK | MB_ICONWARNING);
+                message_box(self.hwnd, &(t.svc_failed)(code), MB_OK | MB_ICONWARNING);
             }
             Err(Elevation::Failed(e)) => {
                 message_box(self.hwnd, &e, MB_OK | MB_ICONWARNING);
@@ -3592,24 +3737,34 @@ impl App {
     }
 
     /// After this window replaced or removed the stored key: restarts or stops the host it runs
-    /// and, when the service is installed (`svc`), offers to reinstall it with the new key or to
+    /// and, when the service is installed without the new key, offers to give it that key or to
     /// remove it, right away. Reports `done` (in `tone`) along with what that changed.
-    fn key_changed_here(&self, done: &str, tone: Tone, svc: bool) {
+    fn key_changed_here(&self, done: &str, tone: Tone) {
         let t = self.t;
-        let present = self.st.borrow().key == KeyState::Present;
+        // The callers checked the service just before the change, so this is the old key's.
+        let (present, old) = {
+            let st = self.st.borrow();
+            (st.key == KeyState::Present, st.key_fp.clone())
+        };
         let (mut text, mut tone) = (done.to_string(), tone);
-        if self.key_replaced(present, svc) {
+        if self.key_replaced(present) {
             text.push_str(if present { t.sharing_restarts } else { t.sharing_stopped });
         }
-        if svc && !self.offer_service_update(present) {
+        let svc = self.service_installed();
+        let needed = {
+            let st = self.st.borrow();
+            // While a service command runs nothing new can be read, nor offered.
+            st.svc_busy || svc_needs_update(st.svc_key.as_deref(), old.as_deref(), st.key_fp.as_deref())
+        };
+        if svc && needed && !self.offer_service_update(present) {
             text.push_str(t.svc_key_note);
             tone = Tone::Warn;
         }
         self.key_message(&text, tone);
     }
 
-    /// Offers to reinstall the service with the stored key (`present`) or to remove it. True if
-    /// that is now under way.
+    /// Offers to give the service the stored key (`present`) or to remove it. True if that is
+    /// now under way.
     fn offer_service_update(&self, present: bool) -> bool {
         let t = self.t;
         if self.st.borrow().svc_busy {
@@ -3619,8 +3774,7 @@ impl App {
         if message_box(self.hwnd, offer, MB_YESNO | MB_ICONWARNING) != IDYES {
             return false;
         }
-        self.run_service_op(present);
-        true
+        self.run_service_op(if present { SvcOp::Rekey } else { SvcOp::Remove })
     }
 
     fn create_key(&self) {
@@ -3637,7 +3791,7 @@ impl App {
                 self.display_key(&text);
                 wipe_string(&mut text);
                 self.update_key_ui();
-                self.key_changed_here(t.created, Tone::Good, svc);
+                self.key_changed_here(t.created, Tone::Good);
             }
             Err(e) => self.key_message(&(t.key_failed)(&e.to_string()), Tone::Bad),
         }
@@ -3745,7 +3899,7 @@ impl App {
                     self.hide_key();
                 }
                 self.update_key_ui();
-                self.key_changed_here(t.imported, Tone::Good, svc);
+                self.key_changed_here(t.imported, Tone::Good);
             }
             Err(e) => self.key_message(&(t.key_failed)(&e.to_string()), Tone::Bad),
         }
@@ -3765,7 +3919,7 @@ impl App {
                 self.st.borrow_mut().key = key_state();
                 self.update_key_ui();
                 if removed {
-                    self.key_changed_here(t.removed, Tone::Muted, svc);
+                    self.key_changed_here(t.removed, Tone::Muted);
                 } else {
                     self.key_message(t.nothing_removed, Tone::Muted);
                 }
@@ -4062,10 +4216,37 @@ mod tests {
             host_args(&all, Some("127.0.0.1".parse().unwrap()), Some(47301)),
             ["host", "--stop-on-eof", "--view-only", "--clipboard", "--files", "--audio", "--privacy", "--bind", "127.0.0.1", "--port", "47301"]
         );
-        assert_eq!(service_install_args(&d, false), ["service", "install"]);
-        let a = service_install_args(&ShareOptions { clipboard: true, ..d }, true);
-        assert_eq!(a, ["service", "install", "--clipboard", "--enable-sas"]);
+        const FP: &str = "891d3768f5c4f960";
+        assert_eq!(service_install_args(&d, false, FP), ["service", "install", "--expect-key", FP]);
+        let a = service_install_args(&ShareOptions { clipboard: true, ..d }, true, FP);
+        assert_eq!(a, ["service", "install", "--expect-key", FP, "--clipboard", "--enable-sas"]);
         assert!(a.iter().all(|s| !s.contains([' ', '"'])));
+        // What the elevated command takes for the key it must find, and for its options.
+        let (expect, rest) = service::expected_key(&a[2..]).unwrap();
+        assert_eq!((expect.as_deref(), rest), (Some(FP), &a[4..]));
+        let a = service_rekey_args(FP);
+        assert_eq!(a, ["service", "rekey", "--expect-key", FP]);
+        assert_eq!(service::expected_key(&a[2..]).unwrap(), (Some(FP.to_string()), &[][..]));
+    }
+
+    #[test]
+    fn the_service_key_is_compared_by_fingerprint() {
+        let (mine, other) = (Some("891d3768f5c4f960"), Some("0123456789abcdef"));
+        assert_eq!(svc_key(mine, mine), SvcKey::Mine);
+        assert_eq!(svc_key(other, mine), SvcKey::Other);
+        assert_eq!(svc_key(other, None), SvcKey::Other, "no key stored here");
+        assert_eq!(svc_key(None, mine), SvcKey::Unknown);
+        assert_eq!(svc_key(None, None), SvcKey::Unknown);
+        // A new key: offered unless the service has it already (as after importing its key).
+        assert!(svc_needs_update(other, other, mine));
+        assert!(svc_needs_update(Some("fedcba9876543210"), other, mine));
+        assert!(!svc_needs_update(mine, other, mine));
+        assert!(svc_needs_update(None, other, mine));
+        // A removed key: offered unless the service has some other key.
+        assert!(svc_needs_update(other, other, None));
+        assert!(!svc_needs_update(mine, other, None));
+        assert!(svc_needs_update(mine, None, None), "the removed key could not be read");
+        assert!(svc_needs_update(None, other, None));
     }
 
     #[test]
@@ -4157,13 +4338,31 @@ mod tests {
             for s in [t.connect, t.start, t.stop, t.create, t.import, t.key_warning, t.svc_text, t.st_service_old_key, t.svc_key_offer] {
                 assert!(!s.is_empty());
             }
+            for s in [t.update_key, t.svc_other_key] {
+                assert!(!s.is_empty());
+            }
             // Added to other text.
-            for s in [t.svc_key_status, t.svc_key_note, t.sharing_restarts, t.sharing_stopped] {
+            for s in [t.svc_key_status, t.svc_key_unknown, t.svc_key_note, t.sharing_restarts, t.sharing_stopped] {
                 assert!(s.starts_with(' ') && s.len() > 1, "{s}");
             }
             assert!(t.key_svc_confirm.starts_with("\n\n") && t.svc_key_remove_offer.contains("\n\n"));
+            for s in [t.svc_install_confirm, t.svc_reinstall_confirm, t.svc_rekey_confirm, t.svc_key_offer] {
+                assert!(s.contains("\n\n"), "{s}");
+            }
             // Wrapped source lines leave no runs of spaces behind.
-            for s in [t.replace_confirm, t.remove_confirm, t.key_svc_confirm, t.svc_key_offer, t.svc_key_remove_offer, t.svc_text] {
+            for s in [
+                t.replace_confirm,
+                t.remove_confirm,
+                t.key_svc_confirm,
+                t.svc_key_offer,
+                t.svc_key_remove_offer,
+                t.svc_text,
+                t.st_service_old_key,
+                t.svc_install_confirm,
+                t.svc_reinstall_confirm,
+                t.svc_rekey_confirm,
+                t.svc_other_key,
+            ] {
                 assert!(!s.contains("  "), "{s}");
             }
             assert!((t.ts_count)(1, 3).contains('1') && (t.ts_count)(1, 3).contains('3'));
