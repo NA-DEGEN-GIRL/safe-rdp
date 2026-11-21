@@ -23,7 +23,7 @@ pub struct ViewerOptions {
     pub allow_capture: bool,
     /// Ask the host for 1/N resolution (1 = full).
     pub downscale: u8,
-    /// `proto::QUALITY_*`.
+    /// `proto::QUALITY_*`, or `proto::QUALITY_DEFAULT` for the host's choice.
     pub quality: u8,
     /// Zero-based monitor index, `proto::MONITOR_ALL` or `proto::MONITOR_DEFAULT`.
     pub monitor: u8,
@@ -41,7 +41,7 @@ impl Default for ViewerOptions {
             view_only: false,
             allow_capture: false,
             downscale: 1,
-            quality: QUALITY_BALANCED as u8,
+            quality: QUALITY_DEFAULT,
             monitor: MONITOR_DEFAULT,
             audio: false,
             privacy: false,

@@ -1054,7 +1054,8 @@ impl Ui {
             view_only: self.opts.view_only,
             allow_capture: self.opts.allow_capture,
             downscale: self.prefs.downscale,
-            quality: self.prefs.quality,
+            // What the user picked, else still the host's choice (`prefs` shows the one in effect).
+            quality: self.opts.quality,
             monitor: self.prefs.monitor,
             audio: self.prefs.audio,
             privacy: self.prefs.privacy,
@@ -1334,6 +1335,7 @@ impl Ui {
             }
             c if (toolbar::CMD_QUALITY..=toolbar::CMD_QUALITY + QUALITY_LOW as u16).contains(&c) => {
                 self.prefs.quality = (c - toolbar::CMD_QUALITY) as u8;
+                self.opts.quality = self.prefs.quality;
                 self.request(SET_QUALITY, self.prefs.quality as u32);
             }
             c if (toolbar::CMD_SCALE + 1..=toolbar::CMD_SCALE + 4).contains(&c) => {
