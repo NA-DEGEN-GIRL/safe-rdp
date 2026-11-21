@@ -15,7 +15,7 @@
 use super::x11::{self, AuthEntry, COOKIE_NAME, Conn, FAMILY_WILD, Target, encode_auth_entry};
 use crate::util::{Error, Result, wipe};
 use crate::{bail, log};
-use std::ffi::{c_char, c_int, c_uint};
+use std::ffi::{c_char, c_int, c_uint, c_ulong};
 use std::fs::{File, FileTimes};
 use std::io::{ErrorKind, PipeReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -29,7 +29,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
-    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    /// Takes four `unsigned long` arguments after `option`.
+    fn prctl(option: c_int, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn waitid(idtype: c_int, id: u32, info: *mut SigInfo, options: c_int) -> c_int;
     fn geteuid() -> u32;
@@ -39,8 +40,16 @@ unsafe extern "C" {
 const PR_SET_PDEATHSIG: c_int = 1;
 const F_SETFD: c_int = 2;
 const MFD_CLOEXEC: c_uint = 1;
+// Open flags differ by architecture (<asm/fcntl.h>): arm64 has its own, under which the
+// asm-generic values x86_64 and riscv64 use mean O_DIRECT and O_LARGEFILE.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const O_DIRECTORY: c_int = 0o200000;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const O_NOFOLLOW: c_int = 0o400000;
+#[cfg(target_arch = "aarch64")]
+const O_DIRECTORY: c_int = 0o40000;
+#[cfg(target_arch = "aarch64")]
+const O_NOFOLLOW: c_int = 0o100000;
 const P_PID: c_int = 1;
 const WNOHANG: c_int = 1;
 const WEXITED: c_int = 4;
@@ -48,7 +57,8 @@ const WNOWAIT: c_int = 0x0100_0000;
 const CLD_EXITED: i32 = 1;
 const CLD_DUMPED: i32 = 3;
 
-/// `siginfo_t` as `waitid` fills it in for a child (x86_64 layout).
+/// `siginfo_t` as `waitid` fills it in for a child (the generic 64-bit layout, which x86_64,
+/// aarch64 and riscv64 share).
 #[repr(C, align(8))]
 struct SigInfo {
     signo: i32,
@@ -91,7 +101,7 @@ fn exit_status(child: &mut Child) -> Option<ExitStatus> {
 fn die_with_parent(c: &mut Command) -> &mut Command {
     unsafe {
         c.pre_exec(|| {
-            prctl(PR_SET_PDEATHSIG, SIGTERM as u64, 0, 0, 0);
+            prctl(PR_SET_PDEATHSIG, SIGTERM as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong);
             Ok(())
         })
     }
@@ -132,17 +142,32 @@ struct Procs {
 }
 
 impl Procs {
-    /// Why the display is no longer usable, once Xvfb or the session command has exited.
-    fn ended(&mut self, dir: &Path) -> Option<String> {
+    /// How Xvfb or the session command exited, once one of them has.
+    fn ended(&mut self) -> Option<Ended> {
         if let Some(status) = exit_status(&mut self.xvfb) {
-            return Some(format!("Xvfb exited ({status}): {}", log_tail(&dir.join("xvfb.log"))));
+            return Some(Ended::Xvfb(status));
         }
-        let status = self.session.as_mut().and_then(exit_status)?;
-        Some(if status.success() {
-            "the session ended".to_string()
-        } else {
-            format!("the session ended ({status}): {}", log_tail(&dir.join("session.log")))
-        })
+        self.session.as_mut().and_then(exit_status).map(Ended::Session)
+    }
+}
+
+/// Which program's exit made the display unusable.
+#[derive(Debug)]
+enum Ended {
+    Xvfb(ExitStatus),
+    Session(ExitStatus),
+}
+
+impl Ended {
+    /// Why the display is no longer usable, with the last lines the program logged.
+    fn why(&self, kept: &Kept) -> String {
+        match *self {
+            Ended::Xvfb(status) => format!("Xvfb exited ({status}): {}", log_tail(&kept.xvfb_log)),
+            Ended::Session(status) if status.success() => "the session ended".to_string(),
+            Ended::Session(status) => {
+                format!("the session ended ({status}): {}", kept.session_log.as_ref().map(log_tail).unwrap_or_default())
+            }
+        }
     }
 }
 
@@ -163,24 +188,31 @@ pub struct VirtualDisplay {
 /// is locked, which keeps systemd-tmpfiles away from it and everything in it; `watch` also
 /// renews their timestamps for cleaners that only go by age (tmpwatch, tmpreaper). At the end
 /// only a directory that still is this one is deleted, and the cookie is wiped through `auth`.
+/// The logs are also read through these descriptors, never by name.
 struct Kept {
     dir: File,
     /// The session's copy of the cookie.
     auth: File,
-    logs: Vec<File>,
+    xvfb_log: File,
+    /// Once a session command runs.
+    session_log: Option<File>,
 }
 
 impl Kept {
     fn try_clone(&self) -> std::io::Result<Kept> {
-        let logs = self.logs.iter().map(File::try_clone).collect::<std::io::Result<_>>()?;
-        Ok(Kept { dir: self.dir.try_clone()?, auth: self.auth.try_clone()?, logs })
+        Ok(Kept {
+            dir: self.dir.try_clone()?,
+            auth: self.auth.try_clone()?,
+            xvfb_log: self.xvfb_log.try_clone()?,
+            session_log: self.session_log.as_ref().map(File::try_clone).transpose()?,
+        })
     }
 
     /// Marks the directory and its files as just used.
     fn touch(&self) {
         let now = SystemTime::now();
         let times = FileTimes::new().set_accessed(now).set_modified(now);
-        for f in [&self.dir, &self.auth].into_iter().chain(&self.logs) {
+        for f in [&self.dir, &self.auth, &self.xvfb_log].into_iter().chain(&self.session_log) {
             let _ = f.set_times(times);
         }
     }
@@ -301,8 +333,33 @@ fn socket_taken(n: u32) -> bool {
         .any(|p| std::fs::symlink_metadata(p).is_ok())
 }
 
-fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+/// A new log in the private directory, open for reading too (see `log_tail`).
+fn create_log(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)
+}
+
+/// How much of the end of a log `log_tail` reads.
+const LOG_TAIL_BYTES: u64 = 4096;
+
+/// The last lines written to `log`, read through the descriptor held: the name may lead
+/// elsewhere by now (another user's file, a FIFO, /dev/zero) once the directory is gone.
+/// `read_at` leaves alone the file offset the writer shares.
+fn log_tail(log: &File) -> String {
+    let len = log.metadata().map_or(0, |m| m.len());
+    let start = len.saturating_sub(LOG_TAIL_BYTES);
+    let mut b = vec![0u8; (len - start) as usize];
+    let mut got = 0;
+    while got < b.len() {
+        match log.read_at(&mut b[got..], start + got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let read = String::from_utf8_lossy(&b[..got]);
+    // A tail that starts within a line drops what it has of that line.
+    let text = if start > 0 { read.split_once('\n').map_or("", |(_, rest)| rest) } else { &read[..] };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     lines[lines.len().saturating_sub(3)..].join(" / ")
 }
@@ -339,16 +396,16 @@ fn check_socket_dir(dir: &Path, euid: u32) -> Result<()> {
 }
 
 /// Reads the display number Xvfb writes to its `-displayfd` pipe once it accepts clients.
-fn read_display_number(ready: &mut PipeReader, xvfb: &Mutex<Procs>, n: u32, log_path: &Path) -> Result<u32> {
+fn read_display_number(ready: &mut PipeReader, xvfb: &Mutex<Procs>, n: u32, log: &File) -> Result<u32> {
     let deadline = Instant::now() + START_TIMEOUT;
     let mut got = Vec::new();
     let mut open = true;
     loop {
         if let Some(status) = exit_status(&mut xvfb.lock().unwrap_or_else(|e| e.into_inner()).xvfb) {
-            bail!("Xvfb on :{n} exited ({status}): {}", log_tail(log_path));
+            bail!("Xvfb on :{n} exited ({status}): {}", log_tail(log));
         }
         if Instant::now() > deadline {
-            bail!("Xvfb on :{n} did not come up: {}", log_tail(log_path));
+            bail!("Xvfb on :{n} did not come up: {}", log_tail(log));
         }
         // Signals (EINTR) only make this report nothing ready.
         if !open || !x11::wait_readable(&[ready.as_raw_fd()], 100)?[0] {
@@ -420,7 +477,7 @@ impl VirtualDisplay {
                     if let Some(cmd) = session {
                         let (child, log) = vd.run_session(cmd)?;
                         vd.procs().session = Some(child);
-                        vd.kept.logs.push(log);
+                        vd.kept.session_log = Some(log);
                     }
                     return Ok(vd);
                 }
@@ -446,8 +503,8 @@ impl VirtualDisplay {
             if !leads_to(&cookie_name, &cookie) {
                 bail!("cannot hand Xvfb its cookie: {} does not lead to it (is /proc mounted?)", cookie_name.display());
             }
-            let log = File::create(&log_path)?;
-            let kept = Kept { dir: held, auth: copy, logs: vec![log.try_clone()?] };
+            let log = create_log(&log_path)?;
+            let kept = Kept { dir: held, auth: copy, xvfb_log: log.try_clone()?, session_log: None };
             // Xvfb writes the display number here once clients can connect.
             let (ready, ready_tx) = std::io::pipe()?;
             let fd = ready_tx.as_raw_fd();
@@ -487,7 +544,7 @@ impl VirtualDisplay {
         let pid = xvfb.id();
         let procs = Arc::new(Mutex::new(Procs { xvfb, session: None, closing: false }));
         let vd = VirtualDisplay { number: n, dir, auth, cookie, kept, procs };
-        let shown = read_display_number(&mut ready, &vd.procs, n, &log_path)?;
+        let shown = read_display_number(&mut ready, &vd.procs, n, &vd.kept.xvfb_log)?;
         if shown != n {
             bail!("Xvfb started display :{shown} instead of :{n}");
         }
@@ -497,14 +554,14 @@ impl VirtualDisplay {
         // An X server that could not read its cookie lets every local user in.
         let anonymous = Target { display: vd.display_name(), xauthority: Some(PathBuf::from("/dev/null")) };
         if Conn::connect_to_server(&anonymous, pid).is_ok() {
-            bail!("Xvfb on :{n} lets clients in without the cookie: {}", log_tail(&log_path));
+            bail!("Xvfb on :{n} lets clients in without the cookie: {}", log_tail(&vd.kept.xvfb_log));
         }
         Ok(vd)
     }
 
     /// Starts the session command; also returns its log, to be kept with the directory.
     fn run_session(&self, cmd: &str) -> Result<(Child, File)> {
-        let log = File::create(self.dir.join("session.log"))?;
+        let log = create_log(&self.dir.join("session.log"))?;
         let kept = log.try_clone()?;
         let child = die_with_parent(&mut Command::new("sh"))
             .arg("-c")
@@ -548,8 +605,10 @@ impl VirtualDisplay {
                 if p.closing {
                     return;
                 }
-                if let Some(why) = p.ended(&dir) {
-                    log!("virtual display {name}: {why}; stopping");
+                if let Some(ended) = p.ended() {
+                    // An exit seen before `Drop` began; the logs are read without the lock it needs.
+                    drop(p);
+                    log!("virtual display {name}: {}; stopping", ended.why(&kept));
                     stop.store(true, Ordering::SeqCst);
                     return;
                 }
@@ -608,7 +667,7 @@ impl VirtualDisplay {
 
     /// The last lines the session wrote, for error messages.
     pub fn session_log_tail(&self) -> String {
-        log_tail(&self.dir.join("session.log"))
+        self.kept.session_log.as_ref().map(log_tail).unwrap_or_default()
     }
 
     /// False once Xvfb has exited.
@@ -732,9 +791,14 @@ mod tests {
         let dir = private_dir("kept").unwrap();
         let auth = dir.join("Xauthority");
         let log = dir.join("xvfb.log");
-        let kept = Kept { dir: hold_dir(&dir).unwrap(), auth: write_auth(&auth, 1, &[1; 16]).unwrap(), logs: vec![File::create(&log).unwrap()] };
+        let kept = Kept {
+            dir: hold_dir(&dir).unwrap(),
+            auth: write_auth(&auth, 1, &[1; 16]).unwrap(),
+            xvfb_log: File::create(&log).unwrap(),
+            session_log: None,
+        };
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        for f in [&kept.dir, &kept.auth, &kept.logs[0]] {
+        for f in [&kept.dir, &kept.auth, &kept.xvfb_log] {
             f.set_times(FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
         }
         let clone = kept.try_clone().unwrap();
@@ -750,6 +814,45 @@ mod tests {
         assert!(cleaner.try_lock().is_err(), "the directory is not locked");
         drop((kept, clone));
         assert!(cleaner.try_lock().is_ok(), "still locked once nothing holds it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only a directory itself is held, never a link to one or a file. With open flags wrong
+    /// for the architecture, opening the directory fails (O_DIRECT) or these get through.
+    #[test]
+    fn holds_only_the_directory_itself() {
+        let dir = private_dir("hold").unwrap();
+        let held = hold_dir(&dir).unwrap();
+        assert!(held.metadata().unwrap().is_dir() && names(&dir, &held));
+        let link = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(hold_dir(&link).is_err(), "followed a link");
+        std::fs::remove_file(&link).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(hold_dir(&file).is_err(), "held a file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Log tails come from the end of the file held, whatever its name leads to by now.
+    #[test]
+    fn log_tails_come_from_the_file_held() {
+        let dir = private_dir("logs").unwrap();
+        let path = dir.join("xvfb.log");
+        let mut log = create_log(&path).unwrap();
+        assert!(create_log(&path).is_err(), "never reuses a name");
+        assert_eq!(log_tail(&log), "");
+        log.write_all(b"first\n\nsecond\n").unwrap();
+        assert_eq!(log_tail(&log), "first / second");
+        // Longer than the part read: the line it starts within is left out. Bytes that are
+        // not UTF-8 do not hide the rest.
+        log.write_all("x".repeat(LOG_TAIL_BYTES as usize).as_bytes()).unwrap();
+        log.write_all(b"\nthird \xff\n \nfourth\nfifth\n").unwrap();
+        assert_eq!(log_tail(&log), "third \u{fffd} / fourth / fifth");
+        // The name now leads to an endless file.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert_eq!(log_tail(&log), "third \u{fffd} / fourth / fifth");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -783,14 +886,14 @@ mod tests {
         let spawn = |script: &str| Command::new("sh").args(["-c", script]).process_group(0).spawn().unwrap();
         let mut p = Procs { xvfb: spawn("sleep 30"), session: Some(spawn("exit 3")), closing: false };
         let deadline = Instant::now() + Duration::from_secs(5);
-        let why = loop {
-            if let Some(why) = p.ended(Path::new("/nonexistent")) {
-                break why;
+        let ended = loop {
+            if let Some(ended) = p.ended() {
+                break ended;
             }
             assert!(Instant::now() < deadline, "the exit was not seen");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(why.contains("exit status: 3"), "{why}");
+        assert!(matches!(ended, Ended::Session(s) if s.code() == Some(3)), "{ended:?}");
         let session = p.session.as_mut().unwrap();
         let stat = std::fs::read_to_string(format!("/proc/{}/stat", session.id())).expect("the session was reaped");
         assert!(stat.contains(") Z "), "{stat}");

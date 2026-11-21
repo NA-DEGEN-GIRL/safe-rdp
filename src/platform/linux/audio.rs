@@ -8,7 +8,7 @@
 use crate::log;
 use crate::platform::jitter::JitterBuffer;
 use crate::util::{Error, Result};
-use std::ffi::c_int;
+use std::ffi::{c_int, c_ulong};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -21,13 +21,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 unsafe extern "C" {
-    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    /// Takes four `unsigned long` arguments after `option`.
+    fn prctl(option: c_int, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn getuid() -> u32;
 }
 
 const PR_SET_PDEATHSIG: c_int = 1;
-const SIGKILL: u64 = 9;
+const SIGKILL: c_ulong = 9;
 const F_SETPIPE_SZ: c_int = 1031;
 
 /// Capture format: what `pw-record` converts the sink monitor to.
@@ -99,7 +100,7 @@ fn pw_command(program: &Program) -> Command {
     // the child is needed.
     unsafe {
         c.pre_exec(|| {
-            prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+            prctl(PR_SET_PDEATHSIG, SIGKILL, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong);
             Ok(())
         });
     }
