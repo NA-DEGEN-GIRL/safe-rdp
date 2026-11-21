@@ -14,9 +14,11 @@
 //!   the window that receives the event only ever see used tags. A program whose own low-level
 //!   hook runs before ours (Windows calls the most recently installed first), or that watches
 //!   during a moment when Windows has dropped our hook, can still see an unused tag and replay
-//!   it, once, with input of its own. Windows silently drops a low-level hook that once misses
-//!   its time limit, so the hooks are re-installed every few seconds. Only one privacy mode
-//!   per process can hold the hooks.
+//!   it, once, with input of its own. On layouts with AltGr, Windows adds a Left Ctrl of its
+//!   own, untagged, in front of every Right Alt press and release; one such Ctrl passes for
+//!   each Right Alt we injected that the hooks have not seen yet. Windows silently drops a
+//!   low-level hook that once misses its time limit, so the hooks are re-installed every few
+//!   seconds. Only one privacy mode per process can hold the hooks.
 //!
 //! Everything lives on one thread with its own message loop. Dropping `Privacy` removes the
 //! hooks and windows before it returns; if the thread or the process dies, Windows removes
@@ -36,7 +38,7 @@
 //! running as SYSTEM, has no such gap. Needs Windows 10 version 2004 (build 19041) or later for
 //! `WDA_EXCLUDEFROMCAPTURE`.
 
-use super::input::{arm, take_tag};
+use super::input::{arm, take_altgr_ctrl, take_tag};
 use crate::bail;
 use crate::screen::Area;
 use crate::util::{Error, Result, wide};
@@ -51,6 +53,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -398,11 +401,24 @@ fn passes(injected: bool, extra_info: usize) -> bool {
     injected && take_tag(extra_info)
 }
 
+/// The scancode of the Left Ctrl that Windows adds to AltGr: Left Ctrl's 0x1D with the 0x200
+/// it marks the keys it simulates with.
+const ALTGR_CTRL_SCAN: u32 = 0x21d;
+
+/// `passes` for a keyboard event, which also lets through the Left Ctrl that Windows adds in
+/// front of a Right Alt we injected while the layout has AltGr: it comes with no `dwExtraInfo`
+/// of its own, and without it AltGr would arrive as plain Alt.
+fn key_passes(k: &KBDLLHOOKSTRUCT) -> bool {
+    let injected = k.flags & LLKHF_INJECTED != 0;
+    passes(injected, k.dwExtraInfo)
+        || (injected && k.dwExtraInfo == 0 && k.vkCode == VK_LCONTROL as u32 && k.scanCode == ALTGR_CTRL_SCAN && take_altgr_ctrl())
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code == HC_ACTION as i32 && lp != 0 {
             let k = &*(lp as *const KBDLLHOOKSTRUCT);
-            if !passes(k.flags & LLKHF_INJECTED != 0, k.dwExtraInfo) {
+            if !key_passes(k) {
                 return 1;
             }
         }
@@ -565,6 +581,30 @@ mod tests {
         assert!(!passes(true, 0x5344_5250)); // the fixed tag of earlier versions
         assert!(!passes(false, 0));
         assert!(passes(true, next));
+    }
+
+    #[test]
+    fn windows_own_ctrl_for_altgr_passes_once_per_right_alt_of_ours() {
+        let _armed = super::super::input::armed_for_test();
+        let key = |vk: u16, scan: u32, flags: u32, tag: usize| KBDLLHOOKSTRUCT { vkCode: vk as u32, scanCode: scan, flags, time: 0, dwExtraInfo: tag };
+        let ctrl = key(VK_LCONTROL, ALTGR_CTRL_SCAN, LLKHF_INJECTED, 0);
+        assert!(!key_passes(&ctrl), "no Right Alt of ours on its way");
+        let ralt = super::super::input::new_right_alt_tag();
+        assert!(!key_passes(&key(VK_LCONTROL, ALTGR_CTRL_SCAN, 0, 0)), "AltGr on the host's own keyboard");
+        assert!(!key_passes(&key(VK_LCONTROL, 0x1d, LLKHF_INJECTED, 0)), "an ordinary Left Ctrl");
+        assert!(!key_passes(&key(VK_RCONTROL, ALTGR_CTRL_SCAN, LLKHF_INJECTED, 0)));
+        assert!(!key_passes(&key(VK_LCONTROL, ALTGR_CTRL_SCAN, LLKHF_INJECTED, 0x5a5a)), "with another tag");
+        assert!(key_passes(&ctrl));
+        assert!(!key_passes(&ctrl), "two for one Right Alt");
+        assert!(key_passes(&key(VK_RMENU, 0x38, LLKHF_INJECTED | LLKHF_EXTENDED, ralt)));
+        // Ctrl was already down, so Windows added none: the allowance ends with its Right Alt.
+        let ralt = super::super::input::new_right_alt_tag();
+        assert!(key_passes(&key(VK_RMENU, 0x38, LLKHF_INJECTED | LLKHF_EXTENDED | LLKHF_UP, ralt)));
+        assert!(!key_passes(&ctrl));
+        // Other keys of ours bring none.
+        let a = new_tag();
+        assert!(!key_passes(&ctrl));
+        assert!(key_passes(&key(0x41, 0x1e, LLKHF_INJECTED, a)));
     }
 
     #[test]
