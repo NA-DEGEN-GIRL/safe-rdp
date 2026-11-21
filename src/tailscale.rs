@@ -1,5 +1,6 @@
 //! Tailscale device discovery (portable): runs `tailscale status --json` and lists the
-//! devices of the tailnet, so people can pick a PC instead of typing an address.
+//! devices of the tailnet, so people can pick a PC instead of typing an address. The host
+//! also asks it whether an address is this device's (`net::tailscale_ipv4`).
 //!
 //! The CLI is looked up only in its standard install locations (directories only
 //! administrators can write to), never on `PATH`, where another local user may have planted
@@ -82,9 +83,13 @@ impl Status {
         self.backend_state == "Running"
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
     pub fn self_device(&self) -> Option<&Device> {
         self.devices.iter().find(|d| d.is_self)
+    }
+
+    /// Whether Tailscale is connected and `ip` is one of this device's Tailscale addresses.
+    pub fn is_own_address(&self, ip: IpAddr) -> bool {
+        self.running() && self.self_device().is_some_and(|d| d.ips.contains(&ip))
     }
 
     pub fn peers(&self) -> impl Iterator<Item = &Device> {
@@ -393,6 +398,20 @@ mod tests {
         assert!(st.devices.is_empty());
         let st = parse_status(br#"{"BackendState":"Stopped"}"#).unwrap();
         assert!(!st.running() && st.devices.is_empty());
+    }
+
+    #[test]
+    fn own_addresses() {
+        let st = parse_status(FIXTURE).unwrap();
+        assert!(st.is_own_address(ip("100.64.10.1")));
+        assert!(st.is_own_address(ip("fd7a:115c:a1e0::a01")));
+        assert!(!st.is_own_address(ip("100.64.10.4")), "a peer's address");
+        assert!(!st.is_own_address(ip("100.72.3.4")), "in the range, but not Tailscale's");
+        // Not while Tailscale is down, whatever it still lists for this device.
+        let doc = br#"{"BackendState":"Stopped","Self":{"HostName":"me","TailscaleIPs":["100.64.0.1"]}}"#;
+        let st = parse_status(doc).unwrap();
+        assert!(st.self_device().is_some() && !st.is_own_address(ip("100.64.0.1")));
+        assert!(!parse_status(br#"{"BackendState":"Running"}"#).unwrap().is_own_address(ip("100.64.0.1")));
     }
 
     #[test]
