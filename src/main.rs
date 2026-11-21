@@ -73,7 +73,8 @@ VIEWER OPTIONS:
   --fullscreen             Start in full screen (toggle: Ctrl+Alt+Enter)
   --clipboard              Share text clipboard (host must allow it)
   --view-only              Do not send keyboard or mouse input
-  --allow-capture          Let local screenshot/recording tools capture the viewer window
+  --allow-capture          (Windows) Let local screenshot/recording tools capture the viewer
+                           window; on Linux (X11) they always can
   --downscale <2|3|4>      Ask the host for 1/N resolution (e.g. 4K host on a laptop or slow link)
   --quality <q>            lossless | balanced (default) | low
   --monitor <n|all>        Which host monitor to show (1 = primary)

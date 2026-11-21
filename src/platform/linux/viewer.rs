@@ -885,6 +885,16 @@ impl Ui {
     }
 }
 
+/// What to tell the user about local screen capture. Windows keeps the viewer window out of
+/// screenshots and recordings unless `--allow-capture` is given; X11 has no such protection,
+/// so the user who relies on that default is the one to warn.
+fn capture_warning(allow_capture: bool) -> Option<&'static str> {
+    (!allow_capture).then_some(
+        "warning: X11 cannot keep the viewer window out of screen capture: screenshot, recording and \
+         screen-sharing programs on this display can see the remote screen",
+    )
+}
+
 /// Window title from the host's (untrusted) name.
 fn title(host_name: &str, target: &str) -> String {
     let name: String = printable(host_name).chars().take(64).collect();
@@ -899,8 +909,8 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     drop(psk);
     check_size(w, h)?;
     let view_only = opts.view_only || flags & F_VIEW_ONLY != 0;
-    if opts.allow_capture {
-        log!("note: X11 cannot hide windows from screen capture; --allow-capture changes nothing here");
+    if let Some(warning) = capture_warning(opts.allow_capture) {
+        log!("{warning}");
     }
 
     let wake = Wake::new()?;
@@ -1066,6 +1076,12 @@ mod tests {
         }
         // Focus moving into a child window stays with us.
         assert!(!focus_moved_away(x11::NOTIFY_INFERIOR, NOTIFY_NORMAL));
+    }
+
+    #[test]
+    fn capture_warning_goes_to_those_relying_on_the_default() {
+        assert!(capture_warning(false).is_some_and(|w| w.contains("X11") && w.contains("screen capture")));
+        assert_eq!(capture_warning(true), None);
     }
 
     #[test]
