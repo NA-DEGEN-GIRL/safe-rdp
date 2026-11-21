@@ -21,7 +21,6 @@ fn desktop_name(h: HDESK) -> String {
 pub struct DesktopFollower {
     /// The desktop we opened and moved the thread to; null until the first switch.
     handle: HDESK,
-    name: String,
     /// The thread's desktop when we started; not ours to close.
     orig: HDESK,
 }
@@ -29,11 +28,13 @@ pub struct DesktopFollower {
 impl DesktopFollower {
     pub fn new() -> DesktopFollower {
         let orig = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
-        DesktopFollower { handle: std::ptr::null_mut(), name: desktop_name(orig), orig }
+        DesktopFollower { handle: std::ptr::null_mut(), orig }
     }
 
-    /// Moves the calling thread to the current input desktop if it changed; true if it moved.
-    /// The thread must not own windows or hooks.
+    /// Moves the calling thread to the current input desktop if it is elsewhere; true if it
+    /// moved. The thread must not own windows or hooks. Another follower on the same thread
+    /// (the input injector has one) may have moved it since our last switch, so this looks at
+    /// where the thread is rather than where we put it.
     pub fn sync(&mut self) -> bool {
         unsafe {
             let access = DESKTOP_CREATEMENU
@@ -49,7 +50,7 @@ impl DesktopFollower {
                 return false;
             }
             let name = desktop_name(h);
-            if name == self.name || SetThreadDesktop(h) == 0 {
+            if name == desktop_name(GetThreadDesktop(GetCurrentThreadId())) || SetThreadDesktop(h) == 0 {
                 CloseDesktop(h);
                 return false;
             }
@@ -58,7 +59,6 @@ impl DesktopFollower {
             }
             crate::log!("switched to desktop '{name}'");
             self.handle = h;
-            self.name = name;
             true
         }
     }
@@ -95,9 +95,10 @@ mod tests {
             let mut f = DesktopFollower::new();
             assert!(!f.release(), "nothing to close before any switch");
             let orig = GetThreadDesktop(GetCurrentThreadId());
+            let name = desktop_name(orig);
             // Stands in for a switch: the same desktop through a handle of our own.
-            let h = OpenDesktopW(wide(&f.name).as_ptr(), 0, 0, DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_CREATEWINDOW);
-            assert!(!h.is_null(), "OpenDesktopW({}) failed", f.name);
+            let h = OpenDesktopW(wide(&name).as_ptr(), 0, 0, DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_CREATEWINDOW);
+            assert!(!h.is_null(), "OpenDesktopW({name}) failed");
             assert!(SetThreadDesktop(h) != 0);
             assert_eq!(GetThreadDesktop(GetCurrentThreadId()), h);
             f.handle = h;
@@ -105,6 +106,39 @@ mod tests {
             assert!(f.handle.is_null());
             assert_eq!(GetThreadDesktop(GetCurrentThreadId()), orig);
             drop(f);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn sync_goes_by_where_the_thread_is_not_where_it_was_left() {
+        std::thread::spawn(|| unsafe {
+            let orig = GetThreadDesktop(GetCurrentThreadId());
+            let input = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+            if input.is_null() {
+                return; // the lock screen: nothing to follow
+            }
+            let input_name = desktop_name(input);
+            CloseDesktop(input);
+            if desktop_name(orig) != input_name {
+                return;
+            }
+            let mut f = DesktopFollower::new();
+            assert!(!f.sync(), "moved although already on the input desktop");
+            // Another follower takes the thread elsewhere: to a desktop of its own that is
+            // never shown.
+            let name = wide(&format!("safe-rdp-test-{}", std::process::id()));
+            let access = DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS;
+            let other = CreateDesktopW(name.as_ptr(), std::ptr::null(), std::ptr::null(), 0, access, std::ptr::null());
+            assert!(!other.is_null(), "CreateDesktopW failed");
+            assert!(SetThreadDesktop(other) != 0);
+            assert!(f.sync(), "the thread was left off the input desktop");
+            assert_eq!(desktop_name(GetThreadDesktop(GetCurrentThreadId())), input_name);
+            assert!(!f.sync());
+            drop(f);
+            assert_eq!(GetThreadDesktop(GetCurrentThreadId()), orig);
+            assert!(CloseDesktop(other) != 0);
         })
         .join()
         .unwrap();
