@@ -16,8 +16,8 @@ const MAX_PENDING: usize = 4096;
 /// SendInput call with that event has returned. The hooks run within the call; this is only a
 /// margin, should one of them get to see the event late.
 const ADDED_GRACE: Duration = Duration::from_millis(250);
-/// How often, and for how long after its session ended, releases that Windows refused are sent
-/// again (see `Leftovers`).
+/// How often releases that Windows refused are sent again (see `Injector::retry_owed`), and for
+/// how long after their session ended (see `Leftovers`).
 const RETRY_EVERY: Duration = Duration::from_millis(500);
 const RETRY_FOR: Duration = Duration::from_secs(600);
 
@@ -307,10 +307,12 @@ pub struct Injector {
     /// Keys and buttons the remote user holds down.
     keys: HashSet<HeldKey>,
     buttons: [bool; 5],
-    /// Releases Windows refused, sent again ahead of the next event and by `release_all`: a
-    /// lost release would leave the key held down on the host. Those still owed when the
-    /// injector is dropped become `Leftovers`.
+    /// Releases Windows refused, sent again ahead of the next event, by `retry_owed` and by
+    /// `release_all`: a lost release would leave the key held down on the host. Those still
+    /// owed when the injector is dropped become `Leftovers`.
     owed: Vec<Held>,
+    /// When `retry_owed` may try them again.
+    retry_at: Instant,
     /// The host follows the input desktop now and then; this follows it the moment Windows
     /// refuses an event, so that the event goes to the new desktop instead of nowhere.
     desktop: DesktopFollower,
@@ -318,9 +320,11 @@ pub struct Injector {
 
 impl Default for Injector {
     fn default() -> Injector {
-        // Releases an earlier session could not send go out ahead of this one's first event.
+        // Releases an earlier session could not send go out ahead of this one's first event,
+        // or by `retry_owed` once the input desktop is back, whichever comes first.
         let owed = leftovers(|l| std::mem::take(&mut l.held));
-        Injector { area: Area::default(), keys: HashSet::new(), buttons: [false; 5], owed, desktop: DesktopFollower::new() }
+        let desktop = DesktopFollower::new();
+        Injector { area: Area::default(), keys: HashSet::new(), buttons: [false; 5], owed, retry_at: Instant::now(), desktop }
     }
 }
 
@@ -505,6 +509,19 @@ impl Injector {
         }
         self.deliver(None);
     }
+
+    /// Tries again, at most every `RETRY_EVERY`, to send the releases still owed, those taken
+    /// over from an earlier session included. The input thread calls this between messages, so
+    /// that they go out soon after the input desktop is back even when the viewer sends no
+    /// input (view-only, the probe, or left alone): until then the keys stay held on the host.
+    pub fn retry_owed(&mut self) {
+        let now = Instant::now();
+        if self.owed.is_empty() || now < self.retry_at {
+            return;
+        }
+        self.retry_at = now + RETRY_EVERY;
+        self.deliver(None);
+    }
 }
 
 impl Drop for Injector {
@@ -560,9 +577,10 @@ fn follow(desktop: &mut DesktopFollower) -> bool {
 
 /// Releases still owed when their injector was dropped: its session ended while the input
 /// desktop was out of reach (the lock screen or a UAC prompt, for a host that is not a
-/// service), and the viewer that could have sent more input is gone. The next injector sends
-/// them ahead of anything else; until then a thread of their own tries every `RETRY_EVERY`,
-/// for `RETRY_FOR`, so that the keys are let go of soon after the desktop comes back.
+/// service), and the viewer that could have sent more input is gone. The next injector takes
+/// them over, sends them ahead of anything else and keeps trying them (`retry_owed`); until
+/// then a thread of their own tries every `RETRY_EVERY`, for `RETRY_FOR`, so that the keys are
+/// let go of soon after the desktop comes back.
 struct Leftovers {
     held: Vec<Held>,
     /// That thread is running.
@@ -624,7 +642,7 @@ fn retry_leftovers() {
 }
 
 /// Tries once to send the leftovers. False when the thread is done: nothing is left (the next
-/// injector may have taken them) or this was its `last` try.
+/// injector may have taken them, and tries them from then on) or this was its `last` try.
 fn retry_once(desktop: &mut DesktopFollower, last: bool) -> bool {
     leftovers(|l| {
         if !l.held.is_empty() {
@@ -910,6 +928,53 @@ mod tests {
         // Nothing left for the thread, should it still run.
         assert!(!retry_once(&mut desktop, false));
         assert!(world(|w| w.taken.is_empty()));
+    }
+
+    #[test]
+    fn owed_releases_go_out_without_further_input() {
+        let _armed = armed_for_test();
+        let mut inj = Injector::default();
+        inj.handle(&key_msg(LCTRL, false));
+        inj.handle(&ClientMsg::MouseButton { button: 0, down: true });
+        world(|w| w.taken.clear());
+        // A UAC prompt comes up, which a host that is not a service cannot follow, and the
+        // viewer leaves.
+        world(|w| (w.off_desktop, w.unreachable) = (true, true));
+        drop(inj);
+        assert_eq!(world(|w| w.retry_threads), 1);
+        // A viewer that sends no input (view-only, or left alone) connects while the prompt is
+        // up and takes the releases over, and the thread that tried them stops.
+        let mut inj = Injector::default();
+        let mut desktop = DesktopFollower::new();
+        assert!(!retry_once(&mut desktop, false));
+        inj.retry_owed();
+        assert_eq!(inj.owed, [held(LCTRL), Held::Button(0)]);
+        // The prompt is answered: they go out at the session's next try, not before.
+        world(|w| (w.off_desktop, w.unreachable) = (false, false));
+        inj.retry_owed();
+        assert!(world(|w| w.taken.is_empty()), "tried again within RETRY_EVERY");
+        inj.retry_at = Instant::now();
+        inj.retry_owed();
+        let left_up = Ev::Mouse { flags: MOUSEEVENTF_LEFTUP, data: 0 };
+        assert_eq!(world(|w| std::mem::take(&mut w.taken)), [sc(0x1d, true), left_up]);
+        assert!(inj.owed.is_empty());
+        // The session's own refused releases are tried again just the same.
+        inj.handle(&key_msg(LALT, false));
+        world(|w| (w.off_desktop, w.unreachable, w.taken) = (true, true, Vec::new()));
+        inj.handle(&key_msg(LALT, true));
+        inj.retry_at = Instant::now();
+        inj.retry_owed();
+        assert_eq!(inj.owed, [held(LALT)]);
+        world(|w| (w.off_desktop, w.unreachable) = (false, false));
+        inj.retry_at = Instant::now();
+        inj.retry_owed();
+        assert_eq!(world(|w| std::mem::take(&mut w.taken)), [sc(0x38, true)]);
+        // Nothing owed, nothing sent; and nothing is left over.
+        inj.retry_at = Instant::now();
+        inj.retry_owed();
+        drop(inj);
+        assert!(world(|w| w.taken.is_empty()) && leftovers(|l| l.held.is_empty()));
+        assert_eq!(world(|w| w.retry_threads), 1);
     }
 
     #[test]
