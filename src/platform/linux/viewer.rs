@@ -43,7 +43,22 @@ fn check_size(w: usize, h: usize) -> Result<()> {
 /// window, or from the pointer-root focus it was getting keys through. Grabs and ungrabs
 /// (our own included) move no focus.
 fn focus_moved_away(detail: u8, mode: u8) -> bool {
-    detail != x11::NOTIFY_INFERIOR && matches!(mode, NOTIFY_NORMAL | NOTIFY_WHILE_GRABBED)
+    detail != x11::NOTIFY_INFERIOR && moves_focus(mode)
+}
+
+/// Whether a focus event of `mode` reports the focus moving (FocusIn: keys now come to this
+/// window). Those of a grab or ungrab do not: another client grabbing the keyboard on the root
+/// sends a FocusIn (detail Pointer) to the window under the pointer, which has no focus.
+fn moves_focus(mode: u8) -> bool {
+    matches!(mode, NOTIFY_NORMAL | NOTIFY_WHILE_GRABBED)
+}
+
+/// Whether after a FocusOut the keys held now are released elsewhere: the focus moved away, or
+/// another client grabbed the keyboard. A grab's FocusOut with detail Pointer is left out: our
+/// own grab sends one under a pointer-root focus, while the keys still come here.
+fn keys_released_elsewhere(detail: u8, mode: u8) -> bool {
+    focus_moved_away(detail, mode)
+        || (detail != x11::NOTIFY_INFERIOR && detail != x11::NOTIFY_POINTER && mode != x11::NOTIFY_UNGRAB)
 }
 
 /// Cursor-font glyphs for the mirrored shapes (`None`: inherit the desktop's themed arrow).
@@ -757,7 +772,7 @@ impl Ui {
             return Ok(());
         }
         if self.typed_elsewhere() {
-            // Its release is held back too.
+            // Its release is held back too, if it comes before the focus is back.
             if press {
                 self.swallowed.insert(evdev);
             }
@@ -837,14 +852,27 @@ impl Ui {
                 }
             }
             Event::Focus { focus_in: false, detail, mode } => {
-                if detail != x11::NOTIFY_INFERIOR && detail != x11::NOTIFY_POINTER && mode != x11::NOTIFY_UNGRAB {
+                if keys_released_elsewhere(detail, mode) {
                     self.release_all();
                 }
                 if focus_moved_away(detail, mode) {
                     self.view.focus_lost()?;
                 }
             }
-            Event::Focus { focus_in: true, .. } => self.view.focus_gained()?,
+            Event::Focus { focus_in: true, mode, .. } => {
+                if moves_focus(mode) {
+                    if !self.view.focused {
+                        // Keys seen while the focus was elsewhere were released there.
+                        self.mods.clear();
+                        self.swallowed.clear();
+                    }
+                    self.view.focus_gained()?;
+                } else {
+                    // A grab or ungrab, which brings no focus: only retry a grab that failed
+                    // while another client held the keyboard.
+                    self.view.try_grab()?;
+                }
+            }
             Event::Expose { x, y, width, height, count } => {
                 let r = (x as usize, y as usize, x as usize + width as usize, y as usize + height as usize);
                 self.expose = Some(match self.expose {
@@ -1036,6 +1064,9 @@ mod tests {
     use crate::screen::Area;
     use std::time::Instant;
 
+    /// The FocusIn/FocusOut mode of a grab itself.
+    const NOTIFY_GRAB: u8 = 1;
+
     #[test]
     fn scaling() {
         // Identity copies the region only.
@@ -1113,6 +1144,33 @@ mod tests {
         }
         // Focus moving into a child window stays with us.
         assert!(!focus_moved_away(x11::NOTIFY_INFERIOR, NOTIFY_NORMAL));
+        // FocusIn: only a focus change gives us the keys, not another client grabbing the
+        // keyboard on the root (detail Pointer, to the window under the pointer) or letting go.
+        assert!(moves_focus(NOTIFY_NORMAL) && moves_focus(NOTIFY_WHILE_GRABBED));
+        assert!(!moves_focus(GRAB) && !moves_focus(x11::NOTIFY_UNGRAB));
+    }
+
+    #[test]
+    fn focus_changes_that_release_held_keys() {
+        const ANCESTOR: u8 = 0;
+        const NONLINEAR: u8 = 3;
+        for detail in [ANCESTOR, NONLINEAR, x11::NOTIFY_POINTER] {
+            // Whenever the focus moves away (the keyboard then goes with it), the pointer-root
+            // focus included.
+            for mode in [NOTIFY_NORMAL, NOTIFY_WHILE_GRABBED] {
+                assert!(keys_released_elsewhere(detail, mode), "{detail} {mode}");
+                assert_eq!(keys_released_elsewhere(detail, mode), focus_moved_away(detail, mode));
+            }
+            // An ungrab, ours included, brings the keys back if anything.
+            assert!(!keys_released_elsewhere(detail, x11::NOTIFY_UNGRAB), "{detail}");
+        }
+        // Another client grabbed the keyboard; with detail Pointer it can be our own grab.
+        assert!(keys_released_elsewhere(ANCESTOR, NOTIFY_GRAB) && keys_released_elsewhere(NONLINEAR, NOTIFY_GRAB));
+        assert!(!keys_released_elsewhere(x11::NOTIFY_POINTER, NOTIFY_GRAB));
+        // Focus moving into a child window stays with us.
+        for mode in [NOTIFY_NORMAL, NOTIFY_GRAB, x11::NOTIFY_UNGRAB, NOTIFY_WHILE_GRABBED] {
+            assert!(!keys_released_elsewhere(x11::NOTIFY_INFERIOR, mode), "{mode}");
+        }
     }
 
     #[test]
@@ -1444,11 +1502,117 @@ mod tests {
         ui.pump().unwrap();
         let got = drain_messages(&rx);
         assert!(!got.iter().any(|m| matches!(m, ClientMsg::Key { .. })), "{got:?}");
+        // A press still caught before the server let the keyboard go is dropped; its release
+        // goes to the other window.
+        let key_a = (30 + X_KEYCODE_OFFSET) as u8;
+        ui.on_event(Event::Key { press: true, keycode: key_a, time: 0, state: 0 }, None).unwrap();
+        assert!(drain_messages(&rx).is_empty());
 
-        // The focus comes back: so does the grab.
+        // A third program grabs the keyboard on the root and lets go, as a global shortcut does,
+        // while the pointer rests over the viewer (which covers the screen). The viewer is told
+        // (FocusIn, detail Pointer) but has no focus: it must not take the keyboard, though by
+        // the time it looks nobody holds it.
+        inj.set_area(Area { left: 0, top: 0, width: 400, height: 300 });
+        inj.handle(&ClientMsg::MouseMove { x: 200, y: 150 });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // QueryPointer: the top-level window under the pointer.
+            let seq = other.send(x11::Req::new(38, 0).u32(root)).unwrap();
+            let r = other.reply(seq).unwrap();
+            if u32::from_le_bytes(r[12..16].try_into().unwrap()) == ui.view.win {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the pointer is not over the viewer");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut third = Conn::connect(&t).unwrap();
+        assert!(third.grab_keyboard(root).unwrap());
+        third.ungrab_keyboard().unwrap();
+        third.sync().unwrap();
+        ui.view.conn.sync().unwrap();
+        let mut seen = Vec::new();
+        while let Some(e) = ui.view.conn.poll_event().unwrap() {
+            seen.push(e);
+        }
+        let told = Event::Focus { focus_in: true, detail: x11::NOTIFY_POINTER, mode: NOTIFY_GRAB };
+        assert!(seen.contains(&told), "{seen:?}");
+        for e in seen {
+            ui.on_event(e, None).unwrap();
+        }
+        assert!(!ui.view.focused);
+        // As a later Configure or Map of the window does.
+        ui.view.try_grab().unwrap();
+        assert!(!viewer_holds_keyboard(&mut other));
+
+        // The focus comes back while the third program holds the keyboard: the grab follows
+        // once it lets go.
+        assert!(third.grab_keyboard(root).unwrap());
         ui.view.conn.set_input_focus(ui.view.win).unwrap();
         ui.view.conn.sync().unwrap();
-        pump_until(&mut ui, |ui| ui.view.focused && !ui.view.want_grab);
+        pump_until(&mut ui, |ui| ui.view.focused);
+        assert!(ui.view.want_grab, "grabbed while another program held the keyboard");
+        third.ungrab_keyboard().unwrap();
+        third.sync().unwrap();
+        pump_until(&mut ui, |ui| !ui.view.want_grab);
         assert!(viewer_holds_keyboard(&mut other));
+
+        // The press dropped earlier does not hold back the next release of that key.
+        drain_messages(&rx);
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: 0 });
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: KEY_UP });
+        let mut keys = Vec::new();
+        pump_until(&mut ui, |_| {
+            keys.extend(drain_messages(&rx).into_iter().filter(|m| matches!(m, ClientMsg::Key { .. })));
+            keys.len() >= 2
+        });
+        assert_eq!(keys, [ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: 0 }, ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: KEY_UP }]);
+    }
+
+    /// Without a window manager keys follow the pointer (pointer-root focus). When another
+    /// program takes the focus from there, the full-screen viewer lets the keyboard go and the
+    /// host lets go of the keys it holds.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn full_screen_lets_go_of_the_pointer_root_focus() {
+        let vd = VirtualDisplay::spawn(Some(91), 400, 300, None).unwrap();
+        let t = vd.target();
+        let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - pointer root", 640, 480, false).unwrap();
+        let rx = Arc::new(OutQueue::default());
+        let mut ui = Ui::new(view, rx.clone(), false, false).unwrap();
+        let mut other = Conn::connect(&t).unwrap();
+        let root = other.root();
+        let win = other.create_window(root, 0, 0, 50, 50, 1, x11::CW_EVENT_MASK, &[x11::KEY_PRESS_MASK]).unwrap();
+        other.map_window(win).unwrap();
+        other.sync().unwrap();
+        assert!(ui.view.focused, "no window manager: keys follow the pointer");
+        ui.view.toggle_fullscreen().unwrap();
+        pump_until(&mut ui, |ui| ui.view.size == (400, 300) && !ui.view.want_grab);
+
+        // Ctrl held down over the viewer reaches the host. Our own grab (FocusOut, detail
+        // Pointer) released nothing.
+        let mut inj = Injector::on(t.clone());
+        inj.set_area(Area { left: 0, top: 0, width: 400, height: 300 });
+        inj.handle(&ClientMsg::MouseMove { x: 200, y: 150 });
+        inj.handle(&ClientMsg::Key { vk: 0xa2, scan: 0x1d, flags: 0 });
+        let mut got = Vec::new();
+        pump_until(&mut ui, |_| {
+            got.extend(drain_messages(&rx));
+            got.iter().any(|m| matches!(m, ClientMsg::Key { .. }))
+        });
+        assert!(!got.contains(&ClientMsg::ReleaseAll), "{got:?}");
+        assert!(ui.mods.contains(&KEY_LEFTCTRL));
+
+        // Another program takes the focus: the grab goes, and so does the key on the host.
+        other.set_input_focus(win).unwrap();
+        other.sync().unwrap();
+        pump_until(&mut ui, |ui| !ui.view.focused);
+        ui.view.conn.sync().unwrap();
+        let got = drain_messages(&rx);
+        assert!(got.contains(&ClientMsg::ReleaseAll), "{got:?}");
+        assert!(ui.mods.is_empty());
+        let free = other.grab_keyboard(win).unwrap();
+        assert!(free, "the viewer kept the keyboard");
+        other.ungrab_keyboard().unwrap();
+        inj.handle(&ClientMsg::Key { vk: 0xa2, scan: 0x1d, flags: KEY_UP });
     }
 }
