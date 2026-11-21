@@ -1399,8 +1399,8 @@ mod tests {
         let vd = VirtualDisplay::spawn(Some(83), 400, 300, None).unwrap();
         let t = vd.target();
         let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - focus", 640, 480, false).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let mut ui = Ui::new(view, tx, false, false).unwrap();
+        let rx = Arc::new(OutQueue::default());
+        let mut ui = Ui::new(view, rx.clone(), false, false).unwrap();
         // Another local program with a window of its own.
         let mut other = Conn::connect(&t).unwrap();
         let root = other.root();
