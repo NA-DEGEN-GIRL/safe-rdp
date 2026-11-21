@@ -50,6 +50,11 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
     }
     println!("cargo:rustc-link-arg-bins=delayimp.lib");
+    // The bins' unit-test harness is linked with these too and calls nothing in some of the
+    // DLLs (sas.dll), which link.exe reports on every `cargo test` (LNK4199, /DELAYLOAD
+    // ignored). Only that warning is turned off, and only where /DELAYLOAD is passed; what the
+    // executable does import is checked by tests/dll_imports.rs.
+    println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
     // .cargo/config.toml links the C runtime statically, so the executable needs no Visual C++
     // redistributable on the other PC. RUSTFLAGS from the environment, or building from outside
     // this directory, replaces that setting without a word: say so.
