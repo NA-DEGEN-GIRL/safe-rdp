@@ -74,6 +74,9 @@ pub const QUALITY_LOSSLESS: u32 = 0;
 pub const QUALITY_BALANCED: u32 = 1;
 /// Stronger lossy compression for slow links, refinement only after a longer pause.
 pub const QUALITY_LOW: u32 = 2;
+/// Hello quality of a viewer that leaves the choice to the host (`host --quality`); the host
+/// then reports the quality in effect with a `State`.
+pub const QUALITY_DEFAULT: u8 = 0xff;
 
 /// `SET_MONITOR` / hello monitor values besides a zero-based index.
 pub const MONITOR_ALL: u8 = 0xff;

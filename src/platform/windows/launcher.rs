@@ -107,8 +107,9 @@ const ID_KEY_TEXT: u16 = 405;
 const ID_COPY: u16 = 406;
 const ID_HIDE: u16 = 407;
 
-/// `--quality` values in the order of the quality list.
-const QUALITY_ARGS: [&str; 3] = ["balanced", "lossless", "low"];
+/// `--quality` values in the order of the quality list ("" = the host's choice). Balanced
+/// comes last so that saved choices keep their indices.
+const QUALITY_ARGS: [&str; 4] = ["", "lossless", "low", "balanced"];
 /// `--monitor` values in the order of the monitor list ("" = the host's choice).
 const MONITOR_ARGS: [&str; 6] = ["", "1", "2", "3", "4", "all"];
 
@@ -142,7 +143,7 @@ struct Text {
     opt_privacy: &'static str,
     opt_view_only: &'static str,
     quality: &'static str,
-    qualities: [&'static str; 3],
+    qualities: [&'static str; 4],
     scale: &'static str,
     scales: [&'static str; 4],
     monitor: &'static str,
@@ -260,7 +261,7 @@ static EN: Text = Text {
     opt_privacy: "Blank the remote screen",
     opt_view_only: "View only",
     quality: "Quality",
-    qualities: ["Balanced", "Best (lossless)", "Low bandwidth"],
+    qualities: ["Default", "Best (lossless)", "Low bandwidth", "Balanced"],
     scale: "Resolution",
     scales: ["Full", "1/2", "1/3", "1/4"],
     monitor: "Monitor",
@@ -383,7 +384,7 @@ static KO: Text = Text {
     opt_privacy: "원격 PC 화면 가리기",
     opt_view_only: "보기 전용",
     quality: "화질",
-    qualities: ["균형", "최고 (무손실)", "저대역폭"],
+    qualities: ["기본", "최고 (무손실)", "저대역폭", "균형"],
     scale: "해상도",
     scales: ["원본", "1/2", "1/3", "1/4"],
     monitor: "모니터",
@@ -660,7 +661,7 @@ fn viewer_args(target: &str, o: &ConnectOptions) -> Vec<String> {
             a.push(flag.into());
         }
     }
-    if let Some(q) = QUALITY_ARGS.get(o.quality).filter(|_| o.quality != 0) {
+    if let Some(q) = QUALITY_ARGS.get(o.quality).filter(|q| !q.is_empty()) {
         a.extend(["--quality".into(), q.to_string()]);
     }
     if (1..=3).contains(&o.scale) {
@@ -3715,6 +3716,9 @@ mod tests {
         );
         let o = ConnectOptions { clipboard: false, audio: false, quality: 2, scale: 1, monitor: 2, ..Default::default() };
         assert_eq!(viewer_args("pc", &o), ["connect", "pc", "--quality", "low", "--downscale", "2", "--monitor", "2"]);
+        // The first quality leaves the choice to the host; balanced has to be asked for.
+        let o = ConnectOptions { clipboard: false, audio: false, quality: 3, ..Default::default() };
+        assert_eq!(viewer_args("pc", &o), ["connect", "pc", "--quality", "balanced"]);
         // Out-of-range indices add nothing.
         let o = ConnectOptions { clipboard: false, audio: false, quality: 7, scale: 9, monitor: 9, ..Default::default() };
         assert_eq!(viewer_args("pc", &o), ["connect", "pc"]);

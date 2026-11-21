@@ -75,7 +75,7 @@ VIEWER OPTIONS:
   --view-only              Do not send keyboard or mouse input
   --allow-capture          Let local screenshot/recording tools capture the viewer window
   --downscale <2|3|4>      Ask the host for 1/N resolution (e.g. 4K host on a laptop or slow link)
-  --quality <q>            lossless | balanced (default) | low
+  --quality <q>            lossless | balanced | low (default: the host's --quality, else balanced)
   --monitor <n|all>        Which host monitor to show (1 = primary)
   --audio                  Play the host's sound
   --privacy                Blank the host's screen and block its local input while connected

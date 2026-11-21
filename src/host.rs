@@ -2,7 +2,7 @@
 //!
 //! One session at a time; a new viewer replaces the current one. Inside a session:
 //! * the capture thread grabs, encodes and sends frames (at most `MAX_IN_FLIGHT` unacknowledged),
-//!   applies quality, scale and monitor changes and spends idle ticks on lossless refinement;
+//!   applies quality, scale and monitor changes and refines lossy regions once they settle;
 //! * the input thread handles everything the viewer sends: input, clipboard, settings, uploads;
 //! * helpers run beside them: the text clipboard bridge, audio capture with its sender thread,
 //!   and a file-pull thread that yields the socket to frames between chunks.
@@ -33,7 +33,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -105,8 +105,15 @@ const QUIET_PER_ADDR: u32 = 3;
 const QUIET_TOTAL: u32 = 20;
 /// Lines a viewer can cause at will (refusals) that one session logs.
 const SESSION_LOG_LINES: u32 = 20;
-/// Lossless refinement sent per idle capture tick.
+/// Bytes one capture tick spends on changed regions and lossless refinement together;
+/// refinement still adds one run when the changes took all of it, so it always progresses.
 const REFINE_BUDGET: usize = 256 * 1024;
+/// Setting changes waiting for the capture thread, which applies at most this many per tick.
+/// A viewer that sends more waits for it, so a flood of `Set`s neither grows the queue nor
+/// keeps the capture thread from frames and its checks.
+const SETTINGS_QUEUE: usize = 16;
+/// Longest the host spends telling a replaced viewer that its session ends.
+const FAREWELL: Duration = Duration::from_secs(1);
 /// Uploads a viewer may have open at once.
 const MAX_UPLOADS: usize = 4;
 /// Longest a file chunk waits for frames and replies to go first.
@@ -136,6 +143,8 @@ struct SessionCtl {
     stop: AtomicBool,
     finished: AtomicBool,
     sock: TcpStream,
+    /// The session's sending half while it has one, for `kick_with_notice`.
+    out: Mutex<Option<Arc<Out>>>,
 }
 
 impl SessionCtl {
@@ -143,6 +152,15 @@ impl SessionCtl {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.sock.shutdown(Shutdown::Both);
         wake_blocked_io(&self.sock);
+    }
+    /// Ends the session after telling the viewer why. A viewer reconnects after a close it was
+    /// not told about, which for a replaced one would throw the newcomer out in turn.
+    fn kick_with_notice(&self, text: &str) {
+        let out = lock(&self.out).clone();
+        if let Some(out) = out {
+            out.farewell(&self.sock, text, &self.stop);
+        }
+        self.kick();
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
@@ -554,7 +572,7 @@ fn handshake(stream: &TcpStream, psk: &[u8; 32], until: Instant) -> Result<chann
 
 fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys) {
     let Ok(sock) = stream.try_clone() else { return };
-    let ctl = Arc::new(SessionCtl { stop: AtomicBool::new(false), finished: AtomicBool::new(false), sock });
+    let ctl = Arc::new(SessionCtl { stop: AtomicBool::new(false), finished: AtomicBool::new(false), sock, out: Mutex::new(None) });
     let old = {
         let mut cur = lock(&host.current);
         if host.stopping.load(Ordering::SeqCst) {
@@ -564,12 +582,13 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
     };
     if let Some(old) = old {
         log!("replacing the existing session");
-        old.kick();
+        old.kick_with_notice("another viewer connected to this host");
         // Let it release its screen duplication, injected keys and privacy mode first.
         old.wait_finished(Duration::from_secs(5));
     }
     log!("session started: {peer}");
     let r = run_session(host, stream, keys, &ctl);
+    lock(&ctl.out).take();
     ctl.kick();
     {
         let mut cur = lock(&host.current);
@@ -624,6 +643,32 @@ impl Out {
     fn notice(&self, text: String) -> Result<()> {
         self.send(&ServerMsg::Notice(short(text)))
     }
+
+    /// Sends `text` as the session's last message and ends the stream behind it, then keeps
+    /// the writer until the viewer hangs up (its session's input side ends: `ended`) or
+    /// `FAREWELL` is over. Meanwhile no other thread can fail on the closed socket and get the
+    /// connection reset, which could discard the notice before the viewer has read it. A writer
+    /// busy for all of `FAREWELL` (a viewer that does not read) means no notice.
+    fn farewell(&self, sock: &TcpStream, text: &str, ended: &AtomicBool) {
+        let t = Instant::now();
+        let mut w = loop {
+            match self.w.try_lock() {
+                Ok(w) => break w,
+                Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(TryLockError::WouldBlock) if t.elapsed() < FAREWELL => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryLockError::WouldBlock) => return,
+            }
+        };
+        let _ = sock.set_write_timeout(Some(FAREWELL.saturating_sub(t.elapsed()).max(Duration::from_millis(50))));
+        let mut b = Vec::new();
+        ServerMsg::Notice(short(text.into())).encode(&mut b);
+        if w.send(&b).is_err() || sock.shutdown(Shutdown::Write).is_err() {
+            return;
+        }
+        while !ended.load(Ordering::SeqCst) && t.elapsed() < FAREWELL {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// What the viewer's coordinates refer to: the captured area at 1/`downscale` resolution.
@@ -650,12 +695,16 @@ struct Start {
     monitor_missing: bool,
     downscale: usize,
     quality: u32,
+    /// The hello named no quality (`QUALITY_DEFAULT`, or one this host does not know):
+    /// `quality` is the host's default, and the viewer is told which.
+    host_quality: bool,
     audio: bool,
     privacy: bool,
 }
 
 fn negotiate(opts: &HostOptions, downscale: u8, quality: u8, monitor: u8, flags: u8, exists: impl Fn(MonitorSel) -> bool) -> Start {
     let fallback = if opts.default_quality <= QUALITY_LOW { opts.default_quality } else { QUALITY_BALANCED };
+    let host_quality = quality as u32 > QUALITY_LOW;
     // What the viewer asked for, else the host's choice, else (unplugged) the primary monitor.
     let (sel, monitor_missing) = match monitor_sel(monitor as u32, opts.monitor).filter(|&s| exists(s)) {
         Some(s) => (s, false),
@@ -666,7 +715,8 @@ fn negotiate(opts: &HostOptions, downscale: u8, quality: u8, monitor: u8, flags:
         sel,
         monitor_missing,
         downscale: downscale.clamp(1, 4) as usize,
-        quality: if quality as u32 <= QUALITY_LOW { quality as u32 } else { fallback },
+        quality: if host_quality { fallback } else { quality as u32 },
+        host_quality,
         audio: flags & HELLO_AUDIO != 0,
         privacy: flags & HELLO_PRIVACY != 0,
     }
@@ -754,6 +804,12 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         monitors,
         name: crate::platform::hostname(),
     })?;
+    // From here on a replacement can say goodbye: the viewer has its hello.
+    *lock(&ctl.out) = Some(out.clone());
+    if start.host_quality {
+        // The viewer left the quality to this host: tell it which one is in effect.
+        out.send(&ServerMsg::State { key: SET_QUALITY, value: start.quality })?;
+    }
     if start.monitor_missing {
         log!("the configured monitor is not connected; sharing the primary monitor");
         out.notice("the monitor this host is set to share is not connected; showing the primary monitor".into())?;
@@ -779,7 +835,7 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         None
     };
 
-    let (settings_tx, settings_rx) = mpsc::channel();
+    let (settings_tx, settings_rx) = mpsc::sync_channel(SETTINGS_QUEUE);
     let input_thread = {
         let (host, out, shared, ctl) = (host.clone(), out.clone(), shared.clone(), ctl.clone());
         let wishes = (start.audio, start.privacy);
@@ -811,7 +867,7 @@ struct Input {
     ctl: Arc<SessionCtl>,
     clip: Option<Clipboard>,
     /// Quality, scale and monitor changes for the capture thread, which confirms them.
-    settings: mpsc::Sender<(u8, u32)>,
+    settings: mpsc::SyncSender<(u8, u32)>,
     inj: Injector,
     follower: DesktopFollower,
     last_sync: Instant,
@@ -835,7 +891,7 @@ impl Input {
         shared: Arc<Shared>,
         ctl: Arc<SessionCtl>,
         clip: Option<Clipboard>,
-        settings: mpsc::Sender<(u8, u32)>,
+        settings: mpsc::SyncSender<(u8, u32)>,
         flags: u32,
     ) -> Input {
         Input {
@@ -887,6 +943,8 @@ impl Input {
             ClientMsg::Ping(t) => self.out.send(&ServerMsg::Pong(t))?,
             ClientMsg::Hello { .. } => {}
             ClientMsg::Set { key: key @ (SET_QUALITY | SET_DOWNSCALE | SET_MONITOR), value } => {
+                // Waits while `SETTINGS_QUEUE` changes are pending (the capture thread takes them
+                // within a tick), so a flood slows down its sender instead of growing the queue.
                 // Fails only once the capture thread has ended, i.e. the session is ending.
                 let _ = self.settings.send((key, value));
             }
@@ -1349,6 +1407,19 @@ fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, st
     }
 }
 
+/// Adds to a tick's `rects` (what `encode` found changed in `pixels`, the frame it last saw)
+/// the lossless refinement of lossy regions that have settled, within what is left of
+/// `REFINE_BUDGET`. Tiles just encoded have not settled yet, so they are not sent twice (and
+/// a frame never covers more than twice the screen, the decoder's limit); one frame per tick
+/// keeps flow control as it was.
+fn add_refinement(encoder: &mut Encoder, pixels: &[u8], w: usize, h: usize, rects: &mut Vec<EncodedRect>) {
+    if pixels.len() != w * h * 4 {
+        return;
+    }
+    let spent: usize = rects.iter().map(EncodedRect::wire_len).sum();
+    rects.extend(encoder.refine(pixels, w, h, REFINE_BUDGET.saturating_sub(spent)));
+}
+
 fn send_frame(out: &Out, frame: &mut u32, w: usize, h: usize, rects: &[EncodedRect]) -> Result<()> {
     *frame = frame.wrapping_add(1);
     for msg in codec::pack(*frame, w, h, rects) {
@@ -1392,8 +1463,12 @@ fn capture_loop(
 
     while !ctl.stopped() {
         let t0 = Instant::now();
-        // Settings from the viewer, applied between frames and confirmed with the value in effect.
-        while let Ok((key, value)) = settings.try_recv() {
+        // Settings from the viewer, applied between frames and confirmed with the value in effect;
+        // at most a queue's worth per tick, however fast the viewer refills it.
+        for (key, value) in settings.try_iter().take(SETTINGS_QUEUE) {
+            if ctl.stopped() {
+                break;
+            }
             let state = match key {
                 SET_QUALITY => {
                     if value <= QUALITY_LOW && value != quality {
@@ -1498,7 +1573,7 @@ fn capture_loop(
                 let (fw, fh) = (area.width as usize, area.height as usize);
                 let d = effective_downscale(area, downscale);
                 let (w, h) = (fw / d, fh / d);
-                let mut sent = false;
+                let mut rects = Vec::new();
                 if cap_ready && (changed || force) {
                     force = false;
                     let pixels = if d > 1 {
@@ -1510,25 +1585,21 @@ fn capture_loop(
                     } else {
                         cap.pixels()
                     };
-                    let rects = encoder.encode(pixels, w, h);
+                    rects = encoder.encode(pixels, w, h);
                     encoded = true;
                     if !rects.is_empty() {
-                        send_frame(out, &mut frame, w, h, &rects)?;
                         last_change = Instant::now();
-                        last_send = last_change;
-                        sent = true;
                     }
                 }
-                // Nothing new on screen: spend the tick on lossless refinement of lossy regions.
-                if !sent && encoded && encoder.needs_refine() {
+                // Lossless refinement of lossy regions that have settled, on every tick: a video
+                // or animation elsewhere on the screen must not keep them lossy.
+                if encoded && encoder.needs_refine() {
                     let pixels = if d > 1 { scaled.as_slice() } else { cap.pixels() };
-                    if pixels.len() == w * h * 4 {
-                        let rects = encoder.refine(pixels, w, h, REFINE_BUDGET);
-                        if !rects.is_empty() {
-                            send_frame(out, &mut frame, w, h, &rects)?;
-                            last_send = Instant::now();
-                        }
-                    }
+                    add_refinement(&mut encoder, pixels, w, h, &mut rects);
+                }
+                if !rects.is_empty() {
+                    send_frame(out, &mut frame, w, h, &rects)?;
+                    last_send = Instant::now();
                 }
             }
             Err(e) => {
@@ -1576,10 +1647,12 @@ mod tests {
         let all = |_| true;
         let s = negotiate(&o, 2, QUALITY_LOW as u8, MONITOR_DEFAULT, HELLO_AUDIO | HELLO_PRIVACY, all);
         let sel = MonitorSel::Index(1);
-        assert_eq!(s, Start { sel, monitor_missing: false, downscale: 2, quality: QUALITY_LOW, audio: true, privacy: true });
+        let want = Start { sel, monitor_missing: false, downscale: 2, quality: QUALITY_LOW, host_quality: false, audio: true, privacy: true };
+        assert_eq!(s, want);
         let s = negotiate(&o, 0, 9, MONITOR_ALL, 0, all);
         let sel = MonitorSel::All;
-        assert_eq!(s, Start { sel, monitor_missing: false, downscale: 1, quality: QUALITY_BALANCED, audio: false, privacy: false });
+        let want = Start { sel, monitor_missing: false, downscale: 1, quality: QUALITY_BALANCED, host_quality: true, audio: false, privacy: false };
+        assert_eq!(s, want);
         assert_eq!(negotiate(&o, 200, 0, 0, 0, all).downscale, 4);
         assert_eq!(negotiate(&o, 1, 0, 3, 0, all).sel, MonitorSel::Index(3));
         // An unknown monitor falls back to the host's choice.
@@ -1596,12 +1669,108 @@ mod tests {
         let o = HostOptions { monitor: MonitorSel::Primary, ..opts() };
         let s = negotiate(&o, 1, 0, MONITOR_DEFAULT, 0, |_| false);
         assert_eq!((s.sel, s.monitor_missing), (MonitorSel::Primary, false));
-        // The host default applies to unknown qualities only, and only if it is a valid one.
+        // The host default applies to viewers that leave the choice to the host (and to unknown
+        // qualities), and only if it is a valid one.
         let o = HostOptions { default_quality: QUALITY_LOSSLESS, ..opts() };
-        assert_eq!(negotiate(&o, 1, 0xff, 0, 0, all).quality, QUALITY_LOSSLESS);
-        assert_eq!(negotiate(&o, 1, QUALITY_LOW as u8, 0, 0, all).quality, QUALITY_LOW);
+        let s = negotiate(&o, 1, QUALITY_DEFAULT, 0, 0, all);
+        assert_eq!((s.quality, s.host_quality), (QUALITY_LOSSLESS, true));
+        let s = negotiate(&o, 1, QUALITY_LOW as u8, 0, 0, all);
+        assert_eq!((s.quality, s.host_quality), (QUALITY_LOW, false));
         let o = HostOptions { default_quality: 42, ..opts() };
-        assert_eq!(negotiate(&o, 1, 0xff, 0, 0, all).quality, QUALITY_BALANCED);
+        assert_eq!(negotiate(&o, 1, QUALITY_DEFAULT, 0, 0, all).quality, QUALITY_BALANCED);
+        // What a viewer started without --quality asks for.
+        assert_eq!(crate::viewer::ViewerOptions::default().quality, QUALITY_DEFAULT);
+    }
+
+    /// Photo-like BGRA noise: busy enough that every tile is sent lossy outside lossless mode.
+    fn noise(pixels: &mut [u8], seed: u32) {
+        let mut s = seed;
+        for px in pixels.as_chunks_mut::<4>().0 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *px = [(s >> 24) as u8, (s >> 16) as u8, (s >> 8) as u8, 255];
+        }
+    }
+
+    /// One capture tick by the host's rule on a screen whose top-left tile changes every
+    /// time (a video): encode, then refinement; the frame is applied to `fb`.
+    fn busy_tick(enc: &mut Encoder, dec: &mut codec::Decoder, cur: &mut [u8], fb: &mut [u8], w: usize, h: usize, n: u32) {
+        let line = codec::TILE * 4;
+        let mut tile = vec![0u8; codec::TILE * line];
+        noise(&mut tile, 1000 + n);
+        for row in 0..codec::TILE {
+            cur[row * w * 4..row * w * 4 + line].copy_from_slice(&tile[row * line..(row + 1) * line]);
+        }
+        let mut rects = enc.encode(cur, w, h);
+        assert!(!rects.is_empty(), "tick {n} was idle");
+        add_refinement(enc, cur, w, h, &mut rects);
+        for m in codec::pack(n, w, h, &rects) {
+            dec.apply(&m[1..], fb, w, h).unwrap();
+        }
+    }
+
+    /// Whether `fb` holds `cur` exactly outside the changing top-left tile.
+    fn exact_outside_first_tile(fb: &[u8], cur: &[u8], w: usize) -> bool {
+        let (fb, cur) = (fb.as_chunks::<4>().0, cur.as_chunks::<4>().0);
+        fb.iter().zip(cur).enumerate().all(|(i, (a, b))| (i % w < codec::TILE && i / w < codec::TILE) || a[..3] == b[..3])
+    }
+
+    #[test]
+    fn lossy_regions_are_refined_while_something_else_keeps_changing() {
+        let (w, h) = (4 * codec::TILE, 3 * codec::TILE);
+        let mut cur = vec![0u8; w * h * 4];
+        noise(&mut cur, 1);
+        let mut fb = vec![0u8; w * h * 4];
+        let mut dec = codec::Decoder::new().unwrap();
+        let mut enc = Encoder::new().unwrap();
+        enc.set_quality(QUALITY_BALANCED);
+        busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 1);
+        assert!(!exact_outside_first_tile(&fb, &cur, w), "the photo was not sent lossy");
+        // Not settled yet: nothing is refined.
+        busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 2);
+        assert!(!exact_outside_first_tile(&fb, &cur, w));
+        // Settled (300 ms): refined although no tick is idle.
+        std::thread::sleep(Duration::from_millis(400));
+        busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 3);
+        assert!(exact_outside_first_tile(&fb, &cur, w), "settled lossy tiles were not refined");
+
+        // Switching to lossless refines what is already lossy at once, animation or not.
+        let mut fb = vec![0u8; w * h * 4];
+        let mut dec = codec::Decoder::new().unwrap();
+        let mut enc = Encoder::new().unwrap();
+        enc.set_quality(QUALITY_LOW);
+        busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 1);
+        assert!(!exact_outside_first_tile(&fb, &cur, w));
+        enc.set_quality(QUALITY_LOSSLESS);
+        busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 2);
+        assert!(fb == cur, "lossless did not make the picture exact");
+        assert!(!enc.needs_refine());
+    }
+
+    #[test]
+    fn refinement_keeps_to_the_tick_budget_but_always_progresses() {
+        // A screen of noise sent lossy, then lossless: more exact data than one tick may carry.
+        let (w, h) = (16 * codec::TILE, 8 * codec::TILE);
+        let mut cur = vec![0u8; w * h * 4];
+        noise(&mut cur, 7);
+        let mut enc = Encoder::new().unwrap();
+        enc.set_quality(QUALITY_BALANCED);
+        assert!(!enc.encode(&cur, w, h).is_empty());
+        enc.set_quality(QUALITY_LOSSLESS);
+        let size = |r: &[EncodedRect]| r.iter().map(EncodedRect::wire_len).sum::<usize>();
+        let mut rects = Vec::new();
+        add_refinement(&mut enc, &cur, w, h, &mut rects);
+        let first = size(&rects);
+        assert!(first > 0 && first <= REFINE_BUDGET, "{first}");
+        // A tick whose changes used up the budget still refines one run.
+        let mut rects = enc.encode(&cur, w, h);
+        assert!(rects.is_empty());
+        rects.push(EncodedRect { rect: codec::Rect { x: 0, y: 0, w: 1, h: 1 }, enc: codec::ENC_RAW, data: vec![0; REFINE_BUDGET] });
+        add_refinement(&mut enc, &cur, w, h, &mut rects);
+        assert!(rects.len() == 2 && size(&rects[1..]) <= 4 * codec::TILE * codec::TILE * 3 + 13, "{}", rects.len());
+        // A picture of another size is left alone.
+        let mut rects = Vec::new();
+        add_refinement(&mut enc, &cur[..w * 4], w, h, &mut rects);
+        assert!(rects.is_empty());
     }
 
     #[test]
@@ -2407,5 +2576,84 @@ mod session_tests {
         }
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn host_quality_and_a_flood_of_settings() {
+        let _serial = lock(&SERIAL);
+        let host = TestHost::start(47421, |o| o.default_quality = QUALITY_LOW);
+        // A viewer started without --quality gets the host's default and is told which.
+        let mut c = host.connect(ViewerOptions::default());
+        let v = c.wait("the quality in effect", |m| match m {
+            ServerMsg::State { key: SET_QUALITY, value } => Some(*value),
+            _ => None,
+        });
+        assert_eq!(v, QUALITY_LOW);
+
+        // A viewer that sends settings without waiting for the answers (and stops acknowledging
+        // frames meanwhile): the host takes them a queue's worth at a time, and every one is
+        // still answered, in order.
+        const N: u32 = 10 * SETTINGS_QUEUE as u32;
+        let (reader, writer) = (&mut c.conn.reader, &mut c.conn.writer);
+        let (states, last_frame) = std::thread::scope(|s| {
+            s.spawn(move || {
+                let mut b = Vec::new();
+                for i in 0..N {
+                    b.clear();
+                    ClientMsg::Set { key: SET_QUALITY, value: i % 3 }.encode(&mut b);
+                    writer.send(&b).unwrap();
+                }
+            });
+            let (mut states, mut last_frame) = (Vec::new(), None);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while states.len() < N as usize {
+                assert!(Instant::now() < deadline, "{} of {N} settings answered", states.len());
+                let rec = reader.recv().unwrap();
+                match ServerMsg::decode(rec).unwrap() {
+                    ServerMsg::State { key: SET_QUALITY, value } => states.push(value),
+                    ServerMsg::Tiles(p) => {
+                        let hdr = codec::parse_header(p).unwrap();
+                        if hdr.last {
+                            last_frame = Some(hdr.frame);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (states, last_frame)
+        });
+        assert!(states.iter().zip(0..).all(|(&v, i)| v == i % 3), "answers out of order");
+        // The session carries on as before.
+        if let Some(f) = last_frame {
+            c.send(ClientMsg::Ack(f));
+        }
+        c.ping(5);
+        assert_eq!(c.state(SET_QUALITY, QUALITY_LOSSLESS), QUALITY_LOSSLESS);
+    }
+
+    #[test]
+    fn a_replaced_viewer_is_told_why_before_the_close() {
+        let _serial = lock(&SERIAL);
+        let host = TestHost::start(47422, |_| {});
+        let mut c = host.connect(ViewerOptions::default());
+        c.ping(1);
+        // The first viewer keeps reading, as a real one does, and hangs up once the host has.
+        let Client { mut conn, .. } = c;
+        let first = std::thread::spawn(move || {
+            let mut notice = None;
+            while let Ok(rec) = conn.reader.recv() {
+                if let Ok(ServerMsg::Notice(text)) = ServerMsg::decode(rec) {
+                    notice = Some(text);
+                }
+            }
+            notice
+        });
+        let t = Instant::now();
+        let mut c2 = host.connect(ViewerOptions::default());
+        assert!(t.elapsed() < Duration::from_secs(3), "handover took {:?}", t.elapsed());
+        let notice = first.join().unwrap();
+        // The viewer stops instead of reconnecting when a notice comes this shortly before the end.
+        assert!(notice.as_deref().is_some_and(|n| n.contains("another viewer")), "{notice:?}");
+        c2.ping(6);
     }
 }
