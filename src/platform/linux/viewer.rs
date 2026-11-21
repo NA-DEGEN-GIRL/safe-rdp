@@ -11,11 +11,11 @@ use super::mem::LockedBuf;
 use super::x11::{self, Conn, Event, Ext, ShmSegment, Target, Wake, Waker};
 use crate::audio::AudioReceiver;
 use crate::channel::{self, RecordReader};
-use crate::codec::{self, Decoder, Rect};
+use crate::codec::{self, Rect};
 use crate::log;
 use crate::proto::*;
 use crate::util::{Result, Secret};
-use crate::viewer::{FrameLock, Next, OutQueue, ResizePacer, ViewerOptions};
+use crate::viewer::{FrameLock, Next, OutQueue, ResizePacer, TileDecoder, ViewerOptions};
 use std::collections::HashSet;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -148,7 +148,7 @@ impl Sound {
 /// Applies one message from the host; returns the acknowledgement to send, if any.
 fn on_server_msg(
     shared: &Shared,
-    dec: &mut Decoder,
+    dec: &mut TileDecoder,
     msg: ServerMsg,
     clip: Option<&Clipboard>,
     sound: Option<&mut Sound>,
@@ -180,17 +180,24 @@ fn on_server_msg(
                 (fb.w, fb.h) = size;
                 fb.resized = true;
             }
-            let (fw, fh) = (fb.w, fb.h);
-            if let Some(b) = dec.apply(p, fb.px.as_mut_slice(), fw, fh)? {
-                fb.dirty = Some(union(fb.dirty, b));
-            }
             drop(fb);
+            // A replaced (or unneeded) buffer is wiped with the lock released, and before this
+            // thread makes its own copy of the screen at the new size.
+            drop((old, fresh));
+            // Decoded without the lock (`TileDecoder`): only copying the rects drawn takes it, a
+            // band at a time, so `present` waits for one band at most.
+            if let Some(b) = dec.decode(p, hdr.width, hdr.height)? {
+                let mut at = (0, 0);
+                loop {
+                    let mut fb = shared.reader_fb();
+                    if dec.copy(fb.px.as_mut_slice(), &mut at) {
+                        fb.dirty = Some(union(fb.dirty, b));
+                        break;
+                    }
+                }
+            }
             if hdr.last {
                 shared.waker.wake();
-            }
-            // A replaced (or unneeded) buffer is wiped only now: lock released, window woken.
-            drop((old, fresh));
-            if hdr.last {
                 return Ok(Some(ClientMsg::Ack(hdr.frame)));
             }
         }
@@ -227,7 +234,7 @@ fn net_loop(
     clip: Option<&Clipboard>,
     mut sound: Option<Sound>,
 ) -> Result<()> {
-    let mut dec = Decoder::new()?;
+    let mut dec = TileDecoder::new()?;
     loop {
         let rec = reader.recv()?;
         if let Some(reply) = on_server_msg(shared, &mut dec, ServerMsg::decode(rec)?, clip, sound.as_mut())? {
@@ -1125,7 +1132,7 @@ mod tests {
     fn sound_problems_never_end_the_session() {
         let wake = Wake::new().unwrap();
         let shared = Shared::new(8, 8, wake.waker().unwrap());
-        let mut dec = Decoder::new().unwrap();
+        let mut dec = TileDecoder::new().unwrap();
         let mut sound = Sound::default();
         // Undecodable audio is reported once and skipped; no player is started for it.
         for (seq, codec) in [(1, 99), (2, 99), (3, AUDIO_IMA_ADPCM)] {
@@ -1147,7 +1154,7 @@ mod tests {
     fn size_changes_swap_the_buffer() {
         let wake = Wake::new().unwrap();
         let shared = Shared::new(8, 8, wake.waker().unwrap());
-        let mut dec = Decoder::new().unwrap();
+        let mut dec = TileDecoder::new().unwrap();
         let mut tiles = |id: u32, w: usize, h: usize| {
             let msg = codec::pack(id, w, h, &[]).remove(0);
             on_server_msg(&shared, &mut dec, ServerMsg::decode(&msg).unwrap(), None, None)
@@ -1164,7 +1171,7 @@ mod tests {
     }
 
     /// Encodes `frame` the way a host does and feeds it to the viewer's message handler.
-    fn deliver(shared: &Shared, codec: &mut (codec::Encoder, Decoder), frame: &[u8], w: usize, h: usize, id: u32) {
+    fn deliver(shared: &Shared, codec: &mut (codec::Encoder, TileDecoder), frame: &[u8], w: usize, h: usize, id: u32) {
         let rects = codec.0.encode(frame, w, h);
         let msgs = codec::pack(id, w, h, &rects);
         for (i, m) in msgs.iter().enumerate() {
@@ -1242,7 +1249,7 @@ mod tests {
         ui.view.conn.sync().unwrap();
         assert_eq!(ui.view.size, (w, h), "1:1 window expected");
 
-        let mut codec = (codec::Encoder::new().unwrap(), Decoder::new().unwrap());
+        let mut codec = (codec::Encoder::new().unwrap(), TileDecoder::new().unwrap());
         deliver(&shared, &mut codec, cap.pixels(), w, h, 1);
         pump_until(&mut ui, |ui| ui.view.conn.get_geometry(ui.view.win).is_ok_and(|g| (g.x, g.y) == (800, 60)));
         ui.sync_remote(&shared).unwrap();
@@ -1286,7 +1293,7 @@ mod tests {
         assert_eq!(ui.view.size, (360, 270));
         ui.view.conn.sync().unwrap();
 
-        let mut codec = (codec::Encoder::new().unwrap(), Decoder::new().unwrap());
+        let mut codec = (codec::Encoder::new().unwrap(), TileDecoder::new().unwrap());
         deliver(&shared, &mut codec, &frame, rw, rh, 1);
         ui.sync_remote(&shared).unwrap();
         ui.view.conn.sync().unwrap();
