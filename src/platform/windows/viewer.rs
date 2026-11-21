@@ -125,6 +125,9 @@ struct App {
     swallowed: Mutex<HashSet<u16>>,
     /// Keys held down and whether their press went to the local desktop (see `stays_local`).
     routes: Mutex<HashMap<u16, bool>>,
+    /// Modifiers held down on the host that a chord staying local pressed here as well
+    /// (see `share_modifiers`): their repeats and release go to both.
+    shared: Mutex<HashSet<u16>>,
     fullscreen: Mutex<Option<Saved>>,
     /// A popup menu is open: keys belong to it, not to the host.
     local_keys: AtomicBool,
@@ -535,6 +538,7 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
         mods: AtomicU8::new(0),
         swallowed: Mutex::new(HashSet::new()),
         routes: Mutex::new(HashMap::new()),
+        shared: Mutex::new(HashSet::new()),
         fullscreen: Mutex::new(None),
         local_keys: AtomicBool::new(false),
         buttons: AtomicU8::new(0),
@@ -607,11 +611,8 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
         ShowWindow(hwnd, SW_SHOW);
         SetTimer(hwnd, T_TICK, TICK_MS, None);
     }
-    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), GetModuleHandleW(null()), 0) };
-    if hook.is_null() {
+    if !hook_keyboard(app) {
         log!("warning: keyboard hook unavailable; system shortcuts stay local");
-    } else {
-        app.hook_active.store(true, Ordering::SeqCst);
     }
     if fullscreen {
         toggle_fullscreen(hwnd);
@@ -625,10 +626,8 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if !hook.is_null() {
-            UnhookWindowsHookEx(hook);
-        }
     }
+    unhook_keyboard(app);
     let ui = UI.with(|cell| cell.borrow_mut().take());
     if let Some(s) = lock(&app.session).take() {
         s.shutdown();
@@ -2039,25 +2038,73 @@ fn toggle_fullscreen(hwnd: HWND) {
 // ---------------------------------------------------------------------------------------
 // Input
 
+/// An unassigned virtual key, pressed on the host while a modifier is down there that is used
+/// for a chord staying local or that is let go of because the focus left, so that its release
+/// does not count as a press of that modifier alone: Alt alone opens the menu bar of the
+/// focused program, Win alone the Start menu. AutoHotkey masks with the same key. A Linux host
+/// has no such key and ignores it.
+const VK_MASK: u16 = 0xe8;
+/// kbd.h `SCANCODE_SIMULATED`: Windows sets it on keys it makes up itself, such as the Left
+/// Ctrl it adds to Right Alt on layouts with AltGr (scancode 0x21D).
+const SCANCODE_SIMULATED: u16 = 0x200;
+/// `dwExtraInfo` of the keys the viewer presses on the local system itself (`press_locally`);
+/// the hook lets them through. Another program sending it only keeps its keys on this PC.
+const LOCAL_TAG: usize = 0x5352_4450;
+/// Re-install the keyboard hook every 5 s (in ticks): Windows silently drops a low-level hook
+/// that once misses its time limit, for instance while this thread paints a very large frame.
+const REHOOK_TICKS: u32 = 20;
+/// Key events the hook remembers, so the window can tell which messages it handled already.
+const HOOK_SEEN: usize = 32;
+
+/// Unicode text typed in the viewer: 1 once some was kept from the host, 2 once that is logged.
+static UNICODE_TEXT: AtomicU8 = AtomicU8::new(0);
+
 fn release_all(app: &App) {
     app.mods.store(0, Ordering::SeqCst);
     lock(&app.swallowed).clear();
-    lock(&app.routes).clear();
+    lock(&app.shared).clear();
+    let routes = std::mem::take(&mut *lock(&app.routes));
     if app.buttons.swap(0, Ordering::SeqCst) != 0 {
         unsafe { ReleaseCapture() };
     }
     if let Some(s) = app.input() {
+        if modifier_on_host(&routes) {
+            mask(&s);
+        }
         s.send(ClientMsg::ReleaseAll);
+    }
+}
+
+/// Whether a modifier is held down on the host (`routes`).
+fn modifier_on_host(routes: &HashMap<u16, bool>) -> bool {
+    routes.iter().any(|(&vk, &local)| !local && is_modifier(vk))
+}
+
+/// Presses and releases `VK_MASK` on the host.
+fn mask(s: &Session) {
+    for flags in [0, KEY_UP] {
+        s.send(ClientMsg::Key { vk: VK_MASK, scan: 0, flags });
     }
 }
 
 /// Handles a physical key event while the viewer is in the foreground. Returns true if the
 /// event was consumed (forwarded or used as a hotkey) and must not reach the local system.
-fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
+/// `hooked`: it comes from the low-level hook, before the system acted on it.
+fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool, hooked: bool) -> bool {
     if app.local_keys.load(Ordering::SeqCst) {
         return false;
     }
-    let bit = mod_bit(vk);
+    if vk == VK_PACKET {
+        // Text a program types as Unicode characters (auto-type, emoji panel): the scancode
+        // field holds a character, not a key position, and the host can only press keys. It
+        // stays here rather than pressing unrelated keys there.
+        let _ = UNICODE_TEXT.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        return false;
+    }
+    // Not a key of the keyboard (AltGr's Left Ctrl): the host's own layout decides what AltGr
+    // does, and as Ctrl here it would turn AltGr+Enter and AltGr+End into the hotkeys.
+    let simulated = is_simulated(vk, scan);
+    let bit = if simulated { 0 } else { mod_bit(vk) };
     if bit != 0 {
         if up {
             app.mods.fetch_and(!bit, Ordering::SeqCst);
@@ -2069,6 +2116,13 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
     // Win+L happens on the lock screen, where this hook never sees it.
     let win = unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 };
     let mods = app.mods.load(Ordering::SeqCst) | if win { MOD_WIN } else { 0 };
+    if simulated {
+        // Never sent. It reaches the local system where its Right Alt does (the same rules
+        // apply to both), tracked under its scancode so that it cannot take over the route
+        // of a real Left Ctrl held down.
+        let to_host = app.input().is_some();
+        return !stays_local(app.is_fullscreen(), mods, scan, up, to_host, &mut lock(&app.routes));
+    }
     let ctrl_alt = mods & (MOD_CTRL | MOD_ALT) == (MOD_CTRL | MOD_ALT);
     if up && lock(&app.swallowed).remove(&vk) {
         return true;
@@ -2087,14 +2141,119 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool) -> bool {
     }
     // Decided with the session check, so `routes` records where every press really went.
     let session = session.filter(|s| !s.view_only);
-    let local = stays_local(app.is_fullscreen(), mods, vk, up, session.is_some(), &mut lock(&app.routes));
+    let to_host = session.is_some();
+    let (local, moved) = {
+        let mut routes = lock(&app.routes);
+        let first = !up && !routes.contains_key(&vk);
+        let local = stays_local(app.is_fullscreen(), mods, vk, up, to_host, &mut routes);
+        // A chord that stays local needs the modifiers pressed before it, which went to the
+        // host (the Alt of Alt+Tab, the Ctrl of Ctrl+Win+Right): they are pressed here too.
+        // Only from the hook; a window message comes after the system acted on the key.
+        let moved = if hooked && to_host && local && first { share_modifiers(&routes, &mut lock(&app.shared)) } else { Vec::new() };
+        (local, moved)
+    };
+    if !moved.is_empty() {
+        if let Some(s) = &session {
+            // They stay down there too; their release must not count as a press of its own.
+            mask(s);
+        }
+        if press_locally(&moved, vk, scan, extended) {
+            return true;
+        }
+        let mut shared = lock(&app.shared);
+        for m in &moved {
+            shared.remove(m);
+        }
+        return false;
+    }
+    let shared = if up { lock(&app.shared).remove(&vk) } else { lock(&app.shared).contains(&vk) };
     let Some(s) = session.filter(|_| !local) else { return false };
     let mut flags = if up { KEY_UP } else { 0 };
     if extended {
         flags |= KEY_EXTENDED;
     }
     s.send(ClientMsg::Key { vk, scan, flags });
-    true
+    // A shared modifier goes on to the local system as well.
+    !shared
+}
+
+/// A key event Windows made up itself rather than one from the keyboard. (A Unicode
+/// character in the scancode field of VK_PACKET is no such mark.)
+fn is_simulated(vk: u16, scan: u16) -> bool {
+    vk != VK_PACKET && scan & SCANCODE_SIMULATED != 0
+}
+
+/// Keys that only modify others, and so do something of their own when pressed alone.
+fn is_modifier(vk: u16) -> bool {
+    matches!(
+        vk,
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_CONTROL | VK_LCONTROL | VK_RCONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN
+    )
+}
+
+/// The modifiers held down on the host (`routes`) that are not shared yet, for a chord that
+/// stays local: they become shared, to be pressed on the local system as well.
+fn share_modifiers(routes: &HashMap<u16, bool>, shared: &mut HashSet<u16>) -> Vec<u16> {
+    let mut moved: Vec<u16> =
+        routes.iter().filter(|&(&vk, &local)| !local && is_modifier(vk) && !shared.contains(&vk)).map(|(&vk, _)| vk).collect();
+    moved.sort_unstable();
+    shared.extend(&moved);
+    moved
+}
+
+/// Presses `mods` and then the key on the local system in place of the key's own event (which
+/// the hook swallows), so that the system sees the whole chord. Their releases are passed on
+/// as they come. False if Windows did not take them.
+fn press_locally(mods: &[u16], vk: u16, scan: u16, extended: bool) -> bool {
+    let inputs = chord_inputs(mods, vk, scan, extended);
+    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) as usize == inputs.len() }
+}
+
+/// The key presses of `press_locally`, tagged for the hook.
+fn chord_inputs(mods: &[u16], vk: u16, scan: u16, extended: bool) -> Vec<INPUT> {
+    let key = |vk: u16, (scan, extended): (u16, bool)| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 },
+                time: 0,
+                dwExtraInfo: LOCAL_TAG,
+            },
+        },
+    };
+    mods.iter().map(|&m| key(m, modifier_scan(m))).chain([key(vk, (scan, extended))]).collect()
+}
+
+/// The key position (set-1 scancode, extended) of a modifier, for pressing it here.
+fn modifier_scan(vk: u16) -> (u16, bool) {
+    match vk {
+        VK_SHIFT | VK_LSHIFT => (0x2a, false),
+        VK_RSHIFT => (0x36, false),
+        VK_CONTROL | VK_LCONTROL => (0x1d, false),
+        VK_RCONTROL => (0x1d, true),
+        VK_MENU | VK_LMENU => (0x38, false),
+        VK_RMENU => (0x38, true),
+        VK_LWIN => (0x5b, true),
+        VK_RWIN => (0x5c, true),
+        _ => (0, false),
+    }
+}
+
+/// The left or right virtual key the hook reports for a modifier, from the either-side one of a
+/// window message, so that a key pressed with the hook and released without it (or the other
+/// way round) is the same key in `routes`.
+fn sided_vk(vk: u16, scan: u16, extended: bool) -> u16 {
+    match vk {
+        VK_SHIFT if scan == 0x36 => VK_RSHIFT,
+        VK_SHIFT => VK_LSHIFT,
+        VK_CONTROL if extended => VK_RCONTROL,
+        VK_CONTROL => VK_LCONTROL,
+        VK_MENU if extended => VK_RMENU,
+        VK_MENU => VK_LMENU,
+        _ => vk,
+    }
 }
 
 /// Whether a key event goes to the local desktop instead of the host. In a window the
@@ -2129,15 +2288,107 @@ fn mod_bit(vk: u16) -> u8 {
     }
 }
 
+/// The low-level keyboard hook. It belongs to the UI thread, which also runs its callback.
+struct KeyHook {
+    handle: HHOOK,
+    ticks: u32,
+    /// A key message reached the window without passing the hook: Windows dropped it.
+    missed: bool,
+    /// Times of the latest key events the hook saw (`KBDLLHOOKSTRUCT::time`, which is what
+    /// `GetMessageTime` reports for the message of an event it passed on).
+    seen: VecDeque<u32>,
+}
+
+impl KeyHook {
+    const fn new() -> KeyHook {
+        KeyHook { handle: null_mut(), ticks: 0, missed: false, seen: VecDeque::new() }
+    }
+
+    fn saw(&mut self, time: u32) {
+        if self.seen.len() == HOOK_SEEN {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(time);
+    }
+
+    /// Whether the hook handled the key message stamped `time` already (it passed the key on);
+    /// if not, it is gone.
+    fn handled(&mut self, time: u32) -> bool {
+        let seen = self.seen.contains(&time);
+        self.missed |= !seen;
+        seen
+    }
+
+    /// Counts a timer tick: true when the hook is to be re-installed.
+    fn due(&mut self) -> bool {
+        self.ticks += 1;
+        if !self.missed && self.ticks < REHOOK_TICKS {
+            return false;
+        }
+        self.ticks = 0;
+        true
+    }
+}
+
+thread_local! {
+    static KEY_HOOK: RefCell<KeyHook> = const { RefCell::new(KeyHook::new()) };
+}
+
+/// Runs `f` on the hook state unless it is already borrowed further up the stack.
+fn with_hook<R>(f: impl FnOnce(&mut KeyHook) -> R) -> Option<R> {
+    KEY_HOOK.try_with(|cell| cell.try_borrow_mut().ok().map(|mut h| f(&mut h))).ok().flatten()
+}
+
+/// Installs the keyboard hook, or a fresh one in place of the current one: the new hook is in
+/// place before the old one goes. On failure the current one (if any) stays.
+fn hook_keyboard(app: &App) -> bool {
+    let new = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), GetModuleHandleW(null()), 0) };
+    if new.is_null() {
+        return false;
+    }
+    let Some(old) = with_hook(|h| {
+        h.missed = false;
+        std::mem::replace(&mut h.handle, new)
+    }) else {
+        unsafe { UnhookWindowsHookEx(new) };
+        return false;
+    };
+    if !old.is_null() {
+        unsafe { UnhookWindowsHookEx(old) };
+    }
+    app.hook_active.store(true, Ordering::SeqCst);
+    true
+}
+
+fn unhook_keyboard(app: &App) {
+    app.hook_active.store(false, Ordering::SeqCst);
+    if let Some(h) = with_hook(|h| std::mem::replace(&mut h.handle, null_mut())).filter(|h| !h.is_null()) {
+        unsafe { UnhookWindowsHookEx(h) };
+    }
+}
+
+/// From the timer: re-installs the hook every few seconds, and at once when it missed a key.
+fn rehook(app: &App) {
+    if with_hook(KeyHook::due) == Some(true) {
+        hook_keyboard(app);
+    }
+    if UNICODE_TEXT.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        log!("note: text typed as Unicode characters (auto-type, emoji panel) is not sent to the host");
+    }
+}
+
 unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code == HC_ACTION as i32 {
-            if let Some(app) = APP.get() {
+            let k = &*(lp as *const KBDLLHOOKSTRUCT);
+            with_hook(|h| h.saw(k.time));
+            // The viewer's own presses of a chord that stays local (`press_locally`).
+            let ours = k.flags & LLKHF_INJECTED != 0 && k.dwExtraInfo == LOCAL_TAG;
+            if let (false, Some(app)) = (ours, APP.get()) {
                 let hwnd = app.hwnd();
                 if !hwnd.is_null() && GetForegroundWindow() == hwnd {
-                    let k = &*(lp as *const KBDLLHOOKSTRUCT);
                     let up = k.flags & LLKHF_UP != 0;
-                    if on_key(app, k.vkCode as u16, k.scanCode as u16, k.flags & LLKHF_EXTENDED != 0, up) {
+                    if on_key(app, k.vkCode as u16, k.scanCode as u16, k.flags & LLKHF_EXTENDED != 0, up, true) {
                         return 1;
                     }
                 }
@@ -2215,6 +2466,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         with_ui(|ui| ui.tick());
                         // In case a WM_APP_EVENT could not be posted (full message queue).
                         dispatch_events(hwnd);
+                        rehook(app);
                     }
                     T_RECONNECT => {
                         with_ui(|ui| ui.launch_attempt());
@@ -2334,12 +2586,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 0
             }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
-                // Only reached when the low-level hook is unavailable or passed the key on.
-                if !app.hook_active.load(Ordering::SeqCst) {
+                // Handled here unless the low-level hook saw the key first and passed it on:
+                // every key while there is no hook (it could not be installed, or Windows
+                // dropped it until the next re-install), with system shortcuts staying local.
+                let seen = app.hook_active.load(Ordering::SeqCst)
+                    && with_hook(|h| h.handled(GetMessageTime() as u32)).unwrap_or(false);
+                if !seen && GetForegroundWindow() == hwnd {
                     let scan = ((lp >> 16) & 0xff) as u16;
                     let extended = (lp >> 24) & 1 != 0;
                     let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-                    if on_key(app, wp as u16, scan, extended, up) {
+                    if on_key(app, sided_vk(wp as u16, scan, extended), scan, extended, up, false) {
                         return 0;
                     }
                 }
@@ -2658,7 +2914,7 @@ mod tests {
         assert!(stays_local(false, 0, e, true, true, &mut r));
         assert!(!stays_local(false, 0, e, false, true, &mut r));
         assert!(!stays_local(false, 0, e, true, true, &mut r));
-        // Alt+Tab stays local (Alt itself goes to the host).
+        // Alt+Tab stays local (Alt itself goes to the host; `share_modifiers` presses it here too).
         assert!(!stays_local(false, MOD_ALT, VK_LMENU, false, true, &mut r));
         assert!(stays_local(false, MOD_ALT, VK_TAB, false, true, &mut r));
         assert!(!stays_local(false, 0, VK_LMENU, true, true, &mut r));
@@ -2698,6 +2954,104 @@ mod tests {
         assert!(stays_local(true, 0, VK_LSHIFT, false, false, &mut r));
         assert!(stays_local(true, 0, VK_LSHIFT, true, true, &mut r));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn chords_staying_local_take_the_modifiers_along() {
+        let (mut r, mut shared) = (HashMap::new(), HashSet::new());
+        // Ctrl and Shift went to the host, then Esc stays local (Ctrl+Shift+Esc): both are
+        // pressed here as well, once. A held letter is no modifier and stays with the host.
+        assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, VK_LSHIFT, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, b'W' as u16, false, true, &mut r));
+        assert!(stays_local(false, MOD_CTRL, VK_ESCAPE, false, true, &mut r));
+        assert!(modifier_on_host(&r));
+        assert_eq!(share_modifiers(&r, &mut shared), [VK_LSHIFT, VK_LCONTROL]);
+        assert!(share_modifiers(&r, &mut shared).is_empty());
+        // Their releases still follow the presses to the host (shared, they also go on here).
+        assert!(!stays_local(false, 0, VK_LSHIFT, true, true, &mut r));
+        assert!(!stays_local(false, 0, VK_LCONTROL, true, true, &mut r));
+        assert!(!modifier_on_host(&r));
+        // Win stays local itself, so nothing is handed over for Win+D.
+        let mut r = HashMap::new();
+        assert!(stays_local(false, MOD_WIN, VK_LWIN, false, true, &mut r));
+        assert!(stays_local(false, MOD_WIN, b'D' as u16, false, true, &mut r));
+        assert!(!modifier_on_host(&r));
+        assert!(share_modifiers(&r, &mut HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn local_chords_are_pressed_whole_and_tagged() {
+        let inputs = chord_inputs(&[VK_LMENU, VK_RCONTROL], VK_TAB, 0x0f, false);
+        let keys: Vec<(u16, u16, u32, usize)> = inputs
+            .iter()
+            .map(|i| {
+                assert_eq!(i.r#type, INPUT_KEYBOARD);
+                let k = unsafe { i.Anonymous.ki };
+                (k.wVk, k.wScan, k.dwFlags, k.dwExtraInfo)
+            })
+            .collect();
+        let tag = LOCAL_TAG;
+        assert_eq!(keys, [(VK_LMENU, 0x38, 0, tag), (VK_RCONTROL, 0x1d, KEYEVENTF_EXTENDEDKEY, tag), (VK_TAB, 0x0f, 0, tag)]);
+    }
+
+    #[test]
+    fn window_messages_name_the_same_modifiers_as_the_hook() {
+        let pairs = [
+            (VK_SHIFT, VK_LSHIFT),
+            (VK_SHIFT, VK_RSHIFT),
+            (VK_CONTROL, VK_LCONTROL),
+            (VK_CONTROL, VK_RCONTROL),
+            (VK_MENU, VK_LMENU),
+            (VK_MENU, VK_RMENU),
+        ];
+        for (either, sided) in pairs {
+            let (scan, extended) = modifier_scan(sided);
+            assert_eq!(sided_vk(either, scan, extended), sided);
+            assert_eq!(mod_bit(sided), mod_bit(either));
+            assert!(is_modifier(sided) && is_modifier(either));
+        }
+        assert_eq!(sided_vk(b'A' as u16, 0x1e, false), b'A' as u16);
+        assert!(!is_modifier(VK_TAB) && !is_modifier(VK_MASK));
+    }
+
+    #[test]
+    fn altgr_left_ctrl_is_not_a_key() {
+        assert!(is_simulated(VK_LCONTROL, 0x21d));
+        assert!(!is_simulated(VK_LCONTROL, 0x1d));
+        // A character in VK_PACKET's scancode field (U+0263) is no such mark.
+        assert!(!is_simulated(VK_PACKET, 0x263));
+        // Tracked under its scancode, it leaves a real Left Ctrl's route alone: that Ctrl went
+        // to the host and is still released there.
+        let mut r = HashMap::new();
+        assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, 0x21d, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL | MOD_ALT, VK_RMENU, false, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, 0x21d, true, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, VK_RMENU, true, true, &mut r));
+        assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, true, true, &mut r));
+        // Without a session that takes input it reaches the local system, like its Right Alt.
+        assert!(stays_local(false, 0, 0x21d, false, false, &mut r));
+        assert!(stays_local(false, 0, 0x21d, true, true, &mut r));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_hook_is_noticed_and_replaced() {
+        let mut h = KeyHook::new();
+        for t in 0..HOOK_SEEN as u32 + 5 {
+            h.saw(t);
+        }
+        // The latest key events passed the hook (it decided about them already).
+        assert!(h.handled(HOOK_SEEN as u32 + 4));
+        assert!(h.handled(5));
+        assert!(!h.missed);
+        // Re-installed every REHOOK_TICKS ticks ...
+        assert!((1..REHOOK_TICKS).all(|_| !h.due()));
+        assert!(h.due());
+        // ... and at the next tick once a key reached the window without passing it.
+        assert!(!h.handled(4));
+        assert!(h.missed && h.due());
     }
 
     #[test]

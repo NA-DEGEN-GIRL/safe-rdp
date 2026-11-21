@@ -13,6 +13,8 @@ pub const VK_MENU: u16 = 0x12;
 pub const VK_PAUSE: u16 = 0x13;
 pub const VK_HANGUL: u16 = 0x15;
 pub const VK_HANJA: u16 = 0x19;
+/// Windows' virtual key for a character typed as Unicode; its "scancode" is the character.
+const VK_PACKET: u16 = 0xe7;
 
 pub const KEY_ENTER: u16 = 28;
 pub const KEY_LEFTCTRL: u16 = 29;
@@ -213,6 +215,12 @@ fn vk_to_evdev(vk: u16) -> Option<u16> {
 pub fn to_evdev(vk: u16, scan: u16, extended: bool) -> Option<u16> {
     // Some senders fold the E0 prefix into the scancode.
     let (scan, extended) = if scan >> 8 == 0xe0 { (scan & 0xff, true) } else { (scan, extended) };
+    // Anything else beyond one byte is not a key position: a key Windows made up (AltGr's
+    // Left Ctrl, 0x21D) or a character typed as Unicode. Neither may fall back to the virtual
+    // key and press a real key.
+    if scan > 0xff || vk == VK_PACKET {
+        return None;
+    }
     match vk {
         VK_PAUSE => return Some(KEY_PAUSE),
         // Dedicated Hangul/Hanja keys, or Korean layouts' Right Alt / Right Ctrl. The same
@@ -305,5 +313,15 @@ mod tests {
         assert_eq!(to_evdev(0, 0x5e, true), None);
         assert_eq!(to_evdev(0, 0x1234, false), None);
         assert_eq!(to_evdev(0xff, 0, false), None);
+        // Not key positions, so not the virtual key either: AltGr's simulated Left Ctrl, and
+        // characters typed as Unicode ('S', '1', U+D55C, U+E01D), which would otherwise press
+        // Keypad ., N or Right Ctrl.
+        assert_eq!(to_evdev(0xa2, 0x21d, false), None);
+        assert_eq!(to_evdev(0xa2, 0x1d, false), Some(KEY_LEFTCTRL));
+        for scan in [0x53, 0x31, 0xd55c, 0xe01d] {
+            assert_eq!(to_evdev(VK_PACKET, scan, false), None, "{scan:#x}");
+        }
+        // The Windows viewer's mask key (vk E8) has no key here.
+        assert_eq!(to_evdev(0xe8, 0, false), None);
     }
 }
