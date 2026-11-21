@@ -2,7 +2,7 @@
 //! forwards keyboard and mouse.
 //!
 //! Hotkeys (handled locally, never forwarded):
-//!   Ctrl+Alt+Enter  toggle full screen (the keyboard is grabbed while full screen)
+//!   Ctrl+Alt+Enter  toggle full screen (the keyboard is grabbed while full screen and focused)
 //!   Ctrl+Alt+End    send Ctrl+Alt+Del to the host (service mode only)
 
 use super::clipboard::Clipboard;
@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 const XK_HANGUL: u32 = 0xff31;
 const XK_HANGUL_HANJA: u32 = 0xff34;
+/// FocusIn/FocusOut modes: a focus change made while the keyboard was free, or while it was
+/// grabbed (the other two modes are a grab or ungrab itself).
+const NOTIFY_NORMAL: u8 = 0;
+const NOTIFY_WHILE_GRABBED: u8 = 3;
 /// Largest remote screen accepted (two 8K screens side by side), bounding what a host can make
 /// the viewer allocate.
 const MAX_PIXELS: usize = 2 * 7680 * 4320;
@@ -33,6 +37,13 @@ fn check_size(w: usize, h: usize) -> Result<()> {
         crate::bail!("remote screen {w}x{h} is too large");
     }
     Ok(())
+}
+
+/// Whether a FocusOut means keys now go to another window: the focus moved away from this
+/// window, or from the pointer-root focus it was getting keys through. Grabs and ungrabs
+/// (our own included) move no focus.
+fn focus_moved_away(detail: u8, mode: u8) -> bool {
+    detail != x11::NOTIFY_INFERIOR && matches!(mode, NOTIFY_NORMAL | NOTIFY_WHILE_GRABBED)
 }
 
 /// Cursor-font glyphs for the mirrored shapes (`None`: inherit the desktop's themed arrow).
@@ -332,6 +343,12 @@ struct View {
     fullscreen: bool,
     saved_geometry: Option<(i16, i16, u16, u16)>,
     want_grab: bool,
+    /// The window has the input focus as far as FocusIn/FocusOut tell. A window manager
+    /// focuses it after mapping it; without one keys follow the pointer and no FocusIn may
+    /// ever come, so it starts out true. The keyboard is grabbed only while this holds: a grab
+    /// kept after the focus moved would send what is typed into another local window to the
+    /// remote.
+    focused: bool,
 }
 
 impl View {
@@ -388,6 +405,7 @@ impl View {
             fullscreen: false,
             saved_geometry: None,
             want_grab: false,
+            focused: !has_wm,
         };
         if fullscreen {
             if has_wm {
@@ -603,12 +621,29 @@ impl View {
         if on { self.try_grab() } else { self.conn.ungrab_keyboard() }
     }
 
-    /// Grabs the keyboard while full screen (retried until the window is viewable).
+    /// Grabs the keyboard while full screen (retried until the window is viewable and has the
+    /// focus).
     fn try_grab(&mut self) -> Result<()> {
-        if self.want_grab && self.conn.grab_keyboard(self.win)? {
+        if self.want_grab && self.focused && self.conn.grab_keyboard(self.win)? {
             self.want_grab = false;
         }
         Ok(())
+    }
+
+    /// The focus went to another window (one on another monitor, a dialog): the keyboard goes
+    /// with it, also in full screen, until the focus is back.
+    fn focus_lost(&mut self) -> Result<()> {
+        self.focused = false;
+        if self.fullscreen {
+            self.want_grab = true;
+            self.conn.ungrab_keyboard()?;
+        }
+        Ok(())
+    }
+
+    fn focus_gained(&mut self) -> Result<()> {
+        self.focused = true;
+        self.try_grab()
     }
 }
 
@@ -673,6 +708,13 @@ impl Ui {
         Ok(())
     }
 
+    /// Whether a key now was typed for another window: in full screen after the focus moved,
+    /// the grab still catches keys until the server has let the keyboard go. They are never
+    /// forwarded; the full-screen hotkey still works.
+    fn typed_elsewhere(&self) -> bool {
+        self.view.fullscreen && !self.view.focused
+    }
+
     fn release_all(&mut self) {
         self.mods.clear();
         self.swallowed.clear();
@@ -699,7 +741,9 @@ impl Ui {
         if press && ctrl && alt && matches!(evdev, KEY_ENTER | KEY_KPENTER | KEY_END) {
             self.swallowed.insert(evdev);
             if evdev == KEY_END {
-                if self.sas && !self.view_only {
+                if self.typed_elsewhere() {
+                    // Meant for another window, like the keys below.
+                } else if self.sas && !self.view_only {
                     self.send(ClientMsg::Sas);
                 } else {
                     log!("Ctrl+Alt+Del forwarding is not enabled on the host");
@@ -710,6 +754,13 @@ impl Ui {
             return Ok(());
         }
         if self.view_only {
+            return Ok(());
+        }
+        if self.typed_elsewhere() {
+            // Its release is held back too.
+            if press {
+                self.swallowed.insert(evdev);
+            }
             return Ok(());
         }
         let wire = match self.korean.iter().find(|(k, _)| *k == keycode) {
@@ -789,8 +840,11 @@ impl Ui {
                 if detail != x11::NOTIFY_INFERIOR && detail != x11::NOTIFY_POINTER && mode != x11::NOTIFY_UNGRAB {
                     self.release_all();
                 }
+                if focus_moved_away(detail, mode) {
+                    self.view.focus_lost()?;
+                }
             }
-            Event::Focus { focus_in: true, .. } => self.view.try_grab()?,
+            Event::Focus { focus_in: true, .. } => self.view.focus_gained()?,
             Event::Expose { x, y, width, height, count } => {
                 let r = (x as usize, y as usize, x as usize + width as usize, y as usize + height as usize);
                 self.expose = Some(match self.expose {
@@ -865,6 +919,16 @@ impl Ui {
     }
 }
 
+/// What to tell the user about local screen capture. Windows keeps the viewer window out of
+/// screenshots and recordings unless `--allow-capture` is given; X11 has no such protection,
+/// so the user who relies on that default is the one to warn.
+fn capture_warning(allow_capture: bool) -> Option<&'static str> {
+    (!allow_capture).then_some(
+        "warning: X11 cannot keep the viewer window out of screen capture: screenshot, recording and \
+         screen-sharing programs on this display can see the remote screen",
+    )
+}
+
 /// Window title from the host's (untrusted) name.
 fn title(host_name: &str, target: &str) -> String {
     let name: String = printable(host_name).chars().take(64).collect();
@@ -879,8 +943,8 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     drop(psk);
     check_size(w, h)?;
     let view_only = opts.view_only || flags & F_VIEW_ONLY != 0;
-    if opts.allow_capture {
-        log!("note: X11 cannot hide windows from screen capture; --allow-capture changes nothing here");
+    if let Some(warning) = capture_warning(opts.allow_capture) {
+        log!("{warning}");
     }
 
     let wake = Wake::new()?;
@@ -1030,6 +1094,31 @@ mod tests {
         assert_eq!(title("pc\n\u{1b}[31m", "pc.tail"), "safe-rdp - pc??[31m (pc.tail)");
         assert_eq!(title("a\u{202E}gpj.exe\u{200B}", "t"), "safe-rdp - a?gpj.exe? (t)");
         assert_eq!(title(&"x".repeat(100), "t"), format!("safe-rdp - {} (t)", "x".repeat(64)));
+    }
+
+    #[test]
+    fn focus_changes_that_move_the_keyboard() {
+        const GRAB: u8 = 1;
+        const ANCESTOR: u8 = 0;
+        const NONLINEAR: u8 = 3;
+        // Another window (or the window manager's frame) took the focus, also while we held the
+        // keyboard, or the pointer-root focus we had keys through went elsewhere.
+        for detail in [ANCESTOR, NONLINEAR, x11::NOTIFY_POINTER] {
+            assert!(focus_moved_away(detail, NOTIFY_NORMAL), "{detail}");
+            assert!(focus_moved_away(detail, NOTIFY_WHILE_GRABBED), "{detail}");
+            // Grabs and ungrabs, ours included, move no focus: letting go on those would only
+            // grab again at once.
+            assert!(!focus_moved_away(detail, GRAB), "{detail}");
+            assert!(!focus_moved_away(detail, x11::NOTIFY_UNGRAB), "{detail}");
+        }
+        // Focus moving into a child window stays with us.
+        assert!(!focus_moved_away(x11::NOTIFY_INFERIOR, NOTIFY_NORMAL));
+    }
+
+    #[test]
+    fn capture_warning_goes_to_those_relying_on_the_default() {
+        assert!(capture_warning(false).is_some_and(|w| w.contains("X11") && w.contains("screen capture")));
+        assert_eq!(capture_warning(true), None);
     }
 
     #[test]
@@ -1299,5 +1388,67 @@ mod tests {
         let win = ui.view.win;
         ui.view.conn.send_event(win, 0, &ev).unwrap();
         pump_until(&mut ui, |ui| ui.closed.is_some());
+    }
+
+    /// In full screen the keyboard is grabbed only while the viewer has the focus: once another
+    /// local window takes it, typing goes there and nothing reaches the host, and the grab
+    /// comes back with the focus.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn full_screen_lets_the_keyboard_go_with_the_focus() {
+        let vd = VirtualDisplay::spawn(Some(83), 400, 300, None).unwrap();
+        let t = vd.target();
+        let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - focus", 640, 480, false).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut ui = Ui::new(view, tx, false, false).unwrap();
+        // Another local program with a window of its own.
+        let mut other = Conn::connect(&t).unwrap();
+        let root = other.root();
+        let win = other.create_window(root, 0, 0, 50, 50, 1, x11::CW_EVENT_MASK, &[x11::KEY_PRESS_MASK]).unwrap();
+        other.map_window(win).unwrap();
+        other.sync().unwrap();
+        // Nobody else can grab the keyboard while the viewer holds it.
+        let viewer_holds_keyboard = |other: &mut Conn| {
+            let free = other.grab_keyboard(win).unwrap();
+            if free {
+                other.ungrab_keyboard().unwrap();
+                other.sync().unwrap();
+            }
+            !free
+        };
+
+        ui.view.conn.set_input_focus(ui.view.win).unwrap();
+        ui.view.conn.sync().unwrap();
+        ui.pump().unwrap();
+        assert!(ui.view.focused);
+        ui.view.toggle_fullscreen().unwrap();
+        pump_until(&mut ui, |ui| ui.view.size == (400, 300) && !ui.view.want_grab);
+        assert!(viewer_holds_keyboard(&mut other));
+
+        // The other program takes the focus: the grab goes, and typing reaches it, not the host.
+        other.set_input_focus(win).unwrap();
+        other.sync().unwrap();
+        pump_until(&mut ui, |ui| !ui.view.focused);
+        ui.view.conn.sync().unwrap();
+        assert!(!viewer_holds_keyboard(&mut other));
+        drain_messages(&rx);
+        let mut inj = Injector::on(t.clone());
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: 0 });
+        inj.handle(&ClientMsg::Key { vk: 0x41, scan: 0x1e, flags: KEY_UP });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(other.wait_event(Duration::from_millis(100)).unwrap(), Some(Event::Key { press: true, .. })) {
+            assert!(Instant::now() < deadline, "the other window got no key");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        ui.view.conn.read_pending().unwrap();
+        ui.pump().unwrap();
+        let got = drain_messages(&rx);
+        assert!(!got.iter().any(|m| matches!(m, ClientMsg::Key { .. })), "{got:?}");
+
+        // The focus comes back: so does the grab.
+        ui.view.conn.set_input_focus(ui.view.win).unwrap();
+        ui.view.conn.sync().unwrap();
+        pump_until(&mut ui, |ui| ui.view.focused && !ui.view.want_grab);
+        assert!(viewer_holds_keyboard(&mut other));
     }
 }

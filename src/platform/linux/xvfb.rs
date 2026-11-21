@@ -6,21 +6,26 @@
 //! to be ours: the directory must be one no other user controls, Xvfb reports through
 //! `-displayfd` when it accepts clients, and both socket names of the display must then belong
 //! to the Xvfb process we started. A host serving the display talks to that process only.
+//!
+//! The cookie Xvfb and the host use lives in a file without a name, which Xvfb inherits as a
+//! descriptor: nothing done to a path (a tmp cleaner ageing it out, another user re-creating
+//! it) can lock the host out or slip Xvfb another cookie. Programs in the session get a copy in
+//! a private directory, kept from tmp cleaners for as long as the display runs.
 
 use super::x11::{self, AuthEntry, COOKIE_NAME, Conn, FAMILY_WILD, Target, encode_auth_entry};
 use crate::util::{Error, Result, wipe};
 use crate::{bail, log};
-use std::ffi::c_int;
-use std::fs::File;
+use std::ffi::{c_char, c_int, c_uint};
+use std::fs::{File, FileTimes};
 use std::io::{ErrorKind, PipeReader, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
@@ -28,10 +33,14 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn waitid(idtype: c_int, id: u32, info: *mut SigInfo, options: c_int) -> c_int;
     fn geteuid() -> u32;
+    fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
 }
 
 const PR_SET_PDEATHSIG: c_int = 1;
 const F_SETFD: c_int = 2;
+const MFD_CLOEXEC: c_uint = 1;
+const O_DIRECTORY: c_int = 0o200000;
+const O_NOFOLLOW: c_int = 0o400000;
 const P_PID: c_int = 1;
 const WNOHANG: c_int = 1;
 const WEXITED: c_int = 4;
@@ -109,6 +118,9 @@ const LAST_DISPLAY: u32 = 99;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often `watch` checks on Xvfb and the session.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// How often `watch` marks the private directory and its files as used (tmp cleaners go by
+/// days).
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Xvfb and the session command, each leading its own process group. Only `stop_group` reaps
 /// them.
@@ -138,9 +150,70 @@ impl Procs {
 pub struct VirtualDisplay {
     number: u32,
     dir: PathBuf,
+    /// The session's copy of the cookie, in `dir`.
     auth: PathBuf,
+    /// The cookie Xvfb and this process read (see `cookie_file`).
+    cookie: File,
+    kept: Kept,
     /// Shared with the `watch` thread, which only holds a weak reference.
     procs: Arc<Mutex<Procs>>,
+}
+
+/// The private directory and the files in it, held open while the display runs. The directory
+/// is locked, which keeps systemd-tmpfiles away from it and everything in it; `watch` also
+/// renews their timestamps for cleaners that only go by age (tmpwatch, tmpreaper). At the end
+/// only a directory that still is this one is deleted, and the cookie is wiped through `auth`.
+struct Kept {
+    dir: File,
+    /// The session's copy of the cookie.
+    auth: File,
+    logs: Vec<File>,
+}
+
+impl Kept {
+    fn try_clone(&self) -> std::io::Result<Kept> {
+        let logs = self.logs.iter().map(File::try_clone).collect::<std::io::Result<_>>()?;
+        Ok(Kept { dir: self.dir.try_clone()?, auth: self.auth.try_clone()?, logs })
+    }
+
+    /// Marks the directory and its files as just used.
+    fn touch(&self) {
+        let now = SystemTime::now();
+        let times = FileTimes::new().set_accessed(now).set_modified(now);
+        for f in [&self.dir, &self.auth].into_iter().chain(&self.logs) {
+            let _ = f.set_times(times);
+        }
+    }
+
+    /// Whether `dir` and `auth` still name the directory and the cookie file held.
+    fn in_place(&self, dir: &Path, auth: &Path) -> bool {
+        names(dir, &self.dir) && names(auth, &self.auth)
+    }
+}
+
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether `path` itself (not a link there) is the file `f` is open on.
+fn names(path: &Path, f: &File) -> bool {
+    match (std::fs::symlink_metadata(path), f.metadata()) {
+        (Ok(a), Ok(b)) => same_file(&a, &b),
+        _ => false,
+    }
+}
+
+/// Whether opening `path` (following links) reaches the file `f` is open on.
+fn leads_to(path: &Path, f: &File) -> bool {
+    match (std::fs::metadata(path), f.metadata()) {
+        (Ok(a), Ok(b)) => same_file(&a, &b),
+        _ => false,
+    }
+}
+
+/// The name in /proc of descriptor `fd` of process `pid` (or "self").
+fn fd_path(pid: &str, fd: c_int) -> PathBuf {
+    PathBuf::from(format!("/proc/{pid}/fd/{fd}"))
 }
 
 fn random_bytes(n: usize) -> Result<Vec<u8>> {
@@ -149,19 +222,40 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-/// A new 0700 directory for the cookie and logs, preferably on the per-user runtime tmpfs.
-fn private_dir(tag: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+/// Whether `dir` can hold our private directory: a directory of this user that nobody else may
+/// enter, as a runtime directory must be.
+fn is_private_dir(dir: &Path, euid: u32) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o077 == 0)
+}
+
+/// Where the private directory goes: the per-user runtime directory, else (a host started
+/// outside a login, where `/run/user/<uid>` may come and go with other sessions of the user)
+/// the temporary directory, which `Kept` protects from tmp cleaners.
+fn private_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("safe-rdp-{tag}-{}", crate::util::hex_encode(&random_bytes(6)?)));
+        .filter(|d| is_private_dir(d, unsafe { geteuid() }))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// A new 0700 directory for the session's cookie and the logs.
+fn private_dir(tag: &str) -> Result<PathBuf> {
+    let dir = private_base().join(format!("safe-rdp-{tag}-{}", crate::util::hex_encode(&random_bytes(6)?)));
     std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 
-/// Writes an Xauthority file holding one wildcard-address cookie for display `number`.
-fn write_auth(path: &Path, number: u32, cookie: &[u8]) -> Result<()> {
+/// Opens directory `dir` (not through a link) and locks it for as long as it stays open:
+/// systemd-tmpfiles skips a directory it cannot lock, and everything in it.
+fn hold_dir(dir: &Path) -> Result<File> {
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECTORY | O_NOFOLLOW).open(dir)?;
+    f.lock_shared()?;
+    Ok(f)
+}
+
+/// One Xauthority entry with the cookie for display `number`, for any address.
+fn auth_bytes(number: u32, cookie: &[u8]) -> Vec<u8> {
     let entry = AuthEntry {
         family: FAMILY_WILD,
         address: Vec::new(),
@@ -169,11 +263,34 @@ fn write_auth(path: &Path, number: u32, cookie: &[u8]) -> Result<()> {
         name: COOKIE_NAME.to_vec(),
         data: cookie.to_vec(),
     };
-    let mut bytes = encode_auth_entry(&entry);
+    encode_auth_entry(&entry)
+}
+
+/// Writes an Xauthority file holding one wildcard-address cookie for display `number`.
+fn write_auth(path: &Path, number: u32, cookie: &[u8]) -> Result<File> {
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    let mut bytes = auth_bytes(number, cookie);
     let r = f.write_all(&bytes).and_then(|_| f.sync_all());
     wipe(&mut bytes);
-    Ok(r?)
+    r?;
+    Ok(f)
+}
+
+/// The cookie as Xvfb and this process read it: an Xauthority file without a name (a memfd),
+/// reached through descriptors only. Not inherited by the programs this process starts.
+fn cookie_file(number: u32, cookie: &[u8]) -> Result<File> {
+    let fd = unsafe { memfd_create(c"safe-rdp-xauthority".as_ptr(), MFD_CLOEXEC) };
+    if fd < 0 {
+        bail!("cannot create the cookie file: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: a new descriptor that nothing else owns.
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    f.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+    let mut bytes = auth_bytes(number, cookie);
+    let r = f.write_all(&bytes);
+    wipe(&mut bytes);
+    r?;
+    Ok(f)
 }
 
 /// True if display `n` is in use or being set up: its socket, its lock file, or the temporary
@@ -260,7 +377,8 @@ fn read_display_number(ready: &mut PipeReader, xvfb: &Mutex<Procs>, n: u32, log_
 
 impl VirtualDisplay {
     /// Starts a virtual display on the first free number from 20, points `DISPLAY` and
-    /// `XAUTHORITY` of this process at it, and runs `session` (a shell command) inside it.
+    /// `XAUTHORITY` of this process at it (the latter at the cookie file without a name), and
+    /// runs `session` (a shell command) inside it.
     ///
     /// Call during start-up, before other threads are running: it changes the environment.
     /// Signals arriving meanwhile (a stop request) do not disturb it.
@@ -271,7 +389,7 @@ impl VirtualDisplay {
         // SAFETY: documented to be called before other threads exist.
         unsafe {
             std::env::set_var("DISPLAY", vd.display_name());
-            std::env::set_var("XAUTHORITY", &vd.auth);
+            std::env::set_var("XAUTHORITY", vd.cookie_path());
         }
         log!("virtual display {} ({width}x{height}) started", vd.display_name());
         Ok(vd)
@@ -298,10 +416,11 @@ impl VirtualDisplay {
         let mut last = Error::msg("no display tried");
         for n in candidates {
             match VirtualDisplay::try_start(n, width, height) {
-                Ok(vd) => {
+                Ok(mut vd) => {
                     if let Some(cmd) = session {
-                        let child = vd.run_session(cmd)?;
+                        let (child, log) = vd.run_session(cmd)?;
                         vd.procs().session = Some(child);
+                        vd.kept.logs.push(log);
                     }
                     return Ok(vd);
                 }
@@ -315,12 +434,20 @@ impl VirtualDisplay {
         let dir = private_dir(&format!("x{n}"))?;
         let auth = dir.join("Xauthority");
         let log_path = dir.join("xvfb.log");
-        let started = (|| -> Result<(Child, PipeReader)> {
-            let mut cookie = random_bytes(16)?;
-            let r = write_auth(&auth, n, &cookie);
-            wipe(&mut cookie);
-            r?;
+        let started = (|| -> Result<(Child, PipeReader, File, Kept)> {
+            let held = hold_dir(&dir)?;
+            let mut secret = random_bytes(16)?;
+            let files = write_auth(&auth, n, &secret).and_then(|copy| Ok((copy, cookie_file(n, &secret)?)));
+            wipe(&mut secret);
+            let (copy, cookie) = files?;
+            // Xvfb opens the cookie by its descriptor's name, which must lead to it.
+            let cookie_fd = cookie.as_raw_fd();
+            let cookie_name = fd_path("self", cookie_fd);
+            if !leads_to(&cookie_name, &cookie) {
+                bail!("cannot hand Xvfb its cookie: {} does not lead to it (is /proc mounted?)", cookie_name.display());
+            }
             let log = File::create(&log_path)?;
+            let kept = Kept { dir: held, auth: copy, logs: vec![log.try_clone()?] };
             // Xvfb writes the display number here once clients can connect.
             let (ready, ready_tx) = std::io::pipe()?;
             let fd = ready_tx.as_raw_fd();
@@ -329,23 +456,28 @@ impl VirtualDisplay {
                 .arg(format!(":{n}"))
                 .args(["-displayfd", &fd.to_string()])
                 .args(["-screen", "0", &format!("{width}x{height}x24"), "-nolisten", "tcp", "-noreset", "-auth"])
-                .arg(&auth)
+                .arg(&cookie_name)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(log)
                 .process_group(0);
-            // Like every descriptor std creates, the pipe is close-on-exec; Xvfb must keep it.
+            // Like every descriptor std creates, the pipe is close-on-exec, and so is the
+            // cookie; Xvfb must keep both.
             unsafe {
-                cmd.pre_exec(move || match fcntl(fd, F_SETFD, 0 as c_int) {
-                    -1 => Err(std::io::Error::last_os_error()),
-                    _ => Ok(()),
+                cmd.pre_exec(move || {
+                    for fd in [fd, cookie_fd] {
+                        if fcntl(fd, F_SETFD, 0 as c_int) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
                 });
             }
             let child = cmd.spawn().map_err(|e| Error::msg(format!("cannot start Xvfb (is it installed?): {e}")))?;
             drop(ready_tx);
-            Ok((child, ready))
+            Ok((child, ready, cookie, kept))
         })();
-        let (xvfb, mut ready) = match started {
+        let (xvfb, mut ready, cookie, kept) = match started {
             Ok(c) => c,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -353,7 +485,8 @@ impl VirtualDisplay {
             }
         };
         let pid = xvfb.id();
-        let vd = VirtualDisplay { number: n, dir, auth, procs: Arc::new(Mutex::new(Procs { xvfb, session: None, closing: false })) };
+        let procs = Arc::new(Mutex::new(Procs { xvfb, session: None, closing: false }));
+        let vd = VirtualDisplay { number: n, dir, auth, cookie, kept, procs };
         let shown = read_display_number(&mut ready, &vd.procs, n, &log_path)?;
         if shown != n {
             bail!("Xvfb started display :{shown} instead of :{n}");
@@ -361,11 +494,18 @@ impl VirtualDisplay {
         check_socket_dir(Path::new(x11::SOCKET_DIR), unsafe { geteuid() })?;
         // Proves the listener is our Xvfb before the cookie goes anywhere.
         Conn::connect_to_server(&vd.target(), pid).map_err(|e| format!("cannot use display :{n}: {e}"))?;
+        // An X server that could not read its cookie lets every local user in.
+        let anonymous = Target { display: vd.display_name(), xauthority: Some(PathBuf::from("/dev/null")) };
+        if Conn::connect_to_server(&anonymous, pid).is_ok() {
+            bail!("Xvfb on :{n} lets clients in without the cookie: {}", log_tail(&log_path));
+        }
         Ok(vd)
     }
 
-    fn run_session(&self, cmd: &str) -> Result<Child> {
+    /// Starts the session command; also returns its log, to be kept with the directory.
+    fn run_session(&self, cmd: &str) -> Result<(Child, File)> {
         let log = File::create(self.dir.join("session.log"))?;
+        let kept = log.try_clone()?;
         let child = die_with_parent(&mut Command::new("sh"))
             .arg("-c")
             .arg(cmd)
@@ -381,7 +521,7 @@ impl VirtualDisplay {
             .process_group(0)
             .spawn()
             .map_err(|e| format!("cannot start session '{cmd}': {e}"))?;
-        Ok(child)
+        Ok((child, kept))
     }
 
     fn procs(&self) -> MutexGuard<'_, Procs> {
@@ -392,11 +532,15 @@ impl VirtualDisplay {
     /// logs why and sets `stop`, so a host serving this display shuts down (dropping it)
     /// instead of serving a dead or empty screen; a session command must therefore run for as
     /// long as the session lasts. The thread ends with the display, and dropping the display
-    /// does not set `stop`.
+    /// does not set `stop`. It also keeps the private directory looking in use to tmp cleaners
+    /// (a host may sit without viewers for weeks), and says so if it is gone anyway.
     pub fn watch(&self, stop: &'static AtomicBool) -> Result<()> {
         let procs = Arc::downgrade(&self.procs);
-        let (dir, name) = (self.dir.clone(), self.display_name());
+        let (dir, auth, name) = (self.dir.clone(), self.auth.clone(), self.display_name());
+        let kept = self.kept.try_clone()?;
         std::thread::Builder::new().name("virtual-display".into()).spawn(move || {
+            let mut refreshed = Instant::now();
+            let mut warned = false;
             loop {
                 std::thread::sleep(WATCH_INTERVAL);
                 let Some(procs) = procs.upgrade() else { return };
@@ -409,6 +553,20 @@ impl VirtualDisplay {
                     stop.store(true, Ordering::SeqCst);
                     return;
                 }
+                // Under the lock, which a display being dropped (its directory deleted) holds.
+                if refreshed.elapsed() >= REFRESH_INTERVAL {
+                    refreshed = Instant::now();
+                    kept.touch();
+                    // The host and Xvfb do not need the copy, only programs the session starts.
+                    if !warned && !kept.in_place(&dir, &auth) {
+                        warned = true;
+                        log!(
+                            "virtual display {name}: {} was deleted or replaced; programs started in the session \
+                             from now on cannot open windows",
+                            auth.display()
+                        );
+                    }
+                }
             }
         })?;
         Ok(())
@@ -419,15 +577,23 @@ impl VirtualDisplay {
         format!(":{}", self.number)
     }
 
+    /// For connections of this process.
     pub fn target(&self) -> Target {
-        Target { display: self.display_name(), xauthority: Some(self.auth.clone()) }
+        Target { display: self.display_name(), xauthority: Some(self.cookie_path()) }
+    }
+
+    /// The cookie file's name in /proc, under this process's id rather than "self", so a
+    /// program that inherits `XAUTHORITY` never reads a descriptor of its own instead. Other
+    /// users cannot open it, nor can such programs once this process is not dumpable.
+    fn cookie_path(&self) -> PathBuf {
+        fd_path(&std::process::id().to_string(), self.cookie.as_raw_fd())
     }
 }
 
 /// For tests; the host learns about exits through `watch`.
 #[cfg(test)]
 impl VirtualDisplay {
-    /// The private Xauthority file holding this display's cookie.
+    /// The private Xauthority file holding this display's cookie, for programs started in it.
     pub fn xauthority(&self) -> &Path {
         &self.auth
     }
@@ -461,11 +627,17 @@ impl Drop for VirtualDisplay {
         }
         stop_group(&mut p.xvfb);
         drop(p);
-        // Overwrite the cookie before deleting it.
-        if let Ok(len) = std::fs::metadata(&self.auth).map(|m| m.len() as usize) {
-            let _ = std::fs::write(&self.auth, vec![0u8; len]);
+        // Overwrite both cookies before they go, through the descriptors held: never whatever
+        // a path leads to by now.
+        for f in [&self.cookie, &self.kept.auth] {
+            if let Ok(len) = f.metadata().map(|m| m.len() as usize) {
+                let _ = f.write_all_at(&vec![0u8; len], 0);
+            }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // Only the directory made for this display, should another have taken its name.
+        if names(&self.dir, &self.kept.dir) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -486,6 +658,98 @@ mod tests {
         assert_eq!(find_cookie(&entries, 256, b"somehost", 42).map(|c| c.0.clone()), Some(vec![7; 16]));
         assert!(find_cookie(&entries, 256, b"somehost", 43).is_none());
         assert!(write_auth(&path, 42, &[1; 16]).is_err(), "never overwrites");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_cookie_file_has_no_name() {
+        const F_GETFD: c_int = 1;
+        const FD_CLOEXEC: c_int = 1;
+        let f = cookie_file(42, &[7; 16]).unwrap();
+        assert_eq!(f.metadata().unwrap().permissions().mode() & 0o777, 0o400);
+        // Read the way Xvfb ("self") and this process (its id) do.
+        for pid in ["self".to_string(), std::process::id().to_string()] {
+            let path = fd_path(&pid, f.as_raw_fd());
+            assert!(leads_to(&path, &f), "{}", path.display());
+            let entries = parse_xauthority(&std::fs::read(&path).unwrap());
+            assert_eq!(find_cookie(&entries, 256, b"somehost", 42).map(|c| c.0.clone()), Some(vec![7; 16]));
+        }
+        // Only Xvfb is handed it.
+        assert_eq!(unsafe { fcntl(f.as_raw_fd(), F_GETFD) } & FD_CLOEXEC, FD_CLOEXEC);
+    }
+
+    #[test]
+    fn runtime_dirs_must_be_private() {
+        let euid = unsafe { geteuid() };
+        let dir = private_dir("base").unwrap();
+        assert!(is_private_dir(&dir, euid));
+        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        for mode in [0o750, 0o705, 0o1777] {
+            set(mode);
+            assert!(!is_private_dir(&dir, euid), "mode {mode:o}");
+        }
+        set(0o700);
+        assert!(!is_private_dir(&dir, euid.wrapping_add(1)), "another user's");
+        assert!(!is_private_dir(&dir.join("missing"), euid));
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!is_private_dir(&file, euid), "not a directory");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let base = private_base();
+        assert!(is_private_dir(&base, euid) || base == std::env::temp_dir(), "{}", base.display());
+    }
+
+    /// Files are told by what is open, not by name: a replacement, a link or a renamed original
+    /// is not the file held.
+    #[test]
+    fn held_files_are_told_from_replacements() {
+        let dir = private_dir("held").unwrap();
+        let held = hold_dir(&dir).unwrap();
+        let path = dir.join("Xauthority");
+        let f = write_auth(&path, 1, &[1; 16]).unwrap();
+        assert!(names(&dir, &held) && names(&path, &f));
+        std::fs::rename(&path, dir.join("moved")).unwrap();
+        assert!(!names(&path, &f), "gone");
+        std::fs::write(&path, b"").unwrap();
+        assert!(!names(&path, &f), "replaced");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.join("moved"), &path).unwrap();
+        assert!(!names(&path, &f), "a link to it");
+        assert!(leads_to(&path, &f));
+        let moved = dir.with_extension("moved");
+        std::fs::rename(&dir, &moved).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!names(&dir, &held), "another directory of the same name");
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+    }
+
+    /// What tmp cleaners look at: timestamps (renewed), and for systemd-tmpfiles whether it can
+    /// lock the directory (not while the display runs).
+    #[test]
+    fn kept_files_look_in_use() {
+        let dir = private_dir("kept").unwrap();
+        let auth = dir.join("Xauthority");
+        let log = dir.join("xvfb.log");
+        let kept = Kept { dir: hold_dir(&dir).unwrap(), auth: write_auth(&auth, 1, &[1; 16]).unwrap(), logs: vec![File::create(&log).unwrap()] };
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for f in [&kept.dir, &kept.auth, &kept.logs[0]] {
+            f.set_times(FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
+        }
+        let clone = kept.try_clone().unwrap();
+        clone.touch();
+        let recent = SystemTime::now() - Duration::from_secs(600);
+        for p in [&dir, &auth, &log] {
+            let m = std::fs::metadata(p).unwrap();
+            assert!(m.modified().unwrap() > recent && m.accessed().unwrap() > recent, "{}", p.display());
+        }
+        assert!(kept.in_place(&dir, &auth));
+        // systemd-tmpfiles asks for this lock (non-blocking) before it cleans a directory.
+        let cleaner = File::open(&dir).unwrap();
+        assert!(cleaner.try_lock().is_err(), "the directory is not locked");
+        drop((kept, clone));
+        assert!(cleaner.try_lock().is_ok(), "still locked once nothing holds it");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -619,6 +883,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!socket_taken(n), "Xvfb still running");
+    }
+
+    /// Xvfb and the host read the cookie from the file without a name. The session's copy on
+    /// disk can go (aged out by a tmp cleaner) or be replaced (by another user once its
+    /// directory is gone) without locking the host out or letting anyone else in.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn the_cookie_on_disk_is_only_for_the_session() {
+        let vd = VirtualDisplay::spawn(Some(85), 64, 64, None).unwrap();
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", vd.procs().xvfb.id())).unwrap();
+        assert!(!String::from_utf8_lossy(&cmdline).contains(&*vd.dir.to_string_lossy()), "Xvfb was given a path");
+        let at = |path: &Path| Target { display: vd.display_name(), xauthority: Some(path.to_path_buf()) };
+        // Programs in the session use the copy.
+        drop(Conn::connect(&at(vd.xauthority())).unwrap());
+        // Gone: the host still gets in.
+        std::fs::remove_file(vd.xauthority()).unwrap();
+        drop(Conn::connect(&vd.target()).unwrap());
+        // Replaced by one with another cookie, then by one with none (to an X server reading it,
+        // "no access control"): nobody without the cookie gets in either way.
+        let foreign = vd.dir.join("foreign");
+        write_auth(&foreign, 85, &[9; 16]).unwrap();
+        for content in [std::fs::read(&foreign).unwrap(), Vec::new()] {
+            std::fs::write(vd.xauthority(), &content).unwrap();
+            // A newer modification time, which is what makes an X server read its file again.
+            std::thread::sleep(Duration::from_millis(1100));
+            match Conn::connect(&at(Path::new("/dev/null"))) {
+                Ok(_) => panic!("let in without a cookie"),
+                Err(e) => assert!(e.to_string().contains("refused"), "{e}"),
+            }
+            assert!(Conn::connect(&at(&foreign)).is_err(), "let in with another cookie");
+            drop(Conn::connect(&vd.target()).unwrap());
+        }
     }
 
     /// Another process holding the display's abstract socket name (which X clients try first)

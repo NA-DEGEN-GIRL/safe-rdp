@@ -4,13 +4,14 @@
 //! applies remote ones. Text written from the remote side is flagged so Windows keeps it out
 //! of clipboard history (Win+V) and cloud clipboard sync.
 
+use crate::platform::handover::Handover;
 use crate::proto::MAX_CLIPBOARD;
 use crate::util::{Error, Result, wide};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::{
     GetTokenInformation, ImpersonateLoggedOnUser, IsWellKnownSid, RevertToSelf, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
@@ -39,22 +40,24 @@ const WM_APP_SET: u32 = WM_APP + 1;
 
 struct State {
     on_change: Box<dyn Fn(String) + Send>,
-    rx: mpsc::Receiver<String>,
+    pending: Arc<Handover>,
     ignore_seq: u32,
 }
 
 pub struct Clipboard {
     hwnd: usize,
-    tx: mpsc::Sender<String>,
+    /// Remote text for the bridge thread: only the newest waits, however busy the thread is.
+    pending: Arc<Handover>,
 }
 
 impl Clipboard {
     /// Starts watching the clipboard; `on_change` runs on the bridge thread.
     pub fn spawn(on_change: impl Fn(String) + Send + 'static) -> Result<Clipboard> {
-        let (tx, rx) = mpsc::channel();
+        let pending = Arc::new(Handover::default());
+        let taken = pending.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<usize>>();
         std::thread::Builder::new().name("clipboard".into()).spawn(move || {
-            let state = Box::new(State { on_change: Box::new(on_change), rx, ignore_seq: 0 });
+            let state = Box::new(State { on_change: Box::new(on_change), pending: taken, ignore_seq: 0 });
             match create_window(state) {
                 Ok(hwnd) => {
                     let _ = ready_tx.send(Ok(hwnd as usize));
@@ -66,19 +69,22 @@ impl Clipboard {
             }
         })?;
         let hwnd = ready_rx.recv().map_err(|_| Error::msg("clipboard thread died"))??;
-        Ok(Clipboard { hwnd, tx })
+        Ok(Clipboard { hwnd, pending })
     }
 
     /// Replaces the local clipboard text (asynchronously, on the bridge thread).
     pub fn set(&self, text: String) {
-        if self.tx.send(text).is_ok() {
-            unsafe { PostMessageW(self.hwnd as HWND, WM_APP_SET, 0, 0) };
+        // One message at a time is in flight; it applies whatever text is newest by then.
+        if self.pending.put(text) && unsafe { PostMessageW(self.hwnd as HWND, WM_APP_SET, 0, 0) } == 0 {
+            // Nothing will come for it (the thread is gone); the next text posts again.
+            self.pending.discard();
         }
     }
 }
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
+        self.pending.close();
         unsafe { PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0) };
     }
 }
@@ -127,7 +133,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_APP_SET if !state.is_null() => {
                 let s = &mut *state;
                 // Only the newest pending value matters.
-                if let Some(t) = s.rx.try_iter().last() {
+                if let Some(t) = s.pending.take() {
                     if write_text(hwnd, &t) {
                         s.ignore_seq = GetClipboardSequenceNumber();
                     }
