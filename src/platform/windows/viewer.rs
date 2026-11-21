@@ -513,7 +513,10 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     r
 }
 
-fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
+fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
+    // Names this window's connections to the host, so that its automatic reconnects take back
+    // only the session it lost, never one another viewer has started since.
+    opts.instance = core::new_instance()?;
     let conn = core::connect(target, &opts, &psk)?;
     let (w, h) = (conn.width, conn.height);
     if w * h > MAX_PIXELS {
@@ -1124,6 +1127,7 @@ impl Ui {
         lock(&app.swallowed).clear();
     }
 
+    /// The hello of an automatic reconnect.
     fn hello_options(&self) -> ViewerOptions {
         ViewerOptions {
             fullscreen: false,
@@ -1136,6 +1140,8 @@ impl Ui {
             monitor: self.prefs.monitor,
             audio: self.prefs.audio,
             privacy: self.prefs.privacy,
+            instance: self.opts.instance,
+            reconnect: true,
         }
     }
 

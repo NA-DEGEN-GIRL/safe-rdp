@@ -1,9 +1,11 @@
 //! Host side: listens on the Tailscale interface, authenticates viewers and streams the screen.
 //!
-//! One session at a time; a new viewer replaces the current one. Inside a session:
+//! One session at a time; a new viewer replaces the current one (an automatic reconnect only
+//! its own viewer's, see `takes_over`), which is told why. Inside a session:
 //! * the capture thread grabs, encodes and sends frames (at most `MAX_IN_FLIGHT` unacknowledged),
 //!   applies quality, scale and monitor changes and refines lossy regions once they settle;
-//! * the input thread handles everything the viewer sends: input, clipboard, settings, uploads;
+//! * the receiving thread reads what the viewer sends, and the input thread handles it: input,
+//!   clipboard, settings, uploads;
 //! * helpers run beside them: the text clipboard bridge, audio capture with its sender thread,
 //!   and a file-pull thread that yields the socket to frames between chunks.
 //!
@@ -118,8 +120,18 @@ const REFINE_BUDGET: usize = 256 * 1024;
 /// A viewer that sends more waits for it, so a flood of `Set`s neither grows the queue nor
 /// keeps the capture thread from frames and its checks.
 const SETTINGS_QUEUE: usize = 16;
-/// Longest the host spends telling a replaced viewer that its session ends.
+/// Longest a replaced viewer's farewell waits for a record already being sent, and how long a
+/// turned-away viewer's connection is drained.
 const FAREWELL: Duration = Duration::from_secs(1);
+/// How long a replaced viewer's connection stays open after its farewell, for the viewer to
+/// work through what it has not read yet up to the notice (`drain`), and how many connections
+/// may wait like that at once; beyond that a replaced session's connection closes at once.
+const DRAIN_FOR: Duration = Duration::from_secs(20);
+const MAX_DRAINS: usize = 4;
+/// Messages the receiving thread reads ahead of the input thread.
+const RECEIVED_QUEUE: usize = 4;
+/// How soon the input thread notices that its session was stopped while it waits for messages.
+const STOP_POLL: Duration = Duration::from_millis(50);
 /// Uploads a viewer may have open at once.
 const MAX_UPLOADS: usize = 4;
 /// What the service's own upload folder may hold, uploads still arriving included: only an
@@ -155,22 +167,88 @@ struct SessionCtl {
     sock: TcpStream,
     /// The session's sending half while it has one, for `kick_with_notice`.
     out: Mutex<Option<Arc<Out>>>,
+    /// The viewer's hello `instance` (0: none), which an automatic reconnect must match.
+    instance: u64,
+    link: Mutex<Link>,
+}
+
+/// What ending a session does to its connection.
+enum Link {
+    /// In use: `kick` shuts it down, waking every thread blocked on it.
+    Live,
+    /// A farewell is on its way to the viewer: nothing the session does closes the connection,
+    /// which stays open after the session until the receiving thread has drained it with this
+    /// slot (`drain`), so that no reset overtakes the notice.
+    Parting(Option<DrainSlot>),
+    Closed,
 }
 
 impl SessionCtl {
+    fn new(sock: TcpStream, instance: u64) -> SessionCtl {
+        SessionCtl {
+            stop: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            sock,
+            out: Mutex::new(None),
+            instance,
+            link: Mutex::new(Link::Live),
+        }
+    }
     fn kick(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self.sock.shutdown(Shutdown::Both);
-        wake_blocked_io(&self.sock);
+        let mut link = lock(&self.link);
+        if !matches!(*link, Link::Parting(_)) {
+            *link = Link::Closed;
+            let _ = self.sock.shutdown(Shutdown::Both);
+            wake_blocked_io(&self.sock);
+        }
+    }
+    /// `kick`, a parting connection included.
+    fn kill(&self) {
+        *lock(&self.link) = Link::Closed;
+        self.kick();
     }
     /// Ends the session after telling the viewer why. A viewer reconnects after a close it was
-    /// not told about, which for a replaced one would throw the newcomer out in turn.
-    fn kick_with_notice(&self, text: &str) {
+    /// not told about, which for a replaced one would throw the newcomer out in turn. The
+    /// session winds down at once; the notice goes out behind whatever the viewer has not read
+    /// yet, on a thread of its own, so the newcomer never waits for that, and the connection
+    /// stays open until the viewer has read it. With `MAX_DRAINS` connections parting already,
+    /// or if the notice cannot go out, the connection is shut down instead.
+    fn kick_with_notice(self: &Arc<Self>, text: &str, drains: &Arc<AtomicUsize>) {
         let out = lock(&self.out).clone();
-        if let Some(out) = out {
-            out.farewell(&self.sock, text, &self.stop);
+        if let (Some(out), Some(slot)) = (out, DrainSlot::take(drains))
+            && self.part(slot)
+        {
+            self.stop.store(true, Ordering::SeqCst);
+            // From now on only the farewell sends.
+            out.parting.store(true, Ordering::SeqCst);
+            let (ctl, text) = (self.clone(), text.to_string());
+            let farewell = move || {
+                if !out.farewell(&ctl.sock, &text) {
+                    ctl.kill();
+                }
+            };
+            if std::thread::Builder::new().name("farewell".into()).spawn(farewell).is_ok() {
+                return;
+            }
         }
-        self.kick();
+        self.kill();
+    }
+    /// Leaves the connection open past the session (`Link::Parting`); false if it is closed already.
+    fn part(&self, slot: DrainSlot) -> bool {
+        let mut link = lock(&self.link);
+        let live = matches!(*link, Link::Live);
+        if live {
+            *link = Link::Parting(Some(slot));
+        }
+        live
+    }
+    /// The drain slot of a parting connection, once.
+    fn drain_slot(&self) -> Option<DrainSlot> {
+        match &mut *lock(&self.link) {
+            Link::Parting(slot) => slot.take(),
+            _ => None,
+        }
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
@@ -197,6 +275,48 @@ fn wake_blocked_io(sock: &TcpStream) {
 #[cfg(not(windows))]
 fn wake_blocked_io(_sock: &TcpStream) {}
 
+/// One of `MAX_DRAINS` connections left open after their session for the viewer to read its
+/// farewell, until `until`.
+struct DrainSlot {
+    count: Arc<AtomicUsize>,
+    until: Instant,
+}
+
+impl DrainSlot {
+    fn take(count: &Arc<AtomicUsize>) -> Option<DrainSlot> {
+        count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_DRAINS).then_some(n + 1)).ok()?;
+        Some(DrainSlot { count: count.clone(), until: Instant::now() + DRAIN_FOR })
+    }
+}
+
+impl Drop for DrainSlot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Reads and discards what a viewer still sends until it hangs up, or until `until`, so that
+/// its connection closes in order. Closing a connection the viewer still sends on (or shutting
+/// it down for reading) resets it, and a reset discards what the viewer has not read yet: a
+/// farewell queued behind frames it is still working through.
+fn drain(sock: &TcpStream, until: Instant) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || sock.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        let read = match (&mut &*sock).read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        if read == 0 {
+            return;
+        }
+    }
+}
+
 /// Ends the session when dropped, also when the owning thread panics.
 struct KickOnDrop(Arc<SessionCtl>);
 
@@ -214,6 +334,8 @@ struct Host {
     quiet: Mutex<Quiet>,
     /// `serve` was told to stop: no new session may start.
     stopping: AtomicBool,
+    /// Replaced sessions' connections being drained (`DrainSlot`).
+    drains: Arc<AtomicUsize>,
 }
 
 impl Host {
@@ -225,6 +347,7 @@ impl Host {
             pending: Mutex::new(Pending::default()),
             quiet: Mutex::new(Quiet::new(Instant::now())),
             stopping: AtomicBool::new(false),
+            drains: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -580,24 +703,78 @@ fn handshake(stream: &TcpStream, psk: &[u8; 32], until: Instant) -> Result<chann
     channel::server_handshake(&mut Deadline { s: stream, until }, psk)
 }
 
+/// The viewer's first message (`ClientMsg::Hello`).
+struct Hello {
+    downscale: u8,
+    quality: u8,
+    monitor: u8,
+    flags: u8,
+    instance: u64,
+}
+
+/// Sets up an authenticated connection's records and reads the viewer's hello.
+fn read_hello(stream: TcpStream, keys: channel::SessionKeys) -> Result<(Arc<Out>, RecordReader<TcpStream>, Hello)> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let out = Arc::new(Out::new(RecordWriter::new(stream.try_clone()?, keys.send)));
+    let mut reader = RecordReader::new(stream, keys.recv);
+    match ClientMsg::decode(reader.recv()?)? {
+        ClientMsg::Hello { downscale, quality, monitor, flags, instance } => {
+            Ok((out, reader, Hello { downscale, quality, monitor, flags, instance }))
+        }
+        _ => bail!("protocol error: viewer did not start with a hello"),
+    }
+}
+
+/// Whether a viewer whose hello has `flags` and `instance` may replace the live session, whose
+/// viewer's instance is `live` (`None`: no session). A new connection does, as a user who moves
+/// to another PC expects. An automatic reconnect takes back only its own viewer's session (one
+/// whose connection it lost), never another viewer's: the one connected since must stay.
+fn takes_over(flags: u8, instance: u64, live: Option<u64>) -> bool {
+    flags & HELLO_RECONNECT == 0 || live.is_none_or(|l| l != 0 && l == instance)
+}
+
+/// Turns a viewer away: tells it why in place of the host's hello, which ends its reconnects,
+/// and closes the connection in order.
+fn refuse(out: &Out, sock: &TcpStream, text: &str) {
+    if out.send(&ServerMsg::Notice(short(text.into()))).is_ok() && sock.shutdown(Shutdown::Write).is_ok() {
+        drain(sock, Instant::now() + FAREWELL);
+    }
+}
+
 fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys) {
     let Ok(sock) = stream.try_clone() else { return };
-    let ctl = Arc::new(SessionCtl { stop: AtomicBool::new(false), finished: AtomicBool::new(false), sock, out: Mutex::new(None) });
+    // The hello first: whether this viewer may replace the live session depends on it.
+    let (out, reader, hello) = match read_hello(stream, keys) {
+        Ok(h) => h,
+        Err(e) => {
+            log!("no session for {peer}: {e}");
+            return;
+        }
+    };
+    let ctl = Arc::new(SessionCtl::new(sock, hello.instance));
     let old = {
         let mut cur = lock(&host.current);
         if host.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let live = cur.as_ref().filter(|c| !c.stopped()).map(|c| c.instance);
+        if !takes_over(hello.flags, hello.instance, live) {
+            drop(cur);
+            log!("refused {peer}: an automatic reconnect does not replace another viewer's session");
+            refuse(&out, &ctl.sock, "another viewer is using this host");
             return;
         }
         cur.replace(ctl.clone())
     };
     if let Some(old) = old {
         log!("replacing the existing session");
-        old.kick_with_notice("another viewer connected to this host");
+        old.kick_with_notice("another viewer connected to this host", &host.drains);
         // Let it release its screen duplication, injected keys and privacy mode first.
         old.wait_finished(Duration::from_secs(5));
     }
     log!("session started: {peer}");
-    let r = run_session(host, stream, keys, &ctl);
+    let r = run_session(host, out, reader, &hello, &ctl);
     lock(&ctl.out).take();
     ctl.kick();
     {
@@ -615,14 +792,24 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
 
 /// The sending half of a session, shared by the capture, input, clipboard, audio and file threads.
 struct Out {
-    w: Mutex<RecordWriter<TcpStream>>,
+    /// The writer; the farewell takes it away (`farewell`).
+    w: Mutex<Option<RecordWriter<TcpStream>>>,
     /// Threads waiting to send frames or replies; bulk file data lets them go first.
     waiting: AtomicUsize,
+    /// The writer is the farewell's: every other send fails.
+    parting: AtomicBool,
 }
 
 impl Out {
     fn new(w: RecordWriter<TcpStream>) -> Out {
-        Out { w: Mutex::new(w), waiting: AtomicUsize::new(0) }
+        Out { w: Mutex::new(Some(w)), waiting: AtomicUsize::new(0), parting: AtomicBool::new(false) }
+    }
+
+    fn writer<'a>(&self, w: &'a mut Option<RecordWriter<TcpStream>>) -> Result<&'a mut RecordWriter<TcpStream>> {
+        match w {
+            Some(w) if !self.parting.load(Ordering::SeqCst) => Ok(w),
+            _ => bail!("the session is ending"),
+        }
     }
 
     /// Sends one complete message (type byte included).
@@ -630,7 +817,7 @@ impl Out {
         self.waiting.fetch_add(1, Ordering::SeqCst);
         let mut w = lock(&self.w);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
-        w.send(rec)
+        self.writer(&mut w)?.send(rec)
     }
 
     fn send(&self, m: &ServerMsg) -> Result<()> {
@@ -647,37 +834,32 @@ impl Out {
         }
         let mut b = Vec::new();
         m.encode(&mut b);
-        lock(&self.w).send(&b)
+        self.writer(&mut lock(&self.w))?.send(&b)
     }
 
     fn notice(&self, text: String) -> Result<()> {
         self.send(&ServerMsg::Notice(short(text)))
     }
 
-    /// Sends `text` as the session's last message and ends the stream behind it, then keeps
-    /// the writer until the viewer hangs up (its session's input side ends: `ended`) or
-    /// `FAREWELL` is over. Meanwhile no other thread can fail on the closed socket and get the
-    /// connection reset, which could discard the notice before the viewer has read it. A writer
-    /// busy for all of `FAREWELL` (a viewer that does not read) means no notice.
-    fn farewell(&self, sock: &TcpStream, text: &str, ended: &AtomicBool) {
+    /// Sends `text` as the session's last message and ends the stream behind it; true if both
+    /// went out. Every other send fails once `parting` is set, so only a record already being
+    /// sent holds the writer, for at most `FAREWELL`: a writer stuck that long means no notice
+    /// (its send still holds the session, the screen included). The farewell then takes the
+    /// writer away, so that no thread of the session waits while the notice waits behind what
+    /// the viewer has not read yet, for up to the connection's write timeout.
+    fn farewell(&self, sock: &TcpStream, text: &str) -> bool {
         let t = Instant::now();
-        let mut w = loop {
+        let w = loop {
             match self.w.try_lock() {
-                Ok(w) => break w,
-                Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                Ok(mut w) => break w.take(),
+                Err(TryLockError::Poisoned(e)) => break e.into_inner().take(),
                 Err(TryLockError::WouldBlock) if t.elapsed() < FAREWELL => std::thread::sleep(Duration::from_millis(5)),
-                Err(TryLockError::WouldBlock) => return,
+                Err(TryLockError::WouldBlock) => return false,
             }
         };
-        let _ = sock.set_write_timeout(Some(FAREWELL.saturating_sub(t.elapsed()).max(Duration::from_millis(50))));
         let mut b = Vec::new();
         ServerMsg::Notice(short(text.into())).encode(&mut b);
-        if w.send(&b).is_err() || sock.shutdown(Shutdown::Write).is_err() {
-            return;
-        }
-        while !ended.load(Ordering::SeqCst) && t.elapsed() < FAREWELL {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        w.is_some_and(|mut w| w.send(&b).is_ok()) && sock.shutdown(Shutdown::Write).is_ok()
     }
 }
 
@@ -786,18 +968,9 @@ fn accepts_clipboard(opts: &HostOptions) -> bool {
     opts.clipboard && !opts.view_only
 }
 
-fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, ctl: &Arc<SessionCtl>) -> Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let out = Arc::new(Out::new(RecordWriter::new(stream.try_clone()?, keys.send)));
-    let mut reader = RecordReader::new(stream, keys.recv);
+fn run_session(host: &Arc<Host>, out: Arc<Out>, reader: RecordReader<TcpStream>, hello: &Hello, ctl: &Arc<SessionCtl>) -> Result<()> {
     let opts = &host.opts;
-    let start = match ClientMsg::decode(reader.recv()?)? {
-        ClientMsg::Hello { downscale, quality, monitor, flags } => {
-            negotiate(opts, downscale, quality, monitor, flags, |s| capture::resolve(s).is_some())
-        }
-        _ => bail!("protocol error: viewer did not start with a hello"),
-    };
+    let start = negotiate(opts, hello.downscale, hello.quality, hello.monitor, hello.flags, |s| capture::resolve(s).is_some());
 
     let area = capture::resolve(start.sel).ok_or("selected monitor not found")?;
     let flags = host_flags(opts, AudioCapture::available(), Privacy::available());
@@ -814,7 +987,13 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         monitors,
         name: crate::platform::hostname(),
     })?;
-    // From here on a replacement can say goodbye: the viewer has its hello.
+    let (received_tx, received) = mpsc::sync_channel(RECEIVED_QUEUE);
+    {
+        let ctl = ctl.clone();
+        std::thread::Builder::new().name("receive".into()).spawn(move || receive(reader, received_tx, &ctl))?;
+    }
+    // From here on a replacement can say goodbye: the viewer has its hello, and the receiving
+    // thread is there to drain the connection afterwards.
     *lock(&ctl.out) = Some(out.clone());
     if start.host_quality {
         // The viewer left the quality to this host: tell it which one is in effect.
@@ -851,7 +1030,7 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         let wishes = (start.audio, start.privacy);
         std::thread::Builder::new().name("input".into()).spawn(move || {
             let _kick = KickOnDrop(ctl.clone());
-            Input::new(host, out, shared, ctl, clip, settings_tx, flags).run(reader, wishes)
+            Input::new(host, out, shared, ctl, clip, settings_tx, flags).run(received, wishes)
         })?
     };
 
@@ -865,6 +1044,24 @@ fn run_session(host: &Arc<Host>, stream: TcpStream, keys: channel::SessionKeys, 
         (_, Err(e)) => Err(e),
         (Err(e), _) if !kicked => Err(e),
         _ => Ok(()),
+    }
+}
+
+/// The receiving thread: reads the viewer's messages for the input thread until the session or
+/// the connection ends (its last message is the error that ended it), then drains a replaced
+/// session's connection and closes it, a farewell still waiting to be sent included. It holds
+/// nothing of the session but the connection.
+fn receive(mut reader: RecordReader<TcpStream>, to_input: mpsc::SyncSender<Result<ClientMsg>>, ctl: &SessionCtl) {
+    while !ctl.stopped() {
+        let m = reader.recv().and_then(ClientMsg::decode);
+        let end = m.is_err();
+        if to_input.send(m).is_err() || end {
+            break;
+        }
+    }
+    if let Some(slot) = ctl.drain_slot() {
+        drain(&ctl.sock, slot.until);
+        ctl.kill();
     }
 }
 
@@ -925,25 +1122,32 @@ impl Input {
         }
     }
 
-    fn run(mut self, reader: RecordReader<TcpStream>, wishes: (bool, bool)) -> Result<()> {
-        match self.serve(reader, wishes) {
+    fn run(mut self, received: mpsc::Receiver<Result<ClientMsg>>, wishes: (bool, bool)) -> Result<()> {
+        match self.serve(received, wishes) {
             // Ended from elsewhere (replaced, host stopping, capture failed): not this side's error.
             Err(_) if self.ctl.stopped() => Ok(()),
             r => r,
         }
     }
 
-    fn serve(&mut self, mut reader: RecordReader<TcpStream>, (audio, privacy): (bool, bool)) -> Result<()> {
+    fn serve(&mut self, received: mpsc::Receiver<Result<ClientMsg>>, (audio, privacy): (bool, bool)) -> Result<()> {
         if audio {
             self.set_feature(SET_AUDIO, 1)?;
         }
         if privacy {
             self.set_feature(SET_PRIVACY, 1)?;
         }
-        loop {
-            let m = ClientMsg::decode(reader.recv()?)?;
-            self.handle(m)?;
+        // Not blocked on the socket (the receiving thread is), so a stopped session lets go of
+        // its keys, privacy mode and the rest at once, even while its connection stays open.
+        while !self.ctl.stopped() {
+            match received.recv_timeout(STOP_POLL) {
+                Ok(_) if self.ctl.stopped() => {}
+                Ok(m) => self.handle(m?)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the receiving thread ended"),
+            }
         }
+        Ok(())
     }
 
     fn handle(&mut self, m: ClientMsg) -> Result<()> {
@@ -1475,9 +1679,10 @@ fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, st
 
 /// Adds to a tick's `rects` (what `encode` found changed in `pixels`, the frame it last saw)
 /// the lossless refinement of lossy regions that have settled, within what is left of
-/// `REFINE_BUDGET`. Tiles just encoded have not settled yet, so they are not sent twice (and
-/// a frame never covers more than twice the screen, the decoder's limit); one frame per tick
-/// keeps flow control as it was.
+/// `REFINE_BUDGET`. Tiles just encoded have normally not settled yet, so they are not sent
+/// twice; an encode slower than the settle delay can have them refined in the same frame,
+/// which only costs bytes: each tile is in it at most twice, within the decoder's limit of
+/// twice the screen. One frame per tick keeps flow control as it was.
 fn add_refinement(encoder: &mut Encoder, pixels: &[u8], w: usize, h: usize, rects: &mut Vec<EncodedRect>) {
     if pixels.len() != w * h * 4 {
         return;
@@ -1789,11 +1994,15 @@ mod tests {
         let mut dec = codec::Decoder::new().unwrap();
         let mut enc = Encoder::new().unwrap();
         enc.set_quality(QUALITY_BALANCED);
+        let t = Instant::now();
         busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 1);
         assert!(!exact_outside_first_tile(&fb, &cur, w), "the photo was not sent lossy");
-        // Not settled yet: nothing is refined.
+        // Not settled yet: nothing is refined. This runs on the real clock, so it holds only if
+        // the two ticks took less than the settle delay; codec::tests checks it on a clock of its own.
         busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 2);
-        assert!(!exact_outside_first_tile(&fb, &cur, w));
+        if t.elapsed() < Duration::from_millis(300) {
+            assert!(!exact_outside_first_tile(&fb, &cur, w));
+        }
         // Settled (300 ms): refined although no tick is idle.
         std::thread::sleep(Duration::from_millis(400));
         busy_tick(&mut enc, &mut dec, &mut cur, &mut fb, w, h, 3);
@@ -2265,6 +2474,151 @@ mod tests {
         assert!(why.is_some());
         assert_eq!(t.set(false, || bail!("unused")), (0, None));
     }
+
+    #[test]
+    fn who_may_take_over() {
+        // A new connection replaces the live session, also an older viewer's (no instance).
+        assert!(takes_over(0, 0, None) && takes_over(0, 5, Some(9)) && takes_over(HELLO_AUDIO, 0, Some(0)));
+        // An automatic reconnect when nobody is connected, or to take back its own viewer's session.
+        assert!(takes_over(HELLO_RECONNECT, 5, None) && takes_over(HELLO_RECONNECT | HELLO_PRIVACY, 5, Some(5)));
+        // Never another viewer's session, nor one of a viewer without an instance.
+        assert!(!takes_over(HELLO_RECONNECT, 5, Some(9)));
+        assert!(!takes_over(HELLO_RECONNECT, 0, Some(0)) && !takes_over(HELLO_RECONNECT, 5, Some(0)));
+    }
+
+    const PAIR_KEY: [u8; 32] = [4; 32];
+
+    /// An authenticated loopback connection: the host's end and the viewer's, with their keys.
+    fn session_pair() -> ((TcpStream, channel::SessionKeys), (TcpStream, channel::SessionKeys)) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let viewer = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let keys = channel::client_handshake(&mut s, &PAIR_KEY).unwrap();
+            (s, keys)
+        });
+        let (s, _) = l.accept().unwrap();
+        let keys = handshake(&s, &PAIR_KEY, Instant::now() + Duration::from_secs(10)).unwrap();
+        ((s, keys), viewer.join().unwrap())
+    }
+
+    /// Reads until the connection ends: the tiles records and the last notice that came.
+    fn read_to_end(reader: &mut RecordReader<TcpStream>) -> (usize, Option<String>) {
+        let (mut tiles, mut notice) = (0, None);
+        while let Ok(rec) = reader.recv() {
+            match ServerMsg::decode(rec) {
+                Ok(ServerMsg::Tiles(_)) => tiles += 1,
+                Ok(ServerMsg::Notice(text)) => notice = Some(text),
+                _ => {}
+            }
+        }
+        (tiles, notice)
+    }
+
+    #[test]
+    fn a_farewell_reaches_a_viewer_that_is_behind_and_still_sending() {
+        let ((hs, hk), (vs, vk)) = session_pair();
+        let drains = Arc::new(AtomicUsize::new(0));
+        let ctl = Arc::new(SessionCtl::new(hs.try_clone().unwrap(), 1));
+        let out = Arc::new(Out::new(RecordWriter::new(hs.try_clone().unwrap(), hk.send)));
+        *lock(&ctl.out) = Some(out.clone());
+        let (to_input, received) = mpsc::sync_channel(RECEIVED_QUEUE);
+        let receiver = {
+            let (ctl, reader) = (ctl.clone(), RecordReader::new(hs, hk.recv));
+            std::thread::spawn(move || receive(reader, to_input, &ctl))
+        };
+        // Frames the viewer has not read yet; it pings all the while, as the GUI viewer does.
+        let mut frame = vec![7u8; 4096];
+        frame[0] = S_TILES;
+        for _ in 0..8 {
+            out.send_record(&frame).unwrap();
+        }
+        let pinging = Arc::new(AtomicBool::new(true));
+        let pinger = {
+            let (pinging, mut w) = (pinging.clone(), RecordWriter::new(vs.try_clone().unwrap(), vk.send));
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                ClientMsg::Ping(1).encode(&mut b);
+                while pinging.load(Ordering::SeqCst) {
+                    if w.send(&b).is_err() {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                true
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        ctl.kick_with_notice("another viewer connected to this host", &drains);
+        assert!(ctl.stopped() && matches!(*lock(&ctl.link), Link::Parting(_)));
+        assert!(out.send(&ServerMsg::Ping).is_err(), "a session thread sent after the farewell");
+        // The input thread is gone (it leaves as soon as it sees the stop), and the session's
+        // own end kicks it once more: the connection stays open.
+        drop(received);
+        ctl.kick();
+        // Well past `FAREWELL`, the viewer reads: everything, then the notice, then the end.
+        std::thread::sleep(FAREWELL + Duration::from_millis(500));
+        let mut reader = RecordReader::new(vs, vk.recv);
+        let (tiles, notice) = read_to_end(&mut reader);
+        assert_eq!((tiles, notice.as_deref()), (8, Some("another viewer connected to this host")));
+        pinging.store(false, Ordering::SeqCst);
+        assert!(pinger.join().unwrap(), "the host reset the connection under the viewer's pings");
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+        // The viewer hangs up, and the drain ends with it.
+        drop(reader);
+        let t = Instant::now();
+        receiver.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5), "drained for {:?}", t.elapsed());
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn without_a_drain_slot_a_replaced_connection_closes_at_once() {
+        let drains = Arc::new(AtomicUsize::new(0));
+        let slots: Vec<DrainSlot> = std::iter::from_fn(|| DrainSlot::take(&drains)).collect();
+        assert_eq!(slots.len(), MAX_DRAINS);
+        let ((hs, hk), (vs, vk)) = session_pair();
+        let ctl = Arc::new(SessionCtl::new(hs.try_clone().unwrap(), 1));
+        *lock(&ctl.out) = Some(Arc::new(Out::new(RecordWriter::new(hs, hk.send))));
+        ctl.kick_with_notice("another viewer connected to this host", &drains);
+        assert!(ctl.stopped() && matches!(*lock(&ctl.link), Link::Closed));
+        let (_, notice) = read_to_end(&mut RecordReader::new(vs, vk.recv));
+        assert_eq!(notice, None);
+        assert_eq!(drains.load(Ordering::SeqCst), MAX_DRAINS);
+        drop(slots);
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+        // A session that ended already is not parted later.
+        assert!(!ctl.part(DrainSlot::take(&drains).unwrap()));
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_automatic_reconnect_does_not_replace_another_viewers_session() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let host = Arc::new(Host::new(HostOptions { copied_files: Vec::new, ..HostOptions::default() }, Secret(PAIR_KEY)));
+        // Another viewer's live session.
+        let ((other, _), _other_viewer) = session_pair();
+        let live = Arc::new(SessionCtl::new(other, 7));
+        *lock(&host.current) = Some(live.clone());
+        let served = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let (s, peer) = l.accept().unwrap();
+                let keys = handshake(&s, &PAIR_KEY, Instant::now() + Duration::from_secs(10)).unwrap();
+                serve_session(&host, s, peer, keys);
+            })
+        };
+        let o = crate::viewer::ViewerOptions { instance: 8, reconnect: true, ..Default::default() };
+        let e = match crate::viewer::connect(&addr.to_string(), &o, &Secret(PAIR_KEY)) {
+            Ok(_) => panic!("an automatic reconnect replaced another viewer's session"),
+            Err(e) => e,
+        };
+        assert_eq!(e.to_string(), format!("{}another viewer is using this host", crate::viewer::REFUSED));
+        assert!(!crate::viewer::retryable(&e));
+        served.join().unwrap();
+        assert!(!live.stopped() && lock(&host.current).as_ref().is_some_and(|c| Arc::ptr_eq(c, &live)));
+    }
 }
 
 /// End-to-end sessions over loopback against the real host, capturing this PC's screen
@@ -2303,10 +2657,11 @@ mod session_tests {
     }
 
     impl TestHost {
-        fn start(port: u16, configure: impl FnOnce(&mut HostOptions)) -> TestHost {
+        /// A host on a port the system picks, so that test runs side by side never collide.
+        fn start(configure: impl FnOnce(&mut HostOptions)) -> TestHost {
             let mut opts = HostOptions {
                 bind: Some(IpAddr::from([127, 0, 0, 1])),
-                port,
+                port: 0,
                 policy: PeerPolicy { allow: vec![], allow_non_tailscale: false, loopback_ok: true },
                 audio: false,
                 privacy: false,
@@ -2315,6 +2670,7 @@ mod session_tests {
             };
             configure(&mut opts);
             let listener = bind(&opts, &AtomicBool::new(false)).unwrap();
+            let port = listener.local_addr().unwrap().port();
             let stop = Arc::new(AtomicBool::new(false));
             let s = stop.clone();
             let thread = std::thread::spawn(move || serve(listener, opts, Secret(PSK), &s));
@@ -2322,9 +2678,7 @@ mod session_tests {
         }
 
         fn connect(&self, o: ViewerOptions) -> Client {
-            let conn = connect(&format!("127.0.0.1:{}", self.port), &o, &Secret(PSK)).unwrap();
-            conn.stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-            Client { conn, dec: Decoder::new().unwrap(), fb: Vec::new(), size: (0, 0), frames: Vec::new(), ack: true }
+            Client::new(connect(&format!("127.0.0.1:{}", self.port), &o, &Secret(PSK)).unwrap())
         }
     }
 
@@ -2351,6 +2705,11 @@ mod session_tests {
     }
 
     impl Client {
+        fn new(conn: Connection) -> Client {
+            conn.stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+            Client { conn, dec: Decoder::new().unwrap(), fb: Vec::new(), size: (0, 0), frames: Vec::new(), ack: true }
+        }
+
         fn send(&mut self, m: ClientMsg) {
             let mut b = Vec::new();
             m.encode(&mut b);
@@ -2427,6 +2786,20 @@ mod session_tests {
             self.wait("pong", |m| matches!(m, ServerMsg::Pong(x) if *x == t).then_some(()));
         }
 
+        /// Stops acknowledging and takes frames until `MAX_IN_FLIGHT` wait to be acknowledged:
+        /// the host then sends no more of them, so none can hold its writer when this viewer
+        /// stops reading and is replaced (a record stuck for all of `FAREWELL` means no notice).
+        fn hold_frames(&mut self) {
+            let acked = self.frames.last().map_or(0, |f| f.0);
+            self.ack = false;
+            while self.frames.iter().filter(|f| f.0 > acked).count() < MAX_IN_FLIGHT as usize {
+                let n = self.frames.len();
+                self.send(ClientMsg::Refresh);
+                self.frame(n + 1);
+            }
+            self.ping(0x401d);
+        }
+
         fn notice(&mut self) -> String {
             self.wait("a notice", |m| match m {
                 ServerMsg::Notice(t) => Some(t.clone()),
@@ -2446,7 +2819,7 @@ mod session_tests {
     fn session_end_to_end() {
         let _serial = lock(&SERIAL);
         let dir = tmpdir("uploads");
-        let host = TestHost::start(47410, |o| o.transfer_dir = Some(dir.clone()));
+        let host = TestHost::start(|o| o.transfer_dir = Some(dir.clone()));
         let primary = capture::resolve(MonitorSel::Primary).expect("no monitor");
         let (pw, ph) = (primary.width as usize, primary.height as usize);
         let mut c = host.connect(ViewerOptions { audio: true, ..ViewerOptions::default() });
@@ -2574,7 +2947,7 @@ mod session_tests {
         for i in 0..OWN_DIR_FILES - 1 {
             std::fs::File::create(dir.join(format!("old{i}"))).unwrap();
         }
-        let host = TestHost::start(47419, |o| {
+        let host = TestHost::start(|o| {
             o.transfer_dir = Some(dir.clone());
             o.own_transfer_dir = true;
         });
@@ -2615,7 +2988,7 @@ mod session_tests {
         let _serial = lock(&SERIAL);
         {
             let dir = tmpdir("view-only");
-            let host = TestHost::start(47411, |o| {
+            let host = TestHost::start(|o| {
                 o.view_only = true;
                 o.transfer_dir = Some(dir.clone());
             });
@@ -2647,7 +3020,7 @@ mod session_tests {
         std::fs::write(src.join("a.txt"), &a).unwrap();
         std::fs::write(src.join("empty.bin"), b"").unwrap();
         PULL_FILES.set(vec![src.join("a.txt"), src.join("missing.txt"), src.join("empty.bin")]).unwrap();
-        let host = TestHost::start(47412, |o| o.copied_files = || PULL_FILES.get().cloned().unwrap_or_default());
+        let host = TestHost::start(|o| o.copied_files = || PULL_FILES.get().cloned().unwrap_or_default());
         let mut c = host.connect(ViewerOptions::default());
         c.send(ClientMsg::FilePull);
         let mut current: Option<Incoming> = None;
@@ -2713,7 +3086,7 @@ mod session_tests {
     #[test]
     fn host_quality_and_a_flood_of_settings() {
         let _serial = lock(&SERIAL);
-        let host = TestHost::start(47421, |o| o.default_quality = QUALITY_LOW);
+        let host = TestHost::start(|o| o.default_quality = QUALITY_LOW);
         // A viewer started without --quality gets the host's default and is told which.
         let mut c = host.connect(ViewerOptions::default());
         let v = c.wait("the quality in effect", |m| match m {
@@ -2766,7 +3139,7 @@ mod session_tests {
     #[test]
     fn a_replaced_viewer_is_told_why_before_the_close() {
         let _serial = lock(&SERIAL);
-        let host = TestHost::start(47422, |_| {});
+        let host = TestHost::start(|_| {});
         let mut c = host.connect(ViewerOptions::default());
         c.ping(1);
         // The first viewer keeps reading, as a real one does, and hangs up once the host has.
@@ -2787,5 +3160,83 @@ mod session_tests {
         // The viewer stops instead of reconnecting when a notice comes this shortly before the end.
         assert!(notice.as_deref().is_some_and(|n| n.contains("another viewer")), "{notice:?}");
         c2.ping(6);
+    }
+
+    #[test]
+    fn a_replaced_viewer_far_behind_still_gets_the_notice() {
+        let _serial = lock(&SERIAL);
+        let host = TestHost::start(|_| {});
+        let mut c = host.connect(ViewerOptions::default());
+        c.frame(1);
+        c.hold_frames();
+        // The first viewer pings as the GUI viewer does, but reads nothing for a while: what the
+        // host sends meanwhile, the notice included, waits for it.
+        let Connection { mut reader, writer, .. } = c.conn;
+        let pinging = Arc::new(AtomicBool::new(true));
+        let pinger = {
+            let (pinging, mut w) = (pinging.clone(), writer);
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                ClientMsg::Ping(1).encode(&mut b);
+                while pinging.load(Ordering::SeqCst) {
+                    if w.send(&b).is_err() {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                true
+            })
+        };
+        let t = Instant::now();
+        let mut c2 = host.connect(ViewerOptions::default());
+        assert!(t.elapsed() < Duration::from_secs(3), "handover took {:?}", t.elapsed());
+        std::thread::sleep((FAREWELL + Duration::from_millis(500)).saturating_sub(t.elapsed()));
+        let mut notice = None;
+        while let Ok(rec) = reader.recv() {
+            if let Ok(ServerMsg::Notice(text)) = ServerMsg::decode(rec) {
+                notice = Some(text);
+            }
+        }
+        assert!(notice.as_deref().is_some_and(|n| n.contains("another viewer")), "{notice:?}");
+        pinging.store(false, Ordering::SeqCst);
+        assert!(pinger.join().unwrap(), "the host reset the connection under the viewer's pings");
+        c2.ping(7);
+    }
+
+    #[test]
+    fn automatic_reconnects_take_back_only_their_own_session() {
+        let _serial = lock(&SERIAL);
+        let host = TestHost::start(|_| {});
+        let target = format!("127.0.0.1:{}", host.port);
+        let reconnect = |instance| ViewerOptions { instance, reconnect: true, ..ViewerOptions::default() };
+        let mut c1 = host.connect(ViewerOptions { instance: 11, ..ViewerOptions::default() });
+        c1.ping(1);
+        // Another viewer's automatic reconnect is turned away for good; the session carries on.
+        match connect(&target, &reconnect(12), &Secret(PSK)) {
+            Ok(_) => panic!("an automatic reconnect replaced another viewer's session"),
+            Err(e) => assert!(e.to_string().starts_with(crate::viewer::REFUSED) && !crate::viewer::retryable(&e), "{e}"),
+        }
+        c1.ping(2);
+        // The viewer that lost this session takes it back.
+        c1.hold_frames();
+        let mut c2 = host.connect(reconnect(11));
+        assert!(c1.notice().contains("another viewer"));
+        c2.ping(3);
+        // A new connection replaces whoever is connected.
+        c2.hold_frames();
+        let mut c3 = host.connect(ViewerOptions::default());
+        assert!(c2.notice().contains("another viewer"));
+        c3.ping(4);
+        // Once that viewer has hung up, any automatic reconnect is let in.
+        drop(c3);
+        let t = Instant::now();
+        let mut c4 = loop {
+            match connect(&target, &reconnect(13), &Secret(PSK)) {
+                Ok(conn) => break Client::new(conn),
+                Err(e) => assert!(t.elapsed() < Duration::from_secs(5), "{e}"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        c4.ping(5);
     }
 }

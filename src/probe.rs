@@ -12,8 +12,9 @@ use crate::codec::{self, Decoder};
 use crate::files::{Incoming, Outgoing};
 use crate::proto::*;
 use crate::util::{Error, Result, Secret};
-use crate::viewer::{ViewerOptions, check_screen_size, connect};
+use crate::viewer::{Next, OutQueue, ViewerOptions, check_screen_size, connect};
 use crate::{bail, log};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct ProbeOptions {
@@ -122,6 +123,23 @@ fn download_dir(pull: bool) -> Result<std::path::PathBuf> {
     crate::files::transfer_dir()
 }
 
+/// The `--set` keys with fewer `State` replies in `states` than settings, and how many are
+/// missing. The host answers every `Set`, and the hello's sound and privacy wishes with one
+/// unasked `State` each, which answers no `Set`.
+fn unanswered(sets: &[(u8, u32)], states: &[(u8, u32)], (audio, privacy): (bool, bool)) -> Vec<(u8, usize)> {
+    let mut keys: Vec<u8> = sets.iter().map(|s| s.0).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.into_iter()
+        .filter_map(|key| {
+            let asked = sets.iter().filter(|s| s.0 == key).count();
+            let wished = (key == SET_AUDIO && audio) || (key == SET_PRIVACY && privacy);
+            let answers = states.iter().filter(|s| s.0 == key).count().saturating_sub(wished as usize);
+            (answers < asked).then_some((key, asked - answers))
+        })
+        .collect()
+}
+
 fn write_ppm(path: &str, fb: &[u8], w: usize, h: usize) -> Result<()> {
     let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
     out.reserve(w * h * 3);
@@ -132,9 +150,107 @@ fn write_ppm(path: &str, fb: &[u8], w: usize, h: usize) -> Result<()> {
     Ok(())
 }
 
+/// What the probe sends, sent on threads of its own (see `run`); the first failure among them.
+#[derive(Clone)]
+struct Sender {
+    queue: Arc<OutQueue>,
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+impl Sender {
+    /// Starts the writer thread.
+    fn start(mut w: crate::channel::RecordWriter<std::net::TcpStream>) -> Sender {
+        let s = Sender { queue: Arc::default(), failed: Arc::default() };
+        let t = s.clone();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            loop {
+                match t.queue.next(Duration::from_millis(500)) {
+                    Next::Msg(m) => {
+                        b.clear();
+                        m.encode(&mut b);
+                        if let Err(e) = w.send(&b) {
+                            return t.fail(e);
+                        }
+                    }
+                    Next::Idle => {}
+                    Next::Closed => return,
+                }
+            }
+        });
+        s
+    }
+
+    /// Ends all sending with `e`, unless something failed before.
+    fn fail(&self, e: Error) {
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(e.to_string());
+        self.queue.close();
+    }
+
+    /// Why sending ended, if it did.
+    fn failure(&self) -> Option<String> {
+        if self.queue.stalled() {
+            return Some(crate::viewer::STALLED.into());
+        }
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Queues a control message (never waits).
+    fn send(&self, m: ClientMsg) -> Result<()> {
+        if !self.queue.send(m) {
+            bail!("{}", self.failure().unwrap_or_else(|| "connection closed".into()));
+        }
+        Ok(())
+    }
+
+    /// Sends `msgs` in order behind the control messages, from a thread of its own.
+    fn send_bulk(&self, msgs: Vec<ClientMsg>) {
+        let queue = self.queue.clone();
+        std::thread::spawn(move || msgs.into_iter().all(|m| queue.send_bulk(m)));
+    }
+
+    /// Sends the files `uploads`, then a `FilePull` if `pull`, behind the control messages from
+    /// a thread of its own, which it returns.
+    fn upload(&self, uploads: Vec<Outgoing>, pull: bool) -> std::thread::JoinHandle<()> {
+        let s = self.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            for mut out in uploads {
+                let id = out.id;
+                if !s.queue.send_bulk(ClientMsg::FileBegin { id, size: out.size, name: out.name.clone() }) {
+                    return;
+                }
+                loop {
+                    match out.next_chunk(&mut buf) {
+                        Ok(true) if s.queue.send_bulk(ClientMsg::FileData { id, data: buf.clone() }) => {}
+                        Ok(true) => return,
+                        Ok(false) => break,
+                        Err(e) => return s.fail(e),
+                    }
+                }
+                if !s.queue.send_bulk(ClientMsg::FileEnd { id, sha256: out.finish() }) {
+                    return;
+                }
+            }
+            if pull {
+                s.queue.send_bulk(ClientMsg::FilePull);
+            }
+        })
+    }
+}
+
+/// Ends the sending threads when the probe is done, however it ends.
+struct StopSending(Arc<OutQueue>);
+
+impl Drop for StopSending {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     let t_connect = Instant::now();
-    let mut conn = connect(target, &o.viewer, &psk)?;
+    let conn = connect(target, &o.viewer, &psk)?;
     drop(psk);
     println!("handshake:   {:.1} ms to {}", t_connect.elapsed().as_secs_f64() * 1000.0, conn.addr);
     // `connect` already made the host name printable and checked the screen size.
@@ -144,8 +260,8 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     }
     // Records are read on their own thread with blocking reads (a timeout mid-record would
     // desynchronise the stream); the main loop polls the channel. A few records at most wait
-    // in it: while the main loop is stuck sending, the reader stops reading instead of
-    // buffering whatever the host sends.
+    // in it: while the main loop is busy, the reader stops reading instead of buffering
+    // whatever the host sends.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(4);
     let mut reader = conn.reader;
     std::thread::spawn(move || {
@@ -157,12 +273,14 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             }
         }
     });
-
-    let send = |w: &mut crate::channel::RecordWriter<std::net::TcpStream>, m: ClientMsg| -> Result<()> {
-        let mut b = Vec::new();
-        m.encode(&mut b);
-        w.send(&b)
-    };
+    // Everything is sent from other threads, so the main loop never waits for the host to read
+    // and keeps the reader going. A host whose sends to the probe wait (its writer is shared)
+    // stops reading too, until an upload's result has gone out: uploads sent from the main loop
+    // would then wait for the main loop to read, and the host for the uploads to stop.
+    let sender = Sender::start(conn.writer);
+    let _stop = StopSending(sender.queue.clone());
+    let uploads = o.uploads.iter().enumerate().map(|(i, path)| Outgoing::open(std::path::Path::new(path), 1000 + i as u32));
+    let uploads = uploads.collect::<Result<Vec<_>>>()?;
 
     let start = Instant::now();
     let (mut fw, mut fh) = (conn.width, conn.height);
@@ -178,46 +296,50 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     let mut input_sent = false;
     let mut states: Vec<(u8, u32)> = Vec::new();
     let mut download: Option<Incoming> = None;
-    let mut pending_uploads = o.uploads.len();
+    let mut pending_uploads = uploads.len();
+    // The next record is the first after the host's hello.
+    let mut first = true;
 
     for &(key, value) in &o.sets {
-        send(&mut conn.writer, ClientMsg::Set { key, value })?;
+        sender.send(ClientMsg::Set { key, value })?;
     }
-    for (i, path) in o.uploads.iter().enumerate() {
-        let mut out = Outgoing::open(std::path::Path::new(path), 1000 + i as u32)?;
-        send(&mut conn.writer, ClientMsg::FileBegin { id: out.id, size: out.size, name: out.name.clone() })?;
-        let mut buf = Vec::new();
-        while out.next_chunk(&mut buf)? {
-            send(&mut conn.writer, ClientMsg::FileData { id: out.id, data: buf.clone() })?;
-        }
-        let id = out.id;
-        send(&mut conn.writer, ClientMsg::FileEnd { id, sha256: out.finish() })?;
-    }
-    if o.pull {
-        send(&mut conn.writer, ClientMsg::FilePull)?;
-    }
+    let uploading = sender.upload(uploads, o.pull);
+    // Results are awaited for 10 s past the measurement, and past the end of the uploads.
+    let mut results_due = start + Duration::from_secs_f64(o.seconds + 10.0);
+    let mut uploaded = false;
 
-    while start.elapsed().as_secs_f64() < o.seconds || (pending_uploads > 0 && start.elapsed().as_secs_f64() < o.seconds + 10.0) {
+    loop {
+        if !uploaded && uploading.is_finished() {
+            uploaded = true;
+            results_due = results_due.max(Instant::now() + Duration::from_secs(10));
+        }
+        if start.elapsed().as_secs_f64() >= o.seconds && uploaded && (pending_uploads == 0 || Instant::now() >= results_due) {
+            break;
+        }
+        if let Some(e) = sender.failure() {
+            bail!("{e}");
+        }
         if Instant::now() >= next_ping {
-            send(&mut conn.writer, ClientMsg::Ping(start.elapsed().as_micros() as u64))?;
+            sender.send(ClientMsg::Ping(start.elapsed().as_micros() as u64))?;
             next_ping = Instant::now() + Duration::from_millis(500);
         }
-        // Input is sent once the first frame established a baseline picture.
+        // Input is sent once the first frame established a baseline picture, in order and in
+        // full (no move merged into the next), like file data behind pings and acks.
         if !input_sent && baseline.is_some() {
             input_sent = true;
+            let mut input = Vec::new();
             for &(x, y) in &o.moves {
-                send(&mut conn.writer, ClientMsg::MouseMove { x, y })?;
+                input.push(ClientMsg::MouseMove { x, y });
             }
             for &(x, y) in &o.clicks {
-                send(&mut conn.writer, ClientMsg::MouseMove { x, y })?;
-                send(&mut conn.writer, ClientMsg::MouseButton { button: BTN_LEFT, down: true })?;
-                send(&mut conn.writer, ClientMsg::MouseButton { button: BTN_LEFT, down: false })?;
+                input.push(ClientMsg::MouseMove { x, y });
+                input.push(ClientMsg::MouseButton { button: BTN_LEFT, down: true });
+                input.push(ClientMsg::MouseButton { button: BTN_LEFT, down: false });
             }
             if let Some(t) = &o.type_text {
-                for m in key_msgs(t)? {
-                    send(&mut conn.writer, m)?;
-                }
+                input.extend(key_msgs(t)?);
             }
+            sender.send_bulk(input);
         }
         let owned = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(r) => r?,
@@ -226,6 +348,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
         };
         let rec = &owned[..];
         bytes += rec.len() as u64 + 20;
+        let after_hello = std::mem::replace(&mut first, false);
         match ServerMsg::decode(rec)? {
             ServerMsg::Tiles(p) => {
                 let hdr = codec::parse_header(p)?;
@@ -239,7 +362,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 if hdr.last {
                     frames += 1;
                     first_frame.get_or_insert(start.elapsed().as_secs_f64() * 1000.0);
-                    send(&mut conn.writer, ClientMsg::Ack(hdr.frame))?;
+                    sender.send(ClientMsg::Ack(hdr.frame))?;
                     let sum = checksum(&fb);
                     match baseline {
                         None => baseline = Some(sum),
@@ -251,7 +374,11 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             ServerMsg::Pong(t) => rtts.push((start.elapsed().as_micros() as u64).saturating_sub(t) as f64 / 1000.0),
             ServerMsg::State { key, value } => {
                 println!("state:       key {key} = {}", if value == STATE_UNAVAILABLE { "unavailable".into() } else { value.to_string() });
-                states.push((key, value));
+                // A host left to pick the quality says which right after its hello, unasked:
+                // no answer to a `--set quality`.
+                if !(after_hello && key == SET_QUALITY && o.viewer.quality as u32 > QUALITY_LOW) {
+                    states.push((key, value));
+                }
             }
             ServerMsg::Notice(t) => println!("notice:      {}", printable(&t)),
             ServerMsg::Audio { .. } => audio_packets += 1,
@@ -297,10 +424,8 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     if frames == 0 {
         failures.push("no frames received".into());
     }
-    for &(key, _) in &o.sets {
-        if !states.iter().any(|&(k, _)| k == key) {
-            failures.push(format!("no State reply for setting {key}"));
-        }
+    for (key, missing) in unanswered(&o.sets, &states, (o.viewer.audio, o.viewer.privacy)) {
+        failures.push(format!("no State reply for {missing} --set of setting {key}"));
     }
     if pending_uploads > 0 {
         failures.push(format!("{pending_uploads} upload(s) without a result"));
@@ -340,6 +465,103 @@ mod tests {
         assert_eq!(scancode_for('\n'), Some((0x1c, false)));
         assert!(scancode_for('한').is_none());
         assert_eq!(key_msgs("Hi").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn every_setting_needs_its_own_reply() {
+        let sets = [(SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2)];
+        // All answered.
+        let states = [(SET_QUALITY, 0), (SET_AUDIO, 1), (SET_QUALITY, 2), (SET_DOWNSCALE, 2)];
+        assert!(unanswered(&sets, &states, (false, false)).is_empty());
+        // One reply for two settings of a key; nothing at all for another.
+        let states = [(SET_QUALITY, 2), (SET_AUDIO, 1)];
+        assert_eq!(unanswered(&sets, &states, (false, false)), [(SET_QUALITY, 1), (SET_DOWNSCALE, 1)]);
+        // The answer to the hello's sound wish answers no `--set audio`.
+        let states = [(SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2)];
+        assert_eq!(unanswered(&sets, &states, (true, false)), [(SET_AUDIO, 1)]);
+        let states = [(SET_AUDIO, 1), (SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2), (SET_PRIVACY, 0)];
+        assert!(unanswered(&sets, &states, (true, true)).is_empty());
+    }
+
+    const KEY: [u8; 32] = [0x3c; 32];
+
+    /// A host that keeps sending (sound, as fast as its socket takes it) while it reads uploads
+    /// at `rate` bytes/s, answering each under the same writer lock, as the real host does.
+    /// Returns the results it sent before the probe hung up.
+    fn busy_host(l: std::net::TcpListener, rate: f64) -> usize {
+        use crate::channel::{RecordReader, RecordWriter, server_handshake};
+        let (mut s, _) = l.accept().unwrap();
+        let keys = server_handshake(&mut s, &KEY).unwrap();
+        let w = Arc::new(Mutex::new(RecordWriter::new(s.try_clone().unwrap(), keys.send)));
+        let send = |w: &Mutex<RecordWriter<std::net::TcpStream>>, m: ServerMsg| {
+            let mut b = Vec::new();
+            m.encode(&mut b);
+            w.lock().unwrap().send(&b)
+        };
+        let mut r = RecordReader::new(s, keys.recv);
+        assert!(matches!(ClientMsg::decode(r.recv().unwrap()).unwrap(), ClientMsg::Hello { .. }));
+        let hello = ServerMsg::Hello { width: 64, height: 64, flags: F_FILES | F_AUDIO, monitor: 0, monitors: vec![], name: "linux-host".into() };
+        send(&w, hello).unwrap();
+        let rects = codec::Encoder::new().unwrap().encode(&[0; 64 * 64 * 4], 64, 64);
+        for m in codec::pack(1, 64, 64, &rects) {
+            w.lock().unwrap().send(&m).unwrap();
+        }
+        let sound = {
+            let w = w.clone();
+            std::thread::spawn(move || {
+                let data = [0u8; 16 * 1024];
+                for seq in 0.. {
+                    if send(&w, ServerMsg::Audio { seq, rate: 48000, channels: 2, codec: AUDIO_PCM16, data: &data }).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let (t, mut read, mut results) = (Instant::now(), 0, 0);
+        while let Ok(rec) = r.recv() {
+            match ClientMsg::decode(rec).unwrap() {
+                ClientMsg::FileData { data, .. } => {
+                    read += data.len();
+                    std::thread::sleep(Duration::from_secs_f64(read as f64 / rate).saturating_sub(t.elapsed()));
+                }
+                ClientMsg::FileEnd { id, .. } => {
+                    send(&w, ServerMsg::FileResult { id, ok: true, message: "saved".into() }).unwrap();
+                    results += 1;
+                }
+                _ => {}
+            }
+        }
+        drop(r);
+        sound.join().unwrap();
+        results
+    }
+
+    #[test]
+    fn uploads_keep_going_while_the_host_keeps_sending() {
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let dir = std::env::temp_dir().join(format!("srdp-probe-{}", crate::util::hex_encode(&r)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<String> = [("a.bin", 4 << 20), ("b.bin", 6 << 20)]
+            .iter()
+            .map(|&(name, size)| {
+                let path = dir.join(name);
+                std::fs::write(&path, vec![0x5a; size]).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let host = std::thread::spawn(move || busy_host(l, 16e6));
+        let o = ProbeOptions { seconds: 0.2, uploads: files, ..ProbeOptions::default() };
+        let t = Instant::now();
+        let r = run(&addr.to_string(), o, Secret(KEY));
+        let took = t.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        r.unwrap();
+        assert!(took < Duration::from_secs(15), "the uploads took {took:?}");
+        assert_eq!(host.join().unwrap(), 2);
     }
 
     #[test]
