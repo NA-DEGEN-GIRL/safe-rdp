@@ -12,7 +12,8 @@ use crate::util::{Error, Result, Secret};
 use crate::{bail, log};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, LockResult, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 pub struct ViewerOptions {
@@ -142,6 +143,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Bulk messages allowed to wait in an `OutQueue` before `send_bulk` blocks.
 pub const BULK_DEPTH: usize = 8;
+/// Control messages allowed to wait in an `OutQueue`. Only local input, settings and the
+/// clipboard queue up there (acks keep just the newest, mouse moves merge), so this many
+/// waiting means the host stopped reading: the queue gives up rather than grow without end.
+pub const CONTROL_DEPTH: usize = 4096;
+/// Why a session ends when its `OutQueue` gave up.
+pub const STALLED: &str = "the host stopped reading what this viewer sends";
 /// Size of one file-data message on the wire: small enough that input queued behind it
 /// waits at most a few milliseconds on a typical link.
 pub const FILE_MSG_CHUNK: usize = 64 * 1024;
@@ -159,7 +166,12 @@ pub struct OutQueue {
 struct OutState {
     control: VecDeque<ClientMsg>,
     bulk: VecDeque<ClientMsg>,
+    /// The newest frame acknowledgement not sent yet: the host keeps only the latest, and one
+    /// per frame would let a host that floods frames and reads slowly fill the queue.
+    ack: Option<u32>,
     closed: bool,
+    /// Closed because `CONTROL_DEPTH` control messages were waiting.
+    stalled: bool,
 }
 
 /// What `OutQueue::next` produced.
@@ -181,18 +193,33 @@ impl Default for OutQueue {
 impl OutQueue {
     /// Queues a control message; false once the queue is closed. A mouse move replaces a
     /// mouse move still waiting at the end of the queue, so a slow link does not replay a
-    /// backlog of stale positions.
+    /// backlog of stale positions, and an ack replaces any waiting ack. With `CONTROL_DEPTH`
+    /// messages waiting the queue closes as `stalled`: the caller should end the session.
     pub fn send(&self, m: ClientMsg) -> bool {
         let mut s = lock(&self.state);
         if s.closed {
             return false;
         }
         match (s.control.back_mut(), &m) {
+            (_, &ClientMsg::Ack(id)) => s.ack = Some(id),
             (Some(last @ ClientMsg::MouseMove { .. }), ClientMsg::MouseMove { .. }) => *last = m,
-            _ => s.control.push_back(m),
+            _ => {
+                if s.control.len() >= CONTROL_DEPTH {
+                    s.stalled = true;
+                    drop(s);
+                    self.close();
+                    return false;
+                }
+                s.control.push_back(m)
+            }
         }
         self.ready.notify_one();
         true
+    }
+
+    /// The queue gave up because the peer stopped reading (see `send`).
+    pub fn stalled(&self) -> bool {
+        lock(&self.state).stalled
     }
 
     /// Queues a bulk message, waiting while the bulk queue is full; false once closed.
@@ -209,13 +236,16 @@ impl OutQueue {
         true
     }
 
-    /// The next message to send, control traffic first.
+    /// The next message to send: the waiting ack, then control traffic, then bulk.
     pub fn next(&self, timeout: Duration) -> Next {
         let deadline = Instant::now() + timeout;
         let mut s = lock(&self.state);
         loop {
             if s.closed {
                 return Next::Closed;
+            }
+            if let Some(id) = s.ack.take() {
+                return Next::Msg(ClientMsg::Ack(id));
             }
             if let Some(m) = s.control.pop_front() {
                 return Next::Msg(m);
@@ -236,10 +266,74 @@ impl OutQueue {
     pub fn close(&self) {
         let mut s = lock(&self.state);
         s.closed = true;
+        s.ack = None;
         s.control.clear();
         s.bulk.clear();
         self.ready.notify_all();
         self.space.notify_all();
+    }
+}
+
+/// Remote screen size changes a host may make back to back, and the pace after that. Each one
+/// costs the viewer a new page-locked framebuffer (up to 256 MiB), a wipe of the old one and a
+/// full repaint, for a few bytes from the host. A real host changes size only when its display
+/// or the user's settings change; a faster one has its reader wait, so it only slows its own
+/// session.
+pub const RESIZE_BURST: u32 = 8;
+pub const RESIZE_GAP: Duration = Duration::from_secs(1);
+
+/// Paces remote screen size changes (see `RESIZE_BURST`).
+pub struct ResizePacer {
+    /// When the next change is due at the sustained pace.
+    due: Instant,
+}
+
+impl ResizePacer {
+    pub fn new(now: Instant) -> ResizePacer {
+        ResizePacer { due: now }
+    }
+
+    /// A size change arrived at `now`: how long to wait before making it.
+    pub fn wait(&mut self, now: Instant) -> Duration {
+        let due = self.due.max(now);
+        self.due = due + RESIZE_GAP;
+        (due - now).saturating_sub(RESIZE_GAP * (RESIZE_BURST - 1))
+    }
+}
+
+/// The framebuffer's lock, shared by the UI thread (painting) and a session's reader
+/// (decoding). The reader takes it again right after each message, and a mutex is not fair,
+/// so under a stream of messages the UI thread (on Windows also the keyboard hook it serves)
+/// could wait through message after message. The UI thread announces its wait instead, and
+/// the reader lets it in before decoding the next message.
+pub struct FrameLock<T> {
+    m: Mutex<T>,
+    ui_waiting: AtomicBool,
+}
+
+/// How long a reader defers to the UI thread at most (it normally takes microseconds).
+const UI_FIRST_FOR: Duration = Duration::from_millis(50);
+
+impl<T> FrameLock<T> {
+    pub fn new(v: T) -> FrameLock<T> {
+        FrameLock { m: Mutex::new(v), ui_waiting: AtomicBool::new(false) }
+    }
+
+    /// Locks on the UI thread: waits for the message being decoded, not for every one after it.
+    pub fn ui(&self) -> LockResult<MutexGuard<'_, T>> {
+        self.ui_waiting.store(true, Ordering::SeqCst);
+        let g = self.m.lock();
+        self.ui_waiting.store(false, Ordering::SeqCst);
+        g
+    }
+
+    /// Locks on a reader, after the UI thread if that is waiting.
+    pub fn reader(&self) -> LockResult<MutexGuard<'_, T>> {
+        let until = Instant::now() + UI_FIRST_FOR;
+        while self.ui_waiting.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        self.m.lock()
     }
 }
 
@@ -405,6 +499,102 @@ mod tests {
         assert!(!blocked.join().unwrap());
         assert!(!q.send(ClientMsg::Refresh));
         assert_eq!(q.next(Duration::from_secs(5)), Next::Closed);
+    }
+
+    #[test]
+    fn acks_keep_only_the_newest_and_go_first() {
+        let q = OutQueue::default();
+        q.send(ClientMsg::MouseButton { button: BTN_LEFT, down: true });
+        // A host flooding tiny frames while reading slowly: one ack waits, not a million.
+        for id in 1..=1_000_000 {
+            assert!(q.send(ClientMsg::Ack(id)));
+        }
+        q.send(ClientMsg::Refresh);
+        assert_eq!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Ack(1_000_000)));
+        assert_eq!(q.next(Duration::ZERO), Next::Msg(ClientMsg::MouseButton { button: BTN_LEFT, down: true }));
+        assert_eq!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Refresh));
+        assert_eq!(q.next(Duration::ZERO), Next::Idle);
+        q.send(ClientMsg::Ack(7));
+        q.close();
+        assert_eq!(q.next(Duration::ZERO), Next::Closed);
+    }
+
+    #[test]
+    fn a_host_that_stops_reading_stalls_the_queue() {
+        let q = Arc::new(OutQueue::default());
+        let key = |i: usize| ClientMsg::Key { vk: i as u16, scan: 0, flags: 0 };
+        for i in 0..CONTROL_DEPTH - 1 {
+            assert!(q.send(key(i)));
+        }
+        assert!(q.send(ClientMsg::MouseMove { x: 1, y: 1 }));
+        // Full, but merged messages still fit.
+        assert!(q.send(ClientMsg::MouseMove { x: 2, y: 2 }) && q.send(ClientMsg::Ack(3)));
+        assert!(!q.stalled());
+        let producer = {
+            let q = q.clone();
+            std::thread::spawn(move || {
+                for _ in 0..=BULK_DEPTH {
+                    if !q.send_bulk(ClientMsg::FilePull) {
+                        return false;
+                    }
+                }
+                true
+            })
+        };
+        assert!(!q.send(key(0)));
+        assert!(q.stalled());
+        // Closed: memory released, the writer and blocked producers stop, later sends fail.
+        assert!(!producer.join().unwrap());
+        assert_eq!(q.next(Duration::ZERO), Next::Closed);
+        assert!(!q.send(ClientMsg::Ack(4)) && !q.send(ClientMsg::MouseMove { x: 3, y: 3 }));
+        // An ordinary close is not a stall.
+        let q = OutQueue::default();
+        q.close();
+        assert!(!q.send(key(0)) && !q.stalled());
+    }
+
+    #[test]
+    fn size_changes_are_paced() {
+        let t0 = Instant::now();
+        let mut p = ResizePacer::new(t0);
+        for _ in 0..RESIZE_BURST {
+            assert_eq!(p.wait(t0), Duration::ZERO);
+        }
+        // Beyond the burst, one per `RESIZE_GAP`, never a longer wait than that.
+        assert_eq!(p.wait(t0), RESIZE_GAP);
+        assert_eq!(p.wait(t0 + RESIZE_GAP), RESIZE_GAP);
+        assert_eq!(p.wait(t0 + RESIZE_GAP * 3), Duration::ZERO);
+        assert_eq!(p.wait(t0 + RESIZE_GAP * 3), RESIZE_GAP);
+        // A quiet host earns its burst back.
+        let later = t0 + RESIZE_GAP * 100;
+        for _ in 0..RESIZE_BURST {
+            assert_eq!(p.wait(later), Duration::ZERO);
+        }
+        assert!(p.wait(later) > Duration::ZERO);
+    }
+
+    #[test]
+    fn frame_lock_lets_a_waiting_ui_in_first() {
+        let fb = Arc::new(FrameLock::new(0u32));
+        // The UI thread announced that it waits (as `ui` does while blocked on the mutex).
+        fb.ui_waiting.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        let reader = {
+            let fb = fb.clone();
+            std::thread::spawn(move || *fb.reader().unwrap() += 1)
+        };
+        std::thread::sleep(UI_FIRST_FOR / 5);
+        // (Unless this thread slept so long that the reader stopped deferring.)
+        assert!(!reader.is_finished() || t.elapsed() >= UI_FIRST_FOR, "the reader went ahead of the waiting UI thread");
+        *fb.ui().unwrap() += 10;
+        reader.join().unwrap();
+        assert_eq!(*fb.ui().unwrap(), 11);
+        assert!(!fb.ui_waiting.load(Ordering::SeqCst));
+        // A UI thread that never takes its turn delays the reader only briefly.
+        fb.ui_waiting.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        *fb.reader().unwrap() += 1;
+        assert!(t.elapsed() >= UI_FIRST_FOR && t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

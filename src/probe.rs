@@ -143,8 +143,10 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
         println!("  monitor {}: {}x{} at ({}, {})", i + 1, m.width, m.height, m.left, m.top);
     }
     // Records are read on their own thread with blocking reads (a timeout mid-record would
-    // desynchronise the stream); the main loop polls the channel.
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>>>();
+    // desynchronise the stream); the main loop polls the channel. A few records at most wait
+    // in it: while the main loop is stuck sending, the reader stops reading instead of
+    // buffering whatever the host sends.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(4);
     let mut reader = conn.reader;
     std::thread::spawn(move || {
         loop {
