@@ -194,13 +194,25 @@ impl<R: Read> RecordReader<R> {
         RecordReader { r, aead, seq: 0, buf: SecureVec::default() }
     }
 
+    /// The same record stream, read through `r` from here on (the same connection, read
+    /// differently: say once a deadline for the first records no longer applies).
+    pub fn with_reader<S: Read>(self, r: S) -> RecordReader<S> {
+        RecordReader { r, aead: self.aead, seq: self.seq, buf: self.buf }
+    }
+
     /// Reads, authenticates and decrypts the next record. The returned slice is valid
     /// until the next call.
     pub fn recv(&mut self) -> Result<&[u8]> {
+        self.recv_max(MAX_RECORD - TAG_LEN)
+    }
+
+    /// `recv` of a message of at most `max` bytes: a longer record is refused as soon as its
+    /// length arrives, before anything is allocated or read for it.
+    pub fn recv_max(&mut self, max: usize) -> Result<&[u8]> {
         let mut len = [0u8; 4];
         read_full(&mut self.r, &mut len)?;
         let total = u32::from_le_bytes(len) as usize;
-        if total <= TAG_LEN || total > MAX_RECORD {
+        if total <= TAG_LEN || total > MAX_RECORD || total - TAG_LEN > max {
             bail!("invalid record length {total}");
         }
         if self.seq == u64::MAX {
@@ -294,5 +306,32 @@ mod tests {
         let mut r = RecordReader::new(&twice[..], ks.recv);
         assert_eq!(r.recv().unwrap(), b"click");
         assert!(r.recv().is_err());
+    }
+
+    #[test]
+    fn records_longer_than_the_caller_takes_are_refused_unread() {
+        let key = [8u8; 32];
+        let mut wire = Vec::new();
+        let mut w = RecordWriter::new(&mut wire, Aead::new(&key).unwrap());
+        w.send(b"hello").unwrap();
+        w.send(&[7; 64]).unwrap();
+        w.send(&[7; 65]).unwrap();
+        drop(w);
+        let mut r = RecordReader::new(&wire[..], Aead::new(&key).unwrap());
+        assert_eq!(r.recv_max(5).unwrap(), b"hello");
+        assert_eq!(r.recv_max(64).unwrap(), &[7; 64]);
+        let e = r.recv_max(64).unwrap_err().to_string();
+        assert_eq!(e, format!("invalid record length {}", 65 + TAG_LEN));
+        // Only the length of a record as large as any may be has come: refused at once, with
+        // nothing allocated for it (`recv` would allocate the 32 MiB and wait for them).
+        let announced = (MAX_RECORD as u32).to_le_bytes();
+        let mut r = RecordReader::new(&announced[..], Aead::new(&key).unwrap());
+        assert!(r.recv_max(64).unwrap_err().to_string().starts_with("invalid record length"));
+        assert_eq!(r.buf.0.capacity(), 0);
+        // The rest of a stream goes on where the first reader left off.
+        let mut r = RecordReader::new(&wire[..], Aead::new(&key).unwrap());
+        assert_eq!(r.recv().unwrap(), b"hello");
+        let mut r = r.with_reader(&wire[4 + 5 + TAG_LEN..]);
+        assert_eq!(r.recv().unwrap(), &[7; 64]);
     }
 }
