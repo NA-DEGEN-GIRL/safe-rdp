@@ -59,6 +59,9 @@ pub const F_PRIVACY: u32 = 32;
 // Viewer wishes in `ClientMsg::Hello::flags`
 pub const HELLO_AUDIO: u8 = 1;
 pub const HELLO_PRIVACY: u8 = 2;
+/// The hello opens an automatic reconnect: it may take over only a session that its own viewer
+/// (the same `instance`) started, never another viewer's.
+pub const HELLO_RECONNECT: u8 = 4;
 
 /// Settings the viewer can change during a session (`ClientMsg::Set`); the host confirms
 /// the value actually in effect with `ServerMsg::State` using the same key.
@@ -155,8 +158,10 @@ pub struct MonitorInfo {
 
 #[derive(Debug, PartialEq)]
 pub enum ClientMsg {
-    /// First message of a session.
-    Hello { downscale: u8, quality: u8, monitor: u8, flags: u8 },
+    /// First message of a session. `instance` is a random number a viewer that reconnects
+    /// automatically keeps for its lifetime (see `HELLO_RECONNECT`); 0 for none, which is sent
+    /// as the shorter hello of older viewers that older hosts expect.
+    Hello { downscale: u8, quality: u8, monitor: u8, flags: u8, instance: u64 },
     Ack(u32),
     MouseMove { x: u16, y: u16 },
     MouseButton { button: u8, down: bool },
@@ -325,7 +330,12 @@ fn file_size(v: u64) -> Result<u64> {
 impl ClientMsg {
     pub fn encode(&self, o: &mut Vec<u8>) {
         match self {
-            ClientMsg::Hello { downscale, quality, monitor, flags } => o.extend_from_slice(&[C_HELLO, *downscale, *quality, *monitor, *flags]),
+            ClientMsg::Hello { downscale, quality, monitor, flags, instance } => {
+                o.extend_from_slice(&[C_HELLO, *downscale, *quality, *monitor, *flags]);
+                if *instance != 0 {
+                    o.extend_from_slice(&instance.to_le_bytes());
+                }
+            }
             ClientMsg::Ack(id) => {
                 o.push(C_ACK);
                 o.extend_from_slice(&id.to_le_bytes());
@@ -385,7 +395,13 @@ impl ClientMsg {
     pub fn decode(b: &[u8]) -> Result<ClientMsg> {
         let mut r = Rd(b);
         let m = match r.u8()? {
-            C_HELLO => ClientMsg::Hello { downscale: r.u8()?, quality: r.u8()?, monitor: r.u8()?, flags: r.u8()? },
+            C_HELLO => ClientMsg::Hello {
+                downscale: r.u8()?,
+                quality: r.u8()?,
+                monitor: r.u8()?,
+                flags: r.u8()?,
+                instance: if r.0.is_empty() { 0 } else { r.u64()? },
+            },
             C_ACK => ClientMsg::Ack(r.u32()?),
             C_MOUSE_MOVE => ClientMsg::MouseMove { x: r.u16()?, y: r.u16()? },
             C_MOUSE_BUTTON => ClientMsg::MouseButton { button: r.u8()?, down: r.u8()? != 0 },
@@ -522,7 +538,8 @@ mod tests {
     #[test]
     fn client_roundtrip() {
         let msgs = [
-            ClientMsg::Hello { downscale: 2, quality: QUALITY_BALANCED as u8, monitor: MONITOR_DEFAULT, flags: HELLO_AUDIO },
+            ClientMsg::Hello { downscale: 2, quality: QUALITY_BALANCED as u8, monitor: MONITOR_DEFAULT, flags: HELLO_AUDIO, instance: 0 },
+            ClientMsg::Hello { downscale: 1, quality: QUALITY_DEFAULT, monitor: 0, flags: HELLO_RECONNECT, instance: u64::MAX - 5 },
             ClientMsg::Ack(7),
             ClientMsg::MouseMove { x: 1919, y: 1079 },
             ClientMsg::MouseButton { button: BTN_X2, down: true },
@@ -581,6 +598,27 @@ mod tests {
         assert!(ServerMsg::decode(&[S_HELLO, 1]).is_err());
         // Monitor count larger than the payload.
         assert!(ServerMsg::decode(&[S_HELLO, 0, 1, 0, 1, 0, 0, 0, 0, 0, 3]).is_err());
+    }
+
+    #[test]
+    fn hellos_with_and_without_an_instance() {
+        // A viewer without an instance sends the original five bytes, which every host takes.
+        let legacy = [C_HELLO, 1, QUALITY_LOW as u8, MONITOR_ALL, HELLO_PRIVACY];
+        let mut b = Vec::new();
+        let hello = ClientMsg::Hello { downscale: 1, quality: QUALITY_LOW as u8, monitor: MONITOR_ALL, flags: HELLO_PRIVACY, instance: 0 };
+        hello.encode(&mut b);
+        assert_eq!(b, legacy);
+        assert_eq!(ClientMsg::decode(&legacy).unwrap(), hello);
+        // One with an instance appends it.
+        let mut b = Vec::new();
+        ClientMsg::Hello { downscale: 1, quality: 0, monitor: 0, flags: HELLO_RECONNECT, instance: 0x0102_0304_0506_0708 }.encode(&mut b);
+        assert_eq!(b, [C_HELLO, 1, 0, 0, HELLO_RECONNECT, 8, 7, 6, 5, 4, 3, 2, 1]);
+        // A partial instance, or anything after it, is malformed.
+        for n in 6..b.len() {
+            assert!(ClientMsg::decode(&b[..n]).is_err(), "{n} bytes accepted");
+        }
+        b.push(0);
+        assert!(ClientMsg::decode(&b).is_err());
     }
 
     #[test]

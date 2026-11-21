@@ -297,8 +297,8 @@ impl Encoder {
 
     /// Lossless re-sends of lossy regions that have stayed unchanged long enough, oldest first,
     /// limited to about `budget_bytes` on the wire (at least one run is sent, so refinement
-    /// always progresses). Call with the current frame when nothing changed; tiles that differ
-    /// from the last encoded frame are left to the next `encode`.
+    /// always progresses). Call with the current frame, right after `encode` or on its own when
+    /// nothing changed; tiles that differ from the frame last encoded are left to the next `encode`.
     pub fn refine(&mut self, cur: &[u8], w: usize, h: usize, budget_bytes: usize) -> Vec<EncodedRect> {
         self.refine_at(cur, w, h, budget_bytes, Instant::now())
     }

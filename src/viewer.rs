@@ -32,6 +32,12 @@ pub struct ViewerOptions {
     pub audio: bool,
     /// Ask the host to blank its screen and block local input while connected.
     pub privacy: bool,
+    /// Identifies a viewer that reconnects automatically to the host, the same for all its
+    /// connections (`new_instance`); 0 for a viewer that never does.
+    pub instance: u64,
+    /// This connection is an automatic reconnect: the host lets it take over only a session of
+    /// the same `instance`, and turns it away while another viewer's session is live.
+    pub reconnect: bool,
 }
 
 impl Default for ViewerOptions {
@@ -46,9 +52,22 @@ impl Default for ViewerOptions {
             monitor: MONITOR_DEFAULT,
             audio: false,
             privacy: false,
+            instance: 0,
+            reconnect: false,
         }
     }
 }
+
+/// A random, non-zero `ViewerOptions::instance`.
+pub fn new_instance() -> Result<u64> {
+    let mut b = [0u8; 8];
+    crate::crypto::random(&mut b)?;
+    Ok(u64::from_le_bytes(b).max(1))
+}
+
+/// Start of the error for a connection the host turned away (an automatic reconnect while
+/// another viewer's session is live); the host's reason follows. Trying again would not help.
+pub const REFUSED: &str = "refused by the host: ";
 
 /// Largest remote screen accepted (64 Mpx, 256 MiB as BGRA), bounding what a host can make a
 /// viewer allocate and scan.
@@ -124,12 +143,18 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
     if opts.privacy {
         flags |= HELLO_PRIVACY;
     }
-    ClientMsg::Hello { downscale: opts.downscale, quality: opts.quality, monitor: opts.monitor, flags }.encode(&mut hello);
+    if opts.reconnect {
+        flags |= HELLO_RECONNECT;
+    }
+    let instance = opts.instance;
+    ClientMsg::Hello { downscale: opts.downscale, quality: opts.quality, monitor: opts.monitor, flags, instance }.encode(&mut hello);
     writer.send(&hello)?;
     let (width, height, flags, monitor, monitors, host_name) = match ServerMsg::decode(reader.recv()?)? {
         ServerMsg::Hello { width, height, flags, monitor, monitors, name } => {
             (width as usize, height as usize, flags, monitor, monitors, printable(&name))
         }
+        // Turned away, with the reason in place of a hello.
+        ServerMsg::Notice(text) => bail!("{REFUSED}{}", printable(&text)),
         _ => bail!("unexpected first message from host"),
     };
     check_screen_size(width, height)?;
@@ -361,10 +386,13 @@ pub fn classify_link_error(e: &Error) -> EndKind {
 }
 
 /// Whether a failed connection attempt is worth repeating. A wrong key, a protocol version
-/// mismatch or a peer that is not safe-rdp will not fix itself.
+/// mismatch or a peer that is not safe-rdp will not fix itself, and a host that turned an
+/// automatic reconnect away has another viewer to serve.
 pub fn retryable(e: &Error) -> bool {
     let s = e.to_string();
-    !["host failed authentication", "protocol version mismatch", "peer is not a safe-rdp endpoint"].iter().any(|p| s.starts_with(p))
+    !["host failed authentication", "protocol version mismatch", "peer is not a safe-rdp endpoint", REFUSED]
+        .iter()
+        .any(|p| s.starts_with(p))
 }
 
 /// A host notice this shortly before an orderly close means the host announced the end.
@@ -624,6 +652,10 @@ mod tests {
         assert!(!retryable(&"protocol version mismatch (peer 1, ours 2)".into()));
         assert!(retryable(&"cannot connect to 100.64.0.1:47300: refused".into()));
         assert!(retryable(&Error::msg(channel::CLOSED)));
+        // Turned away because another viewer is using the host: stop.
+        assert!(!retryable(&format!("{REFUSED}another viewer is using this host").into()));
+        let ids: Vec<u64> = (0..4).map(|_| new_instance().unwrap()).collect();
+        assert!(ids.iter().all(|&i| i != 0) && ids.windows(2).all(|w| w[0] != w[1]), "{ids:?}");
     }
 
     #[test]
