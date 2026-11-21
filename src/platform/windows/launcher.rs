@@ -1524,6 +1524,9 @@ struct State {
     host_gen: u64,
     /// The key file as it was just before the running host read it (`read_key_file`).
     host_key: Option<Vec<u8>>,
+    /// The fingerprint of the key stored then: a file that changed but holds the same key (saved
+    /// again: a fresh DPAPI blob) is no key change.
+    host_key_fp: Option<String>,
     /// Start sharing again once the host of this generation has exited: it was stopped because
     /// the stored key changed.
     restart_after: Option<u64>,
@@ -2141,6 +2144,7 @@ fn run_window() -> crate::util::Result<()> {
             host: None,
             host_gen: 0,
             host_key: None,
+            host_key_fp: None,
             restart_after: None,
             host_error: None,
             listen: None,
@@ -3308,6 +3312,7 @@ impl App {
         }
         // Read before the host reads the key: any change after this is then noticed.
         let key_file = read_key_file().ok();
+        let key_fp = keystore::user_key_fingerprint();
         let opts = self.share_options();
         let bind = std::env::var("SAFE_RDP_LAUNCHER_BIND").ok();
         let port = std::env::var("SAFE_RDP_LAUNCHER_PORT").ok();
@@ -3329,6 +3334,7 @@ impl App {
             st.host_gen += 1;
             st.host = Some(HostProc { child, stdin });
             st.host_key = key_file;
+            st.host_key_fp = key_fp;
             st.host_error = None;
             st.listen = None;
             st.share = Share::Starting;
@@ -3437,6 +3443,7 @@ impl App {
                 KillTimer(self.hwnd, TIMER_KEY);
             },
             Some(false) => {}
+            Some(true) if self.same_key_saved_again() => {}
             Some(true) => {
                 // A key on display is no longer the stored one.
                 if self.st.borrow().key_shown {
@@ -3450,6 +3457,24 @@ impl App {
                 self.refresh_service();
             }
         }
+    }
+
+    /// The key file differs from the one the running host started with: whether it still holds
+    /// that host's key (a key saved again is a fresh DPAPI blob). If so, the file as it is now
+    /// is the one compared with from here on.
+    fn same_key_saved_again(&self) -> bool {
+        // Read before the key: a change in between shows at the next check.
+        let file = read_key_file();
+        let fp = keystore::user_key_fingerprint();
+        let mut st = self.st.borrow_mut();
+        let same = fp.is_some() && fp == st.host_key_fp;
+        if same
+            && let Ok(data) = file
+            && !data.is_empty()
+        {
+            st.host_key = Some(data);
+        }
+        same
     }
 
     /// Adds a line of the window's own to the activity log.

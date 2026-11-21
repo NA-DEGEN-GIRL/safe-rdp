@@ -3006,6 +3006,11 @@ mod session_tests {
         let n = c.frames.len();
         c.send(ClientMsg::Refresh);
         c.frame(n + 1);
+        if !files::room_for_tests(files::Reserve::Ordinary) {
+            drop(host);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         // Upload: saved under its name, content intact, the path reported back.
         let content: Vec<u8> = (0..700_000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -3047,7 +3052,7 @@ mod session_tests {
         c.send(ClientMsg::FileBegin { id: 20, size: 10, name: "again.bin".into() });
         assert!(!c.upload_result(20).0);
         c.ping(3);
-        // The finished upload plus the three partial ones still open (hidden .part files).
+        // The finished upload plus the three partial ones still open (.part files).
         assert_eq!(entries(&dir).len(), 1 + MAX_UPLOADS - 1);
 
         // A protocol error ends the session, and the partial uploads go with it.
@@ -3067,6 +3072,9 @@ mod session_tests {
 
     #[test]
     fn the_services_own_folder_takes_only_so_many_uploads() {
+        if !files::room_for_tests(files::Reserve::ServiceFolder) {
+            return;
+        }
         let _serial = lock(&SERIAL);
         let dir = tmpdir("own");
         for i in 0..OWN_DIR_FILES - 1 {
@@ -3139,6 +3147,9 @@ mod session_tests {
         }
 
         // Pull: the copied files arrive one after another; one that vanished is reported.
+        if !files::room_for_tests(files::Reserve::Ordinary) {
+            return;
+        }
         let src = tmpdir("pull-src");
         let dst = tmpdir("pull-dst");
         let a: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();

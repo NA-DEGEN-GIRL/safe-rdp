@@ -91,6 +91,8 @@ const MAX_PIXELS: usize = 64 << 20;
 const MAX_BATCH: usize = 1000;
 /// How long the floating bar stays after being revealed.
 const BAR_HOLD_MS: u32 = 2000;
+/// How long the viewer waits at exit for the session reader to end, wiping its copy of the screen.
+const READER_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -529,6 +531,8 @@ struct Ui {
     fps: f64,
     mbps: f64,
     generation: u64,
+    /// The latest session's reader thread.
+    reader: Option<std::thread::JoinHandle<()>>,
     reconnect: Option<Reconnect>,
     next_attempt: u64,
     last_notice: Option<String>,
@@ -661,6 +665,7 @@ fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<
         fps: 0.0,
         mbps: 0.0,
         generation: 0,
+        reader: None,
         reconnect: None,
         next_attempt: 0,
         last_notice: None,
@@ -701,9 +706,16 @@ fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<
         }
     }
     unhook_keyboard(app);
-    let ui = UI.with(|cell| cell.borrow_mut().take());
+    let mut ui = UI.with(|cell| cell.borrow_mut().take());
     if let Some(s) = lock(&app.session).take() {
         s.shutdown();
+    }
+    // The reader wipes its own copy of the screen as it ends; exiting first would free it unwiped.
+    if let Some(r) = ui.as_mut().and_then(|u| u.reader.take()) {
+        let deadline = Instant::now() + READER_EXIT_WAIT;
+        while !r.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     // Pending reconnect results hold live connections: close them.
     lock(&app.events).clear();
@@ -1179,6 +1191,11 @@ impl Ui {
         self.host = if host_name.is_empty() { self.target.clone() } else { host_name };
         self.monitors = monitors;
         self.prefs.monitor = monitor;
+        // The hello left the quality to a host that will not say which it uses (an earlier
+        // version): such a host uses Balanced, unless it was started with `--quality`.
+        if flags & F_QUALITY_STATE == 0 && self.opts.quality as u32 > QUALITY_LOW {
+            self.prefs.quality = QUALITY_BALANCED as u8;
+        }
         self.flags = flags;
         self.view_only = view_only;
         self.unavailable = [false; 8];
@@ -1206,6 +1223,8 @@ impl Ui {
         if w.is_err() || r.is_err() {
             session.end(EndKind::Network, "cannot start the session threads".into());
         }
+        // An earlier session's reader was stopped with its session and ends by itself.
+        self.reader = r.ok();
         *lock(&APP.get().unwrap().session) = Some(session);
         let title = wide(&if self.host == self.target {
             format!("{} - safe-rdp", self.host)
