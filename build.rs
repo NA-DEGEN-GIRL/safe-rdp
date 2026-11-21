@@ -3,7 +3,8 @@
 //!
 //! No resource compiler is needed: the icon is drawn here and written as a `.res` file, which
 //! link.exe accepts as an input like an object file. Only binaries get these, not test harnesses.
-//! `assets/icon.svg` is the same drawing for documents; keep the two in step.
+//! `assets/icon.svg` is the same drawing for documents; keep the two in step. Binaries also
+//! take their imported DLLs from System32 only (see `/DEPENDENTLOADFLAG` below).
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,23 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
     // The manifest carries its own trustInfo (asInvoker); do not let the linker add another.
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
+    // Resolve the DLLs this executable imports (dxgi, sas, uxtheme, ...) from System32 only.
+    // By default the loader looks in the executable's own folder first, so a dxgi.dll that
+    // lands beside safe-rdp.exe (a received file, a download, another user's file in a shared
+    // folder) would run as code in it, elevated during `service install`. 0x800 is
+    // LOAD_LIBRARY_SEARCH_SYSTEM32; main() sets the same for DLLs loaded later.
+    println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    // .cargo/config.toml links the C runtime statically, so the executable needs no Visual C++
+    // redistributable on the other PC. RUSTFLAGS from the environment, or building from outside
+    // this directory, replaces that setting without a word: say so.
+    let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    if !features.split(',').any(|f| f == "crt-static") {
+        println!(
+            "cargo:warning=the C runtime is linked dynamically (RUSTFLAGS overrides .cargo/config.toml?): \
+             safe-rdp.exe will need the Visual C++ runtime (VCRUNTIME140.dll) on every PC; \
+             add `-C target-feature=+crt-static` to build a self-contained executable"
+        );
+    }
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("safe-rdp.res");
     write_res(&out).expect("writing the icon resource");

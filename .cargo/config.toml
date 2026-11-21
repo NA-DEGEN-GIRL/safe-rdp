@@ -1,0 +1,5 @@
+# Link the C runtime statically on Windows: the default (/MD) makes safe-rdp.exe import
+# VCRUNTIME140.dll, which Windows does not ship, so the copied executable would not start on a
+# PC without the Visual C++ redistributable. build.rs warns when this setting is overridden.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

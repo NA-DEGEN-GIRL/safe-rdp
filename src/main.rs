@@ -90,6 +90,14 @@ Downloads/safe-rdp. Hotkeys: Ctrl+Alt+Enter full screen, Ctrl+Alt+End sends Ctrl
 static STOP: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    // DLLs loaded from here on (by us or by Windows on our behalf) come from System32 only,
+    // never from this executable's folder, where anyone may have left a file; the imports
+    // themselves are covered by /DEPENDENTLOADFLAG (build.rs).
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = dispatch(&args) {
         log!("error: {e}");
