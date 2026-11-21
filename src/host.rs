@@ -167,8 +167,9 @@ struct SessionCtl {
     sock: TcpStream,
     /// The session's sending half while it has one, for `kick_with_notice`.
     out: Mutex<Option<Arc<Out>>>,
-    /// The viewer's hello `instance` (0: none), which an automatic reconnect must match.
-    instance: u64,
+    /// The viewer's instance (0: none), which an automatic reconnect must match: from its hello,
+    /// else from its `ClientMsg::Instance` (`name`).
+    instance: AtomicU64,
     link: Mutex<Link>,
 }
 
@@ -190,9 +191,13 @@ impl SessionCtl {
             finished: AtomicBool::new(false),
             sock,
             out: Mutex::new(None),
-            instance,
+            instance: AtomicU64::new(instance),
             link: Mutex::new(Link::Live),
         }
+    }
+    /// Names a session whose viewer has no instance yet; the first name stays.
+    fn name(&self, instance: u64) {
+        let _ = self.instance.compare_exchange(0, instance, Ordering::SeqCst, Ordering::SeqCst);
     }
     fn kick(&self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -249,6 +254,22 @@ impl SessionCtl {
             Link::Parting(slot) => slot.take(),
             _ => None,
         }
+    }
+    /// Returns once a parting connection is closed, and closes it at its drain deadline. The
+    /// receiving thread drains it only once its read returns, which for a viewer that sends
+    /// nothing takes up to `IO_TIMEOUT`, and a farewell the viewer does not read waits as long to
+    /// be sent: closing the connection wakes both, and gives the drain slot back.
+    fn close_parted(&self) {
+        loop {
+            match &*lock(&self.link) {
+                Link::Parting(Some(slot)) if Instant::now() >= slot.until => break,
+                // Without its slot the receiving thread is draining, up to the same deadline.
+                Link::Parting(_) => {}
+                Link::Live | Link::Closed => return,
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+        self.kill();
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
@@ -758,7 +779,7 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
         if host.stopping.load(Ordering::SeqCst) {
             return;
         }
-        let live = cur.as_ref().filter(|c| !c.stopped()).map(|c| c.instance);
+        let live = cur.as_ref().filter(|c| !c.stopped()).map(|c| c.instance.load(Ordering::SeqCst));
         if !takes_over(hello.flags, hello.instance, live) {
             drop(cur);
             log!("refused {peer}: an automatic reconnect does not replace another viewer's session");
@@ -788,6 +809,8 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
         Err(e) if e.to_string() != channel::CLOSED => log!("session ended: {peer}: {e}"),
         _ => log!("session ended: {peer} disconnected"),
     }
+    // A replaced session's connection may still be parting: it closes by its drain deadline.
+    ctl.close_parted();
 }
 
 /// The sending half of a session, shared by the capture, input, clipboard, audio and file threads.
@@ -846,7 +869,7 @@ impl Out {
     /// sent holds the writer, for at most `FAREWELL`: a writer stuck that long means no notice
     /// (its send still holds the session, the screen included). The farewell then takes the
     /// writer away, so that no thread of the session waits while the notice waits behind what
-    /// the viewer has not read yet, for up to the connection's write timeout.
+    /// the viewer has not read yet, until the connection closes (`close_parted`).
     fn farewell(&self, sock: &TcpStream, text: &str) -> bool {
         let t = Instant::now();
         let w = loop {
@@ -940,7 +963,8 @@ fn effective_downscale(area: Area, d: usize) -> usize {
 
 /// Capabilities announced in the hello.
 fn host_flags(opts: &HostOptions, audio_available: bool, privacy_available: bool) -> u32 {
-    let mut flags = 0;
+    // What every session of this host does (viewers send instances only to hosts that say so).
+    let mut flags = F_INSTANCE | F_QUALITY_STATE;
     if opts.clipboard {
         flags |= F_CLIPBOARD;
     }
@@ -1156,6 +1180,7 @@ impl Input {
             ClientMsg::Refresh => self.shared.refresh.store(true, Ordering::SeqCst),
             ClientMsg::Ping(t) => self.out.send(&ServerMsg::Pong(t))?,
             ClientMsg::Hello { .. } => {}
+            ClientMsg::Instance(id) => self.ctl.name(id),
             ClientMsg::Set { key: key @ (SET_QUALITY | SET_DOWNSCALE | SET_MONITOR), value } => {
                 // Waits while `SETTINGS_QUEUE` changes are pending (the capture thread takes them
                 // within a tick), so a flood slows down its sender instead of growing the queue.
@@ -2082,13 +2107,15 @@ mod tests {
 
     #[test]
     fn capability_flags() {
+        // Announced by every host of this version, whatever its options.
+        let always = F_INSTANCE | F_QUALITY_STATE;
         let base = HostOptions { clipboard: true, ..HostOptions::default() };
-        assert_eq!(host_flags(&base, true, true), F_CLIPBOARD | F_AUDIO | F_FILES | F_PRIVACY);
-        assert_eq!(host_flags(&base, false, false), F_CLIPBOARD | F_FILES);
+        assert_eq!(host_flags(&base, true, true), always | F_CLIPBOARD | F_AUDIO | F_FILES | F_PRIVACY);
+        assert_eq!(host_flags(&base, false, false), always | F_CLIPBOARD | F_FILES);
         let o = HostOptions { view_only: true, sas: true, ..HostOptions::default() };
-        assert_eq!(host_flags(&o, true, true), F_VIEW_ONLY | F_SAS | F_AUDIO);
+        assert_eq!(host_flags(&o, true, true), always | F_VIEW_ONLY | F_SAS | F_AUDIO);
         let o = HostOptions { files: false, audio: false, privacy: false, ..HostOptions::default() };
-        assert_eq!(host_flags(&o, true, true), 0);
+        assert_eq!(host_flags(&o, true, true), always);
     }
 
     #[test]
@@ -2508,6 +2535,20 @@ mod tests {
         assert!(!takes_over(HELLO_RECONNECT, 0, Some(0)) && !takes_over(HELLO_RECONNECT, 5, Some(0)));
     }
 
+    #[test]
+    fn a_session_is_named_once() {
+        let ((s, _), _viewer) = session_pair();
+        // Named after the hellos (the hello of a new connection carries no instance).
+        let ctl = SessionCtl::new(s.try_clone().unwrap(), 0);
+        ctl.name(5);
+        ctl.name(6);
+        assert_eq!(ctl.instance.load(Ordering::SeqCst), 5);
+        // Named by its hello already.
+        let ctl = SessionCtl::new(s, 7);
+        ctl.name(8);
+        assert_eq!(ctl.instance.load(Ordering::SeqCst), 7);
+    }
+
     const PAIR_KEY: [u8; 32] = [4; 32];
 
     /// An authenticated loopback connection: the host's end and the viewer's, with their keys.
@@ -2615,6 +2656,55 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_replaced_viewer_is_closed_at_its_drain_deadline() {
+        let ((hs, hk), (vs, vk)) = session_pair();
+        // As `read_hello` sets them: the receiving thread's read waits this long for a viewer
+        // that sends nothing.
+        hs.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        hs.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+        let drains = Arc::new(AtomicUsize::new(0));
+        let ctl = Arc::new(SessionCtl::new(hs.try_clone().unwrap(), 1));
+        *lock(&ctl.out) = Some(Arc::new(Out::new(RecordWriter::new(hs.try_clone().unwrap(), hk.send))));
+        let (to_input, received) = mpsc::sync_channel(RECEIVED_QUEUE);
+        let receiver = {
+            let (ctl, reader) = (ctl.clone(), RecordReader::new(hs, hk.recv));
+            std::thread::spawn(move || receive(reader, to_input, &ctl))
+        };
+        // The viewer sends once, then goes silent (frozen, or a link that went quiet): the
+        // receiving thread waits in its next read.
+        let mut b = Vec::new();
+        ClientMsg::Ping(1).encode(&mut b);
+        RecordWriter::new(vs.try_clone().unwrap(), vk.send).send(&b).unwrap();
+        assert!(matches!(received.recv().unwrap(), Ok(ClientMsg::Ping(1))));
+        ctl.kick_with_notice("another viewer connected to this host", &drains);
+        drop(received);
+        // The deadline, brought forward from `DRAIN_FOR` after the kick.
+        let until = Instant::now() + Duration::from_secs(2);
+        match &mut *lock(&ctl.link) {
+            Link::Parting(Some(slot)) => slot.until = until,
+            _ => panic!("the connection is not parting"),
+        }
+        // What the replaced session's own thread does last (`serve_session`).
+        ctl.close_parted();
+        let late = Instant::now().saturating_duration_since(until);
+        assert!(Instant::now() >= until && late < Duration::from_secs(2), "closed {late:?} after the deadline");
+        assert!(matches!(*lock(&ctl.link), Link::Closed));
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+        // The receiving thread was woken rather than left waiting for `IO_TIMEOUT`.
+        let t = Instant::now();
+        receiver.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5), "the receiving thread took {:?}", t.elapsed());
+        // The viewer, reading at last, finds the notice and the end.
+        let (_, notice) = read_to_end(&mut RecordReader::new(vs, vk.recv));
+        assert_eq!(notice.as_deref(), Some("another viewer connected to this host"));
+        // A connection that is not parting is left as it is.
+        let ((s, _), _viewer) = session_pair();
+        let ctl = SessionCtl::new(s, 1);
+        ctl.close_parted();
+        assert!(matches!(*lock(&ctl.link), Link::Live));
+    }
+
+    #[test]
     fn an_automatic_reconnect_does_not_replace_another_viewers_session() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
@@ -2626,18 +2716,24 @@ mod tests {
         let served = {
             let host = host.clone();
             std::thread::spawn(move || {
-                let (s, peer) = l.accept().unwrap();
-                let keys = handshake(&s, &PAIR_KEY, Instant::now() + Duration::from_secs(10)).unwrap();
-                serve_session(&host, s, peer, keys);
+                for _ in 0..2 {
+                    let (s, peer) = l.accept().unwrap();
+                    let keys = handshake(&s, &PAIR_KEY, Instant::now() + Duration::from_secs(10)).unwrap();
+                    serve_session(&host, s, peer, keys);
+                }
             })
         };
-        let o = crate::viewer::ViewerOptions { instance: 8, reconnect: true, ..Default::default() };
-        let e = match crate::viewer::connect(&addr.to_string(), &o, &Secret(PAIR_KEY)) {
-            Ok(_) => panic!("an automatic reconnect replaced another viewer's session"),
-            Err(e) => e,
-        };
-        assert_eq!(e.to_string(), format!("{}another viewer is using this host", crate::viewer::REFUSED));
-        assert!(!crate::viewer::retryable(&e));
+        // With its instance in the hello, and without (the hello it falls back to when an attempt
+        // like that went unanswered, which older hosts take like any other).
+        for instance_in_hello in [true, false] {
+            let o = crate::viewer::ViewerOptions { instance: 8, reconnect: true, instance_in_hello, ..Default::default() };
+            let e = match crate::viewer::connect(&addr.to_string(), &o, &Secret(PAIR_KEY)) {
+                Ok(_) => panic!("an automatic reconnect replaced another viewer's session"),
+                Err(e) => e,
+            };
+            assert_eq!(e.to_string(), format!("{}another viewer is using this host", crate::viewer::REFUSED));
+            assert!(!crate::viewer::retryable(&e));
+        }
         served.join().unwrap();
         assert!(!live.stopped() && lock(&host.current).as_ref().is_some_and(|c| Arc::ptr_eq(c, &live)));
     }
@@ -3111,6 +3207,7 @@ mod session_tests {
         let host = TestHost::start(|o| o.default_quality = QUALITY_LOW);
         // A viewer started without --quality gets the host's default and is told which.
         let mut c = host.connect(ViewerOptions::default());
+        assert_ne!(c.conn.flags & F_QUALITY_STATE, 0);
         let v = c.wait("the quality in effect", |m| match m {
             ServerMsg::State { key: SET_QUALITY, value } => Some(*value),
             _ => None,
@@ -3230,8 +3327,11 @@ mod session_tests {
         let _serial = lock(&SERIAL);
         let host = TestHost::start(|_| {});
         let target = format!("127.0.0.1:{}", host.port);
-        let reconnect = |instance| ViewerOptions { instance, reconnect: true, ..ViewerOptions::default() };
+        let reconnect = |instance| ViewerOptions { instance, reconnect: true, instance_in_hello: true, ..ViewerOptions::default() };
+        // The first connection's hello carries no instance (older hosts would reject it): the
+        // viewer names the session afterwards, since this host says it takes that.
         let mut c1 = host.connect(ViewerOptions { instance: 11, ..ViewerOptions::default() });
+        assert_ne!(c1.conn.flags & F_INSTANCE, 0);
         c1.ping(1);
         // Another viewer's automatic reconnect is turned away for good; the session carries on.
         match connect(&target, &reconnect(12), &Secret(PSK)) {

@@ -458,6 +458,9 @@ struct Reconnect {
     /// Why the session ended, and the error of the latest failed attempt.
     cause: String,
     last_error: Option<String>,
+    /// An attempt whose hello carried the instance was closed unanswered (`HELLO_UNANSWERED`):
+    /// an older host may be answering now, so the next ones leave it out.
+    instance_unanswered: bool,
 }
 
 /// UI-thread state. Lives in `UI`; handlers borrow it briefly and never across calls that
@@ -537,7 +540,9 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
 
 fn run_window(target: &str, mut opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
     // Names this window's connections to the host, so that its automatic reconnects take back
-    // only the session it lost, never one another viewer has started since.
+    // only the session it lost, never one another viewer has started since. The first hello is
+    // the five-byte one every host takes; `connect` names the session only to a host that
+    // announced `F_INSTANCE`.
     opts.instance = core::new_instance()?;
     let conn = core::connect(target, &opts, &psk)?;
     let (w, h) = (conn.width, conn.height);
@@ -1178,6 +1183,10 @@ impl Ui {
             privacy: self.prefs.privacy,
             instance: self.opts.instance,
             reconnect: true,
+            // Only a host that announced it takes the instance in the hello: an older one rejects
+            // that hello after replacing its viewer. Without it, an older host takes the hello as
+            // any other, and a newer one lets it in only while nobody is connected.
+            instance_in_hello: self.flags & F_INSTANCE != 0 && !self.reconnect.as_ref().is_some_and(|rc| rc.instance_unanswered),
         }
     }
 
@@ -1257,8 +1266,15 @@ impl Ui {
         dim_framebuffer();
         let now = Instant::now();
         let delay = core::reconnect_delay(0);
-        self.reconnect =
-            Some(Reconnect { since: now, attempt: 0, due: Some(now + delay), in_flight: None, cause: reason, last_error: None });
+        self.reconnect = Some(Reconnect {
+            since: now,
+            attempt: 0,
+            due: Some(now + delay),
+            in_flight: None,
+            cause: reason,
+            last_error: None,
+            instance_unanswered: false,
+        });
         unsafe { SetTimer(self.hwnd, T_RECONNECT, delay.as_millis() as u32, None) };
         self.bar.set_keep_visible(true);
         self.refresh_overlay();
@@ -1309,6 +1325,7 @@ impl Ui {
                 log!("reconnect failed: {e}");
                 rc.attempt += 1;
                 rc.last_error = Some(short_error(&e.to_string()));
+                rc.instance_unanswered |= e.to_string() == core::HELLO_UNANSWERED;
                 if !core::retryable(&e) || rc.since.elapsed() >= core::RECONNECT_FOR {
                     return After::Quit(Some(trf(Txt::GaveUp, &[&self.host, &e])));
                 }

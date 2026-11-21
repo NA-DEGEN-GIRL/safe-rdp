@@ -47,14 +47,22 @@ pub const C_FILE_BEGIN: u8 = 0x8c;
 pub const C_FILE_DATA: u8 = 0x8d;
 pub const C_FILE_END: u8 = 0x8e;
 pub const C_FILE_PULL: u8 = 0x8f;
+pub const C_INSTANCE: u8 = 0x90;
 
-// Host capability flags in `ServerMsg::Hello`
+// Host capability flags in `ServerMsg::Hello` (viewers ignore bits they do not know)
 pub const F_CLIPBOARD: u32 = 1;
 pub const F_VIEW_ONLY: u32 = 2;
 pub const F_SAS: u32 = 4;
 pub const F_AUDIO: u32 = 8;
 pub const F_FILES: u32 = 16;
 pub const F_PRIVACY: u32 = 32;
+/// The host knows viewer instances: it takes `ClientMsg::Instance` and hellos that carry one.
+/// Older hosts end the session on either (after replacing their viewer), so viewers send them
+/// neither, only the original five-byte hello.
+pub const F_INSTANCE: u32 = 64;
+/// A hello that leaves the quality to the host (`QUALITY_DEFAULT`, or one it does not know) gets
+/// a `State` for `SET_QUALITY` right after the host's hello, which answers no `Set`.
+pub const F_QUALITY_STATE: u32 = 128;
 
 // Viewer wishes in `ClientMsg::Hello::flags`
 pub const HELLO_AUDIO: u8 = 1;
@@ -159,8 +167,8 @@ pub struct MonitorInfo {
 #[derive(Debug, PartialEq)]
 pub enum ClientMsg {
     /// First message of a session. `instance` is a random number a viewer that reconnects
-    /// automatically keeps for its lifetime (see `HELLO_RECONNECT`); 0 for none, which is sent
-    /// as the shorter hello of older viewers that older hosts expect.
+    /// automatically keeps for its lifetime (see `HELLO_RECONNECT`), sent only to hosts that
+    /// announce `F_INSTANCE`; 0 for none, which is the original five-byte hello every host takes.
     Hello { downscale: u8, quality: u8, monitor: u8, flags: u8, instance: u64 },
     Ack(u32),
     MouseMove { x: u16, y: u16 },
@@ -180,6 +188,10 @@ pub enum ClientMsg {
     FileEnd { id: u32, sha256: [u8; 32] },
     /// Ask the host to send the files currently copied to its clipboard.
     FilePull,
+    /// Names the session after the viewer's instance (see `Hello`), right after the hellos of a
+    /// connection whose hello did not carry it, so that the viewer's automatic reconnects may take
+    /// it back. Only for hosts that announce `F_INSTANCE`.
+    Instance(u64),
 }
 
 #[derive(Debug, PartialEq)]
@@ -389,6 +401,10 @@ impl ClientMsg {
                 o.extend_from_slice(sha256);
             }
             ClientMsg::FilePull => o.push(C_FILE_PULL),
+            ClientMsg::Instance(id) => {
+                o.push(C_INSTANCE);
+                o.extend_from_slice(&id.to_le_bytes());
+            }
         }
     }
 
@@ -417,6 +433,7 @@ impl ClientMsg {
             C_FILE_DATA => ClientMsg::FileData { id: r.u32()?, data: chunk(r.rest())?.to_vec() },
             C_FILE_END => ClientMsg::FileEnd { id: r.u32()?, sha256: r.arr32()? },
             C_FILE_PULL => ClientMsg::FilePull,
+            C_INSTANCE => ClientMsg::Instance(r.u64()?),
             t => bail!("unknown client message {t:#x}"),
         };
         r.end()?;
@@ -555,6 +572,7 @@ mod tests {
             ClientMsg::FileData { id: 3, data: vec![1, 2, 3] },
             ClientMsg::FileEnd { id: 3, sha256: [9; 32] },
             ClientMsg::FilePull,
+            ClientMsg::Instance(u64::MAX - 5),
         ];
         for m in msgs {
             let mut b = Vec::new();
@@ -619,6 +637,16 @@ mod tests {
         }
         b.push(0);
         assert!(ClientMsg::decode(&b).is_err());
+        // Named after the hellos instead: exactly eight bytes.
+        let mut b = Vec::new();
+        ClientMsg::Instance(0x0102_0304_0506_0708).encode(&mut b);
+        assert_eq!(b, [C_INSTANCE, 8, 7, 6, 5, 4, 3, 2, 1]);
+        assert!(ClientMsg::decode(&b[..8]).is_err());
+        b.push(0);
+        assert!(ClientMsg::decode(&b).is_err());
+        // The capability bits are distinct.
+        let all = [F_CLIPBOARD, F_VIEW_ONLY, F_SAS, F_AUDIO, F_FILES, F_PRIVACY, F_INSTANCE, F_QUALITY_STATE];
+        assert_eq!(all.iter().fold(0, |a, f| a | f).count_ones() as usize, all.len());
     }
 
     #[test]
