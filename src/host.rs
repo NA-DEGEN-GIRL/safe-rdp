@@ -57,6 +57,11 @@ pub struct HostOptions {
     pub default_quality: u32,
     /// Where uploads are saved (default: `files::transfer_dir()`).
     pub transfer_dir: Option<PathBuf>,
+    /// `transfer_dir` is the service's own folder, which only SYSTEM and Administrators can
+    /// change: uploads are saved there with the host's own rights, up to `OWN_DIR_BYTES` /
+    /// `OWN_DIR_FILES`. Any other folder is written as the user signed in on the console
+    /// (`FileUser`), so a host running as SYSTEM never follows a path that user can redirect.
+    pub own_transfer_dir: bool,
     /// The files a `FilePull` sends: the platform clipboard (replaceable for tests). Called on
     /// the file-pull thread.
     pub copied_files: fn() -> Vec<PathBuf>,
@@ -78,6 +83,7 @@ impl Default for HostOptions {
             privacy: true,
             default_quality: QUALITY_BALANCED,
             transfer_dir: None,
+            own_transfer_dir: false,
             copied_files: clipboard::copied_files,
         }
     }
@@ -116,6 +122,10 @@ const SETTINGS_QUEUE: usize = 16;
 const FAREWELL: Duration = Duration::from_secs(1);
 /// Uploads a viewer may have open at once.
 const MAX_UPLOADS: usize = 4;
+/// What the service's own upload folder may hold, uploads still arriving included: only an
+/// administrator can empty it.
+const OWN_DIR_BYTES: u64 = MAX_FILE_SIZE;
+const OWN_DIR_FILES: usize = 1000;
 /// Longest a file chunk waits for frames and replies to go first.
 const BULK_YIELD: Duration = Duration::from_millis(100);
 /// Audio packet length.
@@ -873,7 +883,7 @@ struct Input {
     last_sync: Instant,
     /// Uploads and pulls are allowed in this session.
     files: bool,
-    uploads: HashMap<u32, Incoming>,
+    uploads: HashMap<u32, Upload>,
     upload_dir: Option<PathBuf>,
     pulling: Arc<AtomicBool>,
     /// The id of the next file pulled.
@@ -1056,12 +1066,12 @@ impl Input {
         } else if self.uploads.len() >= MAX_UPLOADS {
             Err(format!("too many uploads at once (at most {MAX_UPLOADS})").into())
         } else {
-            self.upload_dir().and_then(|dir| Incoming::begin(&dir, id, size, name))
+            self.open_upload(id, size, name)
         };
         match r {
-            Ok(inc) => {
+            Ok(up) => {
                 log!("receiving file {name} ({size} bytes)");
-                self.uploads.insert(id, inc);
+                self.uploads.insert(id, up);
                 Ok(())
             }
             Err(e) => {
@@ -1071,20 +1081,39 @@ impl Input {
         }
     }
 
+    /// Creates the partial file of an upload. A host running as SYSTEM (the service's agent)
+    /// takes uploads only while somebody is signed in on the console, like pulls, and saves them
+    /// as that user unless they go to the service's own folder.
+    fn open_upload(&mut self, id: u32, size: u64, name: &str) -> Result<Upload> {
+        let user = FileUser::get()?;
+        let own = self.host.opts.own_transfer_dir;
+        let user = (!own).then_some(user);
+        let file = as_user(user.as_ref(), || -> Result<Incoming> {
+            let dir = self.upload_dir()?;
+            if own {
+                let arriving = self.uploads.values().map(|u| u.file.size - u.file.received()).sum();
+                own_dir_room(&dir, arriving, size, OWN_DIR_BYTES, OWN_DIR_FILES)?;
+            }
+            Incoming::begin(&dir, id, size, name)
+        })??;
+        Ok(Upload { file, user })
+    }
+
     fn upload_data(&mut self, id: u32, data: &[u8]) -> Result<()> {
         // Data for an upload that was refused or failed earlier is dropped silently.
-        let Some(inc) = self.uploads.get_mut(&id) else { return Ok(()) };
-        let Err(e) = inc.write(data) else { return Ok(()) };
-        log!("upload of {} ({} bytes) failed: {e}", inc.name, inc.size);
+        let Some(up) = self.uploads.get_mut(&id) else { return Ok(()) };
+        // Written through the open file: no path is looked up, so no need to act as the user.
+        let Err(e) = up.file.write(data) else { return Ok(()) };
+        log!("upload of {} ({} bytes) failed: {e}", up.file.name, up.file.size);
         // Dropping it removes the partial file.
         self.uploads.remove(&id);
         self.file_result(id, false, e.to_string())
     }
 
     fn upload_end(&mut self, id: u32, sha256: &[u8; 32]) -> Result<()> {
-        let Some(inc) = self.uploads.remove(&id) else { return Ok(()) };
-        let (name, size) = (inc.name.clone(), inc.size);
-        match inc.finish(sha256) {
+        let Some(up) = self.uploads.remove(&id) else { return Ok(()) };
+        let (name, size) = (up.file.name.clone(), up.file.size);
+        match up.finish(sha256) {
             Ok(path) => {
                 log!("received file {name} ({size} bytes)");
                 self.file_result(id, true, path.display().to_string())
@@ -1116,6 +1145,43 @@ impl Input {
         }
         Ok(())
     }
+}
+
+/// An upload in progress, and the user it is saved as (None: the host itself, in the
+/// service's own folder).
+struct Upload {
+    file: Incoming,
+    user: Option<FileUser>,
+}
+
+impl Upload {
+    /// Moves the file into place as its user: the folder it goes to is looked up again.
+    fn finish(self, sha256: &[u8; 32]) -> Result<PathBuf> {
+        let Upload { file, user } = self;
+        as_user(user.as_ref(), || file.finish(sha256))?
+    }
+}
+
+/// Runs `f` as `user`, or as the host itself.
+fn as_user<T>(user: Option<&FileUser>, f: impl FnOnce() -> T) -> Result<T> {
+    match user {
+        Some(u) => u.act(f),
+        None => Ok(f()),
+    }
+}
+
+/// Refuses an upload of `size` bytes that would take `dir` beyond `max_bytes` or `max_files`,
+/// counting `arriving` bytes of the uploads still in progress (their parts are entries already).
+fn own_dir_room(dir: &Path, arriving: u64, size: u64, max_bytes: u64, max_files: usize) -> Result<()> {
+    let (bytes, entries) = files::dir_usage(dir)?;
+    if entries >= max_files || bytes.saturating_add(arriving).saturating_add(size) > max_bytes {
+        bail!(
+            "{} is full (it takes at most {max_files} files and {} GiB in all); an administrator has to empty it",
+            dir.display(),
+            max_bytes >> 30
+        );
+    }
+    Ok(())
 }
 
 /// Elsewhere the host runs as the user whose screen it shares: files are read as itself.
@@ -1809,6 +1875,29 @@ mod tests {
     }
 
     #[test]
+    fn the_services_own_folder_fills_only_so_far() {
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let dir = std::env::temp_dir().join(format!("srdp-host-own-{}", crate::util::hex_encode(&r)));
+        std::fs::create_dir_all(&dir).unwrap();
+        own_dir_room(&dir, 0, 100, 100, 3).unwrap();
+        assert!(own_dir_room(&dir, 0, 101, 100, 3).is_err());
+        std::fs::write(dir.join("a"), [0u8; 40]).unwrap();
+        std::fs::write(dir.join("b"), [0u8; 10]).unwrap();
+        own_dir_room(&dir, 0, 50, 100, 3).unwrap();
+        // Uploads still arriving count with everything they announced.
+        let e = own_dir_room(&dir, 30, 21, 100, 3).unwrap_err().to_string();
+        assert!(e.contains("is full") && e.contains("administrator"), "{e}");
+        own_dir_room(&dir, 30, 20, 100, 3).unwrap();
+        // And every entry counts against the number of files, whatever its size.
+        std::fs::create_dir(dir.join("c")).unwrap();
+        assert!(own_dir_room(&dir, 0, 0, 100, 3).is_err());
+        own_dir_room(&dir, 0, 0, 100, 4).unwrap();
+        assert!(own_dir_room(&dir.join("missing"), 0, 0, 100, 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn view_only_viewers_cannot_set_the_clipboard() {
         let o = |clipboard, view_only| HostOptions { clipboard, view_only, ..HostOptions::default() };
         assert!(accepts_clipboard(&o(true, false)));
@@ -2474,6 +2563,49 @@ mod session_tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(entries(&dir), [name]);
+        drop(host);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_services_own_folder_takes_only_so_many_uploads() {
+        let _serial = lock(&SERIAL);
+        let dir = tmpdir("own");
+        for i in 0..OWN_DIR_FILES - 1 {
+            std::fs::File::create(dir.join(format!("old{i}"))).unwrap();
+        }
+        let host = TestHost::start(47419, |o| {
+            o.transfer_dir = Some(dir.clone());
+            o.own_transfer_dir = true;
+        });
+        let mut c = host.connect(ViewerOptions::default());
+        let upload = |c: &mut Client, id, name: &str| {
+            c.send(ClientMsg::FileBegin { id, size: 1, name: name.into() });
+            c.send(ClientMsg::FileData { id, data: vec![1] });
+            c.send(ClientMsg::FileEnd { id, sha256: crate::crypto::sha256(&[&[1]]) });
+            c.upload_result(id)
+        };
+        // One more fits; after that an administrator has to make room.
+        let (ok, msg) = upload(&mut c, 1, "last.bin");
+        assert!(ok, "{msg}");
+        let (ok, msg) = upload(&mut c, 2, "one too many.bin");
+        assert!(!ok && msg.contains("is full"), "{msg}");
+        assert_eq!(entries(&dir).len(), OWN_DIR_FILES);
+        std::fs::remove_file(dir.join("old0")).unwrap();
+        assert!(upload(&mut c, 3, "after cleaning.bin").0);
+        // An upload still arriving when the session ends is removed with it.
+        std::fs::remove_file(dir.join("old1")).unwrap();
+        c.send(ClientMsg::FileBegin { id: 4, size: 10, name: "cut off.bin".into() });
+        c.send(ClientMsg::FileData { id: 4, data: vec![1; 4] });
+        c.ping(4);
+        assert_eq!(entries(&dir).len(), OWN_DIR_FILES);
+        c.conn.writer.send(&[0x7f]).unwrap();
+        let t = Instant::now();
+        while entries(&dir).len() == OWN_DIR_FILES {
+            assert!(t.elapsed() < Duration::from_secs(10), "the partial upload outlived its session");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(entries(&dir).iter().all(|n| !n.starts_with(".srdp-")));
         drop(host);
         let _ = std::fs::remove_dir_all(&dir);
     }
