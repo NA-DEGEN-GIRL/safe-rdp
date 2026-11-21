@@ -22,8 +22,9 @@ safe-rdp is designed not to leave persistent data like this behind.
 ## Quick start (Windows, GUI)
 
 1. Build: `cargo build --release` in the repository folder (with your own `RUSTFLAGS`, keep `-C target-feature=+crt-static`), then copy
-   `target\release\safe-rdp.exe` to both PCs, into a folder only you or administrators can write: not a shared folder, and not
-   `Downloads\safe-rdp`, where received files go (run from there, safe-rdp refuses to receive files)
+   `target\release\safe-rdp.exe` to both PCs, into a folder only you or administrators can write and nothing is downloaded into:
+   not Downloads or a shared folder, and not `Downloads\safe-rdp`, where received files go (run from there, safe-rdp refuses to
+   receive files)
 2. Double-click `safe-rdp.exe` to open the launcher window (same as `safe-rdp gui`)
 3. **Key** tab: on one PC, *Create new key* → *Copy*; on the other PC, paste it under *Import* on the Key tab
    (the copied key is kept out of clipboard history and cloud sync, and is cleared automatically after 60 seconds).
@@ -41,6 +42,8 @@ Buttons for features the host does not allow are hidden, and a dropped connectio
 (after 1, 2, 4, 8, 16, 30 seconds, giving up after 2 minutes; it stops at once if the key is wrong).
 An automatic reconnect takes back only its own session: if another viewer is connected by then, the host turns it away
 ("another viewer is using this host") and the viewer stops. Connecting by hand still replaces whoever is connected.
+This needs a viewer and a host of this version: with an older one on either end, an automatic reconnect replaces whoever
+is connected, as before.
 
 ## Quick start (command line, Windows and Linux)
 
@@ -60,17 +63,19 @@ safe-rdp connect remote-pc     # MagicDNS name, Tailscale IP or host:port
 In windowed mode the Win key, Alt+Tab, Alt+Esc and Ctrl+Esc stay local (the same as mstsc's default), together with the
 Ctrl/Alt/Shift held for them, so Ctrl+Shift+Esc, Alt+Shift+Tab and Ctrl+Win+arrow keys work locally too (a Windows remote does
 not see them as a lone Alt or Win press); in full screen every key goes to the remote while the viewer has the focus (when another
-window takes it, the Linux viewer lets go of the keyboard until it is focused again). The Korean Han/Eng and Hanja keys are passed
-through to the remote IME, and AltGr is passed as Right Alt, so the remote's keyboard layout decides what it types. Text that a
-program on the viewer PC types as Unicode characters (some password managers' auto-type, the emoji panel, the touch keyboard)
-is not forwarded, since only key presses are sent; use the clipboard for it.
+window takes it, the Linux viewer lets go of the keyboard until it is focused again; under a window manager, the pointer merely
+resting on it does not count as focus). The Korean Han/Eng and Hanja keys are passed through to the remote IME, and AltGr is passed
+as Right Alt, so the remote's keyboard layout decides what it types. Text that a program on the viewer PC types as Unicode
+characters (some password managers' auto-type, the emoji panel, the touch keyboard) is not forwarded, since only key presses are
+sent; use the clipboard for it.
 
 ## Linux
 
 Requirements: the OpenSSL 3 runtime (`libssl3`, installed by default on Ubuntu/Debian/Fedora); for the host, X11 (XTEST, XFIXES, and MIT-SHM if available);
-for sound, PipeWire's `pw-record`/`pw-play`. Supported: 64-bit x86_64, aarch64 (e.g. Raspberry Pi OS 64-bit) and riscv64, with glibc or musl;
-builds for other architectures (32-bit ARM and x86, x32, powerpc, mips, s390x, loongarch) stop with a compile error until their system
-constants have been checked.
+for sound, PipeWire's `pw-record`/`pw-play`. Supported: 64-bit x86_64, aarch64 (e.g. Raspberry Pi OS 64-bit) and riscv64, with glibc,
+or with musl as a dynamically linked build (`-C target-feature=-crt-static`) using the system's libcrypto: a static musl build,
+Rust's default there, cannot load libcrypto. Builds for other architectures (32-bit ARM and x86, x32, powerpc, mips, s390x,
+loongarch) stop with a compile error until their system constants have been checked.
 
 - **Linux with a desktop**: run `safe-rdp host` in an X11 session. A Wayland session (Ubuntu's default GNOME) only lets it capture and
   control Xwayland windows, so pick "Ubuntu on Xorg" on the login screen or use a virtual display (below).
@@ -112,12 +117,14 @@ Linux hosts have no privacy screen, no Ctrl+Alt+Del and no "Get copied files" (u
 File transfer safeguards:
 - Only a single file name is accepted, never a path. Names ending in `.` or a space, device names such as `CON` and `NUL`, and
   bidirectional characters (RLO etc.) that disguise the extension are rejected
-- Files are received into a hidden, randomly named `.srdp-*.part` file (on Windows, other programs cannot write to or delete it
-  meanwhile) and made visible only if the size and SHA-256 match. Existing files are never overwritten (`name (1).ext`)
+- Files are received into a randomly named `.srdp-*.part` file (hidden by its leading dot on Linux; on Windows it is visible, but
+  other programs cannot write to or delete it meanwhile) and given their real name only if the size and SHA-256 match. Existing
+  files are never overwritten (`name (1).ext`)
 - On Windows the *downloaded from the internet* mark (Mark of the Web) is attached as soon as receiving starts, so SmartScreen and
   Office Protected View apply. Transfers are refused on drives that cannot carry the mark (FAT/exFAT)
 - The viewer accepts files only after you click *Get copied files* (at most 1000 per click; the request expires if the transfer
-  stalls for more than 30 seconds, and you are told if files arrived after it expired). Files on network paths (`\\server\...`) are never sent
+  stalls for more than 30 seconds, and you are told if files arrived after it expired). Copied files on network paths
+  (`\\server\...` or a mapped network drive) are never sent
 - A received file must leave 1% of its volume free (256 MiB to 2 GiB; 5% in the service's own folder, see below), counting other
   transfers still arriving; this is checked again every 64 MiB, and a transfer stops if the disk fills up meanwhile. An abandoned
   partial file is deleted (on Windows through its open handle, never by its path)
@@ -160,11 +167,17 @@ What installation does:
 
 The service keeps the key it was installed with, and accepts it until told otherwise. After changing your key (`keygen --force`,
 `key import`, the Key tab), run `safe-rdp service rekey` elevated: it gives the service the key stored for the account that runs it and
-restarts it, keeping its command line, firewall rule and options; after `key forget`, run `service uninstall`. The key commands say
-which key the service has and print the exact command; the launcher offers the update right after the change and meanwhile shows
-*Update key* on its install button (*Reinstall* warns that options set in a terminal are dropped). Given `--expect-key <fingerprint>`
-as their first argument, `install` and `rekey` refuse (exit code 3, nothing changed) unless the running account's key has that
-fingerprint. The launcher always passes it: under UAC the service gets the key of the account that approves the prompt.
+restarts it, keeping its command line, firewall rule and options; after `key forget`, run `service uninstall`. The key commands and
+`service status` say which key the service has and print the exact command. A service without a recorded fingerprint may have been
+installed by an earlier safe-rdp and then still runs that earlier program, which `rekey` leaves in place: for it they suggest
+`service install --expect-key <fingerprint>` with the options it was installed with, and `rekey` adds a note saying so.
+The launcher offers the update right after the change, and meanwhile shows *Update key* (rekey) on its install button while the
+service is known to have another key. A service whose key is unknown is marked *key unknown* (the *Share this PC* tab says why)
+and keeps *Reinstall*, which the offer after a key change runs as well (*Reinstall* warns that options set in a terminal are
+dropped). Given `--expect-key <fingerprint>` as their first argument, `install` and `rekey` refuse (exit code 3, nothing changed)
+unless the running account's key has that fingerprint. The launcher always passes it: under UAC the service gets the key of the
+account that approves the prompt. Both also replace nothing when the installed service does not stop within 20 s (exit code 4),
+and exit with code 5 when the service got the new key and its fingerprint but could not be started.
 
 `%ProgramData%\safe-rdp` must be owned by SYSTEM/Administrators and have an administrators-only ACL. If a normal user created the
 folder beforehand, installation is refused (to prevent key theft or substitution); delete that folder and install again. The service
@@ -260,9 +273,11 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   adapter; Linux: `tailscale0`) or one that `tailscale status` reports as this device's. An address that is merely in 100.64.0.0/10
   (carrier-grade NAT from a mobile modem or a 5G/satellite gateway, another VPN) is ignored and logged once, and the host keeps
   waiting for Tailscale. A peer whose address is outside the Tailscale ranges is dropped before the handshake
-- On Windows, safe-rdp.exe takes the DLLs it uses from System32, never from the folder it runs from, so a `dxgi.dll` lying beside it
-  (in Downloads, a shared folder, among received files) is not loaded. Still keep safe-rdp.exe where only you or administrators
-  can write
+- On Windows, safe-rdp.exe imports at start-up only DLLs that Windows maps, with what they import, from its own copies
+  (KnownDLLs); every other DLL it uses is loaded on first use and looked for in System32 only. So a `dxgi.dll` or `sspicli.dll`
+  lying beside it (in Downloads, a shared folder, among received files) is not loaded. Windows' side-by-side mechanism is the
+  exception: a `safe-rdp.exe.config`, an assembly manifest and a `comctl32.dll` placed beside it can still make Windows load that
+  copy of the common controls. So keep safe-rdp.exe where only you or administrators can write
 - The only parsing before authentication is one fixed-length 101-byte message. The whole handshake has a 10-second deadline (a peer
   cannot hang on by trickling one byte at a time), concurrent unauthenticated connections are capped at 8 in total, 2 per address and
   (for IPv6 outside Tailscale) 4 per /64, failed addresses get a 1-second delay, and logging before authentication is limited to a few
@@ -275,16 +290,20 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   Even a malicious host cannot turn on the viewer's sound or privacy screen behind the user's back, send files that were not
   requested, or freeze the viewer with a flood of notifications, frames, cursor changes or setting changes
 - Nor can a host run a viewer out of memory or keep its window busy: only the newest frame acknowledgement waits to be sent; a host
-  that stops reading while 4096 messages or 8 MiB of clipboard text wait ends the session (the Windows viewer reconnects); tiles
-  are decoded outside the lock the window needs, and over 480 screens' worth per second (beyond a 1-second burst) ends the session;
-  size changes are paced (8 back to back, then one per second); merged frame and cursor wakeups let input and repaints in between
+  that stops reading while 4096 messages or 8 MiB of clipboard text wait ends the session (the Windows viewer reconnects), and as a
+  new clipboard text replaces one still waiting unless a key or click was queued after it, copying again and again over a slow
+  link never reaches that cap; tiles are decoded outside the lock the window needs, and over 480 screens' worth per second (beyond a
+  1-second burst) ends the session; size changes are paced (8 back to back, then one per second); merged frame and cursor wakeups
+  let input and repaints in between; one paint of the Windows viewer smooths at most about a whole 4K frame (a larger picture is
+  shown unsmoothed while it moves and smoothed about 150 ms after it stops), so no host makes a paint cost more than a 4K screen
 - A view-only session cannot send input, and it cannot change the host clipboard, transfer files or use the privacy screen either
 - When a new viewer authenticates, the existing session is replaced (one session at a time). The replaced viewer is told why
   ("another viewer connected to this host") and does not reconnect; the host keeps its connection open until it has read that
   notice (up to 20 s, at most 4 such connections at once), without making the newcomer wait
 - On disconnect all held keys and buttons are released and the privacy screen is turned off. On a Windows host, releases that
-  cannot reach the input desktop at that moment (a plain host at the lock screen or a UAC prompt) are retried every 0.5 s for
-  up to 10 minutes, and otherwise sent ahead of the next session's first input
+  cannot reach the input desktop (a plain host at the lock screen or a UAC prompt) are retried every 0.5 s, during the session
+  and for up to 10 minutes after it; the next session takes over any still owed and keeps retrying them for as long as it lasts,
+  whether or not its viewer sends input. A host that stops while they are still owed cannot release them
 - Stopping the host with Ctrl+C/SIGTERM goes through the same cleanup
 
 ### No leftover screen data
@@ -292,7 +311,7 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
 | Risk | Mitigation |
 |---|---|
 | On-disk bitmap cache | None. There is no code that writes screen data to files at all (except the diagnostic `probe --snapshot`) |
-| Swap | Frame buffers are locked in RAM with `VirtualLock`/`mlock`; on Linux they are also excluded from core dumps. The viewer's session reader decodes into a locked copy of its own, so the viewer holds about twice the remote screen (at most 2 × 256 MiB) |
+| Swap | Frame buffers are locked in RAM with `VirtualLock`/`mlock`; on Linux they are also excluded from core dumps. The viewer's session reader decodes into a locked copy of its own, so the viewer holds about twice the remote screen (at most 2 × 256 MiB; while the remote screen changes size, the Linux viewer briefly holds a third copy) |
 | Memory left after exit | Frame buffers, plaintext record buffers and keys are overwritten with zeros before they are freed |
 | Other processes reading memory | Linux: `PR_SET_DUMPABLE=0` (blocks ptrace and /proc/pid/mem from the same user) |
 | Local screenshots/recording | Windows: `WDA_EXCLUDEFROMCAPTURE` on the viewer window (it shows as black in captures; lift with `--allow-capture`). Linux (X11): not possible; the viewer warns when it starts |
@@ -344,9 +363,12 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
 - The Linux (X11) viewer cannot keep its window out of screenshots, recordings or screen sharing on its own display.
 - Unicode text typed by other programs is not forwarded (see the keyboard notes). On a Linux remote, a local Alt+Tab from a
   windowed viewer can still arrive as a lone Alt press (Firefox may show its menu bar).
-- A Windows viewer from this version needs a host from this version: its hello carries an 8-byte random instance id and a reconnect
-  flag (for the reconnect rule above), which older hosts reject. Hosts accept both hellos; the Linux viewer and `probe` still send
-  the original 5-byte one.
+- Older and newer versions work together: hosts accept every hello, and every viewer first sends the original 5-byte one. Only a
+  host of this version, which announces that it knows viewer instances, is told the Windows viewer's random 8-byte instance id
+  (in a message right after the hellos, or in the hello of an automatic reconnect). Older hosts get the 5-byte hello, reconnects
+  included, and take it as before, replacing whoever is connected, so the reconnect rule above needs a host of this version. Only
+  if a host is downgraded while a viewer is reconnecting does the first attempt replace that host's viewer and fail ("the host
+  closed the connection without answering the hello"); later attempts leave the instance out.
 - Limiting which devices can reach port 47300 with Tailscale ACLs adds one more layer of safety.
 
 ## Test status
