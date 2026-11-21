@@ -124,16 +124,17 @@ fn download_dir(pull: bool) -> Result<std::path::PathBuf> {
 }
 
 /// The `--set` keys with fewer `State` replies in `states` than settings, and how many are
-/// missing. The host answers every `Set`, and the hello's sound and privacy wishes with one
-/// unasked `State` each, which answers no `Set`.
-fn unanswered(sets: &[(u8, u32)], states: &[(u8, u32)], (audio, privacy): (bool, bool)) -> Vec<(u8, usize)> {
+/// missing. The host answers every `Set`, and with one unasked `State` each, which answers no
+/// `Set`: the quality when the hello left it to a host that says which (`F_QUALITY_STATE`), and
+/// the hello's sound and privacy wishes.
+fn unanswered(sets: &[(u8, u32)], states: &[(u8, u32)], (quality, audio, privacy): (bool, bool, bool)) -> Vec<(u8, usize)> {
     let mut keys: Vec<u8> = sets.iter().map(|s| s.0).collect();
     keys.sort_unstable();
     keys.dedup();
     keys.into_iter()
         .filter_map(|key| {
             let asked = sets.iter().filter(|s| s.0 == key).count();
-            let wished = (key == SET_AUDIO && audio) || (key == SET_PRIVACY && privacy);
+            let wished = (key == SET_QUALITY && quality) || (key == SET_AUDIO && audio) || (key == SET_PRIVACY && privacy);
             let answers = states.iter().filter(|s| s.0 == key).count().saturating_sub(wished as usize);
             (answers < asked).then_some((key, asked - answers))
         })
@@ -258,6 +259,9 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     for (i, m) in conn.monitors.iter().enumerate() {
         println!("  monitor {}: {}x{} at ({}, {})", i + 1, m.width, m.height, m.left, m.top);
     }
+    // A host left to pick the quality says which, unasked, if it is one that announces it
+    // (older hosts do not): that `State` answers no `--set quality`.
+    let announced = conn.flags & F_QUALITY_STATE != 0 && o.viewer.quality as u32 > QUALITY_LOW;
     // Records are read on their own thread with blocking reads (a timeout mid-record would
     // desynchronise the stream); the main loop polls the channel. A few records at most wait
     // in it: while the main loop is busy, the reader stops reading instead of buffering
@@ -297,8 +301,6 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     let mut states: Vec<(u8, u32)> = Vec::new();
     let mut download: Option<Incoming> = None;
     let mut pending_uploads = uploads.len();
-    // The next record is the first after the host's hello.
-    let mut first = true;
 
     for &(key, value) in &o.sets {
         sender.send(ClientMsg::Set { key, value })?;
@@ -348,7 +350,6 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
         };
         let rec = &owned[..];
         bytes += rec.len() as u64 + 20;
-        let after_hello = std::mem::replace(&mut first, false);
         match ServerMsg::decode(rec)? {
             ServerMsg::Tiles(p) => {
                 let hdr = codec::parse_header(p)?;
@@ -374,11 +375,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             ServerMsg::Pong(t) => rtts.push((start.elapsed().as_micros() as u64).saturating_sub(t) as f64 / 1000.0),
             ServerMsg::State { key, value } => {
                 println!("state:       key {key} = {}", if value == STATE_UNAVAILABLE { "unavailable".into() } else { value.to_string() });
-                // A host left to pick the quality says which right after its hello, unasked:
-                // no answer to a `--set quality`.
-                if !(after_hello && key == SET_QUALITY && o.viewer.quality as u32 > QUALITY_LOW) {
-                    states.push((key, value));
-                }
+                states.push((key, value));
             }
             ServerMsg::Notice(t) => println!("notice:      {}", printable(&t)),
             ServerMsg::Audio { .. } => audio_packets += 1,
@@ -424,7 +421,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     if frames == 0 {
         failures.push("no frames received".into());
     }
-    for (key, missing) in unanswered(&o.sets, &states, (o.viewer.audio, o.viewer.privacy)) {
+    for (key, missing) in unanswered(&o.sets, &states, (announced, o.viewer.audio, o.viewer.privacy)) {
         failures.push(format!("no State reply for {missing} --set of setting {key}"));
     }
     if pending_uploads > 0 {
@@ -472,15 +469,21 @@ mod tests {
         let sets = [(SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2)];
         // All answered.
         let states = [(SET_QUALITY, 0), (SET_AUDIO, 1), (SET_QUALITY, 2), (SET_DOWNSCALE, 2)];
-        assert!(unanswered(&sets, &states, (false, false)).is_empty());
+        assert!(unanswered(&sets, &states, (false, false, false)).is_empty());
         // One reply for two settings of a key; nothing at all for another.
         let states = [(SET_QUALITY, 2), (SET_AUDIO, 1)];
-        assert_eq!(unanswered(&sets, &states, (false, false)), [(SET_QUALITY, 1), (SET_DOWNSCALE, 1)]);
+        assert_eq!(unanswered(&sets, &states, (false, false, false)), [(SET_QUALITY, 1), (SET_DOWNSCALE, 1)]);
         // The answer to the hello's sound wish answers no `--set audio`.
         let states = [(SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2)];
-        assert_eq!(unanswered(&sets, &states, (true, false)), [(SET_AUDIO, 1)]);
+        assert_eq!(unanswered(&sets, &states, (false, true, false)), [(SET_AUDIO, 1)]);
         let states = [(SET_AUDIO, 1), (SET_QUALITY, 0), (SET_QUALITY, 2), (SET_AUDIO, 1), (SET_DOWNSCALE, 2), (SET_PRIVACY, 0)];
-        assert!(unanswered(&sets, &states, (true, true)).is_empty());
+        assert!(unanswered(&sets, &states, (false, true, true)).is_empty());
+        // Nor does a host's quality announcement answer a `--set quality`, wherever it comes; from a
+        // host that makes none, the first `State` after the hello may well be the answer.
+        let sets = [(SET_QUALITY, 0)];
+        assert_eq!(unanswered(&sets, &[(SET_QUALITY, 1)], (true, false, false)), [(SET_QUALITY, 1)]);
+        assert!(unanswered(&sets, &[(SET_QUALITY, 0), (SET_QUALITY, 1)], (true, false, false)).is_empty());
+        assert!(unanswered(&sets, &[(SET_QUALITY, 0)], (false, false, false)).is_empty());
     }
 
     const KEY: [u8; 32] = [0x3c; 32];
@@ -562,6 +565,71 @@ mod tests {
         r.unwrap();
         assert!(took < Duration::from_secs(15), "the uploads took {took:?}");
         assert_eq!(host.join().unwrap(), 2);
+    }
+
+    /// A host that answers every `Set` with the value asked for (if `answer`), then sends its first
+    /// frame, and pings all the while, so that it notices when the probe has gone. One with
+    /// `F_QUALITY_STATE` announces the quality right after its hello, as such hosts do for a hello
+    /// that leaves it to them; an older one does not, so the answer comes first.
+    fn settings_host(l: std::net::TcpListener, flags: u32, answer: bool) {
+        use crate::channel::{RecordReader, RecordWriter, server_handshake};
+        let (mut s, _) = l.accept().unwrap();
+        let keys = server_handshake(&mut s, &KEY).unwrap();
+        let w = Arc::new(Mutex::new(RecordWriter::new(s.try_clone().unwrap(), keys.send)));
+        let send = |w: &Mutex<RecordWriter<std::net::TcpStream>>, m: ServerMsg| {
+            let mut b = Vec::new();
+            m.encode(&mut b);
+            w.lock().unwrap().send(&b)
+        };
+        let mut r = RecordReader::new(s, keys.recv);
+        assert!(matches!(ClientMsg::decode(r.recv().unwrap()).unwrap(), ClientMsg::Hello { quality: QUALITY_DEFAULT, .. }));
+        send(&w, ServerMsg::Hello { width: 64, height: 64, flags, monitor: 0, monitors: vec![], name: "linux-host".into() }).unwrap();
+        if flags & F_QUALITY_STATE != 0 {
+            send(&w, ServerMsg::State { key: SET_QUALITY, value: QUALITY_BALANCED }).unwrap();
+        }
+        let pinger = {
+            let w = w.clone();
+            std::thread::spawn(move || {
+                while send(&w, ServerMsg::Ping).is_ok() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let mut framed = false;
+        while let Ok(rec) = r.recv() {
+            if let ClientMsg::Set { key, value } = ClientMsg::decode(rec).unwrap() {
+                if answer {
+                    send(&w, ServerMsg::State { key, value }).unwrap();
+                }
+                if !std::mem::replace(&mut framed, true) {
+                    let rects = codec::Encoder::new().unwrap().encode(&[0; 64 * 64 * 4], 64, 64);
+                    for m in codec::pack(1, 64, 64, &rects) {
+                        w.lock().unwrap().send(&m).unwrap();
+                    }
+                }
+            }
+        }
+        drop(r);
+        pinger.join().unwrap();
+    }
+
+    #[test]
+    fn a_set_quality_is_answered_by_hosts_with_and_without_the_announcement() {
+        let probe = |flags, answer| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let host = std::thread::spawn(move || settings_host(l, flags, answer));
+            let o = ProbeOptions { seconds: 0.3, sets: vec![(SET_QUALITY, QUALITY_LOSSLESS)], ..ProbeOptions::default() };
+            let r = run(&addr.to_string(), o, Secret(KEY));
+            host.join().unwrap();
+            r
+        };
+        // An older host's answer is the first record after its hello, and it counts.
+        probe(F_FILES, true).unwrap();
+        // A newer host's announcement comes first, and does not count.
+        probe(F_FILES | F_QUALITY_STATE, true).unwrap();
+        let e = probe(F_FILES | F_QUALITY_STATE, false).unwrap_err();
+        assert_eq!(e.to_string(), "1 check(s) failed");
     }
 
     #[test]

@@ -35,11 +35,16 @@ pub struct ViewerOptions {
     /// Ask the host to blank its screen and block local input while connected.
     pub privacy: bool,
     /// Identifies a viewer that reconnects automatically to the host, the same for all its
-    /// connections (`new_instance`); 0 for a viewer that never does.
+    /// connections (`new_instance`); 0 for a viewer that never does. Only a host that announces
+    /// `F_INSTANCE` learns it (an older one ends the session on it, after replacing its viewer):
+    /// `connect` names the session after the hellos, unless `instance_in_hello`.
     pub instance: u64,
     /// This connection is an automatic reconnect: the host lets it take over only a session of
     /// the same `instance`, and turns it away while another viewer's session is live.
     pub reconnect: bool,
+    /// The hello carries `instance`, so that a reconnect can take back its own session: only
+    /// for a host that announced `F_INSTANCE` (see `HELLO_UNANSWERED`).
+    pub instance_in_hello: bool,
 }
 
 impl Default for ViewerOptions {
@@ -56,6 +61,7 @@ impl Default for ViewerOptions {
             privacy: false,
             instance: 0,
             reconnect: false,
+            instance_in_hello: false,
         }
     }
 }
@@ -70,6 +76,11 @@ pub fn new_instance() -> Result<u64> {
 /// Start of the error for a connection the host turned away (an automatic reconnect while
 /// another viewer's session is live); the host's reason follows. Trying again would not help.
 pub const REFUSED: &str = "refused by the host: ";
+
+/// Error for a connection the host closed without answering a hello that carried the instance
+/// (`ViewerOptions::instance_in_hello`). A host from before `F_INSTANCE` does that (one may have
+/// taken the place of the host that announced it): the next attempt should leave the instance out.
+pub const HELLO_UNANSWERED: &str = "the host closed the connection without answering the hello";
 
 /// Largest remote screen accepted (64 Mpx, 256 MiB as BGRA), bounding what a host can make a
 /// viewer allocate and scan.
@@ -148,10 +159,14 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
     if opts.reconnect {
         flags |= HELLO_RECONNECT;
     }
-    let instance = opts.instance;
+    let instance = if opts.instance_in_hello { opts.instance } else { 0 };
     ClientMsg::Hello { downscale: opts.downscale, quality: opts.quality, monitor: opts.monitor, flags, instance }.encode(&mut hello);
     writer.send(&hello)?;
-    let (width, height, flags, monitor, monitors, host_name) = match ServerMsg::decode(reader.recv()?)? {
+    let first = reader.recv().map_err(|e| match e.to_string().as_str() {
+        channel::CLOSED if instance != 0 => Error::msg(HELLO_UNANSWERED),
+        _ => e,
+    })?;
+    let (width, height, flags, monitor, monitors, host_name) = match ServerMsg::decode(first)? {
         ServerMsg::Hello { width, height, flags, monitor, monitors, name } => {
             (width as usize, height as usize, flags, monitor, monitors, printable(&name))
         }
@@ -160,6 +175,11 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
         _ => bail!("unexpected first message from host"),
     };
     check_screen_size(width, height)?;
+    if opts.instance != 0 && instance == 0 && flags & F_INSTANCE != 0 {
+        let mut named = Vec::new();
+        ClientMsg::Instance(opts.instance).encode(&mut named);
+        writer.send(&named)?;
+    }
     log!("connected to {host_name}: remote screen {width}x{height}");
     Ok(Connection { host_name, monitors, monitor, addr, stream, reader, writer, width, height, flags })
 }
@@ -875,6 +895,81 @@ mod tests {
         assert!(!retryable(&format!("{REFUSED}another viewer is using this host").into()));
         let ids: Vec<u64> = (0..4).map(|_| new_instance().unwrap()).collect();
         assert!(ids.iter().all(|&i| i != 0) && ids.windows(2).all(|w| w[0] != w[1]), "{ids:?}");
+    }
+
+    const KEY: [u8; 32] = [0x6b; 32];
+
+    /// A host for one connection, on a port the system picks: it answers the viewer's hello
+    /// with its own, announcing `flags`, if `takes` the hello, and otherwise closes the
+    /// connection as a host that cannot decode it does. Returns what the viewer sent.
+    fn one_connection(flags: u32, takes: fn(&[u8]) -> bool) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let host = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let keys = channel::server_handshake(&mut s, &KEY).unwrap();
+            let mut r = RecordReader::new(s.try_clone().unwrap(), keys.recv);
+            let mut seen = vec![r.recv().unwrap().to_vec()];
+            if takes(&seen[0]) {
+                let mut b = Vec::new();
+                ServerMsg::Hello { width: 64, height: 48, flags, monitor: 0, monitors: vec![], name: "linux-host".into() }.encode(&mut b);
+                RecordWriter::new(s, keys.send).send(&b).unwrap();
+                while let Ok(rec) = r.recv() {
+                    seen.push(rec.to_vec());
+                }
+            }
+            seen
+        });
+        (addr, host)
+    }
+
+    /// The viewer's records to a host announcing `flags` that `takes` its hello, and how its
+    /// `connect` ended.
+    fn exchange(flags: u32, takes: fn(&[u8]) -> bool, o: ViewerOptions) -> (Vec<Vec<u8>>, Result<()>) {
+        let (addr, host) = one_connection(flags, takes);
+        let r = connect(&addr, &o, &Secret(KEY)).map(drop);
+        (host.join().unwrap(), r)
+    }
+
+    #[test]
+    fn instances_go_only_to_hosts_that_take_them() {
+        // A host of the published version decodes exactly five bytes, after replacing its
+        // viewer; a newer one takes either hello and the instance message.
+        let older: fn(&[u8]) -> bool = |h| h.len() == 5;
+        let newer: fn(&[u8]) -> bool = |h| ClientMsg::decode(h).is_ok();
+        let hello = |flags| vec![C_HELLO, 1, QUALITY_DEFAULT, MONITOR_DEFAULT, flags];
+        let mut named = Vec::new();
+        ClientMsg::Instance(9).encode(&mut named);
+        let first = || ViewerOptions { instance: 9, ..ViewerOptions::default() };
+        let reconnect = |instance_in_hello| ViewerOptions { instance: 9, reconnect: true, instance_in_hello, ..ViewerOptions::default() };
+
+        // An older host gets the five bytes it takes, also from a viewer that has an instance.
+        let (seen, r) = exchange(F_FILES, older, first());
+        assert!(r.is_ok() && seen == [hello(0)], "{seen:?}");
+        let (seen, r) = exchange(F_FILES, older, reconnect(false));
+        assert!(r.is_ok() && seen == [hello(HELLO_RECONNECT)], "{seen:?}");
+        // One that has taken the place of a newer host rejects the instance: the error says so,
+        // and the next attempt leaves it out.
+        let (seen, r) = exchange(F_FILES, older, reconnect(true));
+        let e = r.unwrap_err();
+        assert!(e.to_string() == HELLO_UNANSWERED && retryable(&e), "{e}");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 13);
+
+        // A newer host is told the instance after the hellos, or in a reconnect's hello.
+        let (seen, r) = exchange(F_FILES | F_INSTANCE, newer, first());
+        assert!(r.is_ok() && seen == [hello(0), named], "{seen:?}");
+        let (seen, r) = exchange(F_FILES | F_INSTANCE, newer, reconnect(true));
+        assert!(r.is_ok() && seen.len() == 1, "{seen:?}");
+        let want =
+            ClientMsg::Hello { downscale: 1, quality: QUALITY_DEFAULT, monitor: MONITOR_DEFAULT, flags: HELLO_RECONNECT, instance: 9 };
+        assert_eq!(ClientMsg::decode(&seen[0]).unwrap(), want);
+        // A viewer without an instance (Linux viewer, probe) names nothing.
+        let (seen, r) = exchange(F_FILES | F_INSTANCE, newer, ViewerOptions::default());
+        assert!(r.is_ok() && seen == [hello(0)], "{seen:?}");
+        // And a five-byte hello closed unanswered is an ordinary close.
+        let (_, r) = exchange(F_FILES, |_| false, first());
+        assert_eq!(r.unwrap_err().to_string(), channel::CLOSED);
     }
 
     #[test]
