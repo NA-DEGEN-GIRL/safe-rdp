@@ -14,11 +14,16 @@
 //!   the window that receives the event only ever see used tags. A program whose own low-level
 //!   hook runs before ours (Windows calls the most recently installed first), or that watches
 //!   during a moment when Windows has dropped our hook, can still see an unused tag and replay
-//!   it, once, with input of its own. On layouts with AltGr, Windows adds a Left Ctrl of its
-//!   own, untagged, in front of every Right Alt press and release; one such Ctrl passes for
-//!   each Right Alt we injected that the hooks have not seen yet. Windows silently drops a
-//!   low-level hook that once misses its time limit, so the hooks are re-installed every few
-//!   seconds. Only one privacy mode per process can hold the hooks.
+//!   it, once, with input of its own. Windows also adds keys of its own, untagged, to some of
+//!   ours: on layouts with AltGr a Left Ctrl in front of every Right Alt press and release, and
+//!   with Num Lock on a release of the Shift held down in front of a numpad key and a press
+//!   after it (so that Shift+Numpad7 is a plain Home; that Shift may not even be marked injected).
+//!   One such key passes for each Right Alt, or numpad key while we hold that Shift, that our
+//!   SendInput call is delivering: the hooks run within the call, and a margin of a fraction of
+//!   a second after it returns covers one that runs late. A Right Alt's Ctrl also stops passing
+//!   once the hooks have seen the Right Alt. Windows silently drops a low-level hook that once
+//!   misses its time limit, so the hooks are re-installed every few seconds. Only one privacy
+//!   mode per process can hold the hooks.
 //!
 //! Everything lives on one thread with its own message loop. Dropping `Privacy` removes the
 //! hooks and windows before it returns; if the thread or the process dies, Windows removes
@@ -38,7 +43,7 @@
 //! running as SYSTEM, has no such gap. Needs Windows 10 version 2004 (build 19041) or later for
 //! `WDA_EXCLUDEFROMCAPTURE`.
 
-use super::input::{arm, take_altgr_ctrl, take_tag};
+use super::input::{arm, take_altgr_ctrl, take_numpad_shift, take_tag};
 use crate::bail;
 use crate::screen::Area;
 use crate::util::{Error, Result, wide};
@@ -53,7 +58,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_LSHIFT, VK_RSHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -404,14 +409,28 @@ fn passes(injected: bool, extra_info: usize) -> bool {
 /// The scancode of the Left Ctrl that Windows adds to AltGr: Left Ctrl's 0x1D with the 0x200
 /// it marks the keys it simulates with.
 const ALTGR_CTRL_SCAN: u32 = 0x21d;
+/// Likewise the scancodes of the Left and Right Shift it lets go of and presses again around a
+/// numpad key.
+const NUMPAD_LSHIFT_SCAN: u32 = 0x22a;
+const NUMPAD_RSHIFT_SCAN: u32 = 0x236;
 
-/// `passes` for a keyboard event, which also lets through the Left Ctrl that Windows adds in
-/// front of a Right Alt we injected while the layout has AltGr: it comes with no `dwExtraInfo`
-/// of its own, and without it AltGr would arrive as plain Alt.
+/// `passes` for a keyboard event, which also lets through the keys that Windows adds to ours
+/// (see the module notes), which come with no `dwExtraInfo` of their own. Without the Left
+/// Ctrl, AltGr would arrive as plain Alt; without the Shift, Shift+Numpad7 as Shift+Home.
 fn key_passes(k: &KBDLLHOOKSTRUCT) -> bool {
     let injected = k.flags & LLKHF_INJECTED != 0;
     passes(injected, k.dwExtraInfo)
         || (injected && k.dwExtraInfo == 0 && k.vkCode == VK_LCONTROL as u32 && k.scanCode == ALTGR_CTRL_SCAN && take_altgr_ctrl())
+        || (k.dwExtraInfo == 0 && numpad_shift(k).is_some_and(take_numpad_shift))
+}
+
+/// Whether `k` is a Left (false) or Right (true) Shift as Windows adds it around a numpad key.
+fn numpad_shift(k: &KBDLLHOOKSTRUCT) -> Option<bool> {
+    match k.scanCode {
+        NUMPAD_LSHIFT_SCAN if k.vkCode == VK_LSHIFT as u32 => Some(false),
+        NUMPAD_RSHIFT_SCAN if k.vkCode == VK_RSHIFT as u32 => Some(true),
+        _ => None,
+    }
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -605,6 +624,42 @@ mod tests {
         let a = new_tag();
         assert!(!key_passes(&ctrl));
         assert!(key_passes(&key(0x41, 0x1e, LLKHF_INJECTED, a)));
+        // A Right Alt the hooks never saw (an elevated window had the focus) brings one only
+        // until shortly after our SendInput call.
+        let missed = super::super::input::new_right_alt_tag();
+        super::super::input::sent_for_test(missed, Duration::from_secs(1));
+        assert!(!key_passes(&ctrl), "outlived its SendInput call");
+    }
+
+    #[test]
+    fn windows_own_shift_around_a_numpad_key_passes_while_we_hold_that_shift() {
+        use super::super::input::{new_numpad_tag, sent_for_test};
+        let _armed = super::super::input::armed_for_test();
+        let key = |vk: u16, scan: u32, flags: u32, tag: usize| KBDLLHOOKSTRUCT { vkCode: vk as u32, scanCode: scan, flags, time: 0, dwExtraInfo: tag };
+        // Not marked injected, as Windows may add them even to injected numpad keys.
+        let lshift_up = key(VK_LSHIFT, NUMPAD_LSHIFT_SCAN, LLKHF_UP, 0);
+        let rshift_up = key(VK_RSHIFT, NUMPAD_RSHIFT_SCAN, LLKHF_EXTENDED | LLKHF_UP, 0);
+        assert!(!key_passes(&lshift_up), "no numpad key of ours on its way");
+        let down = new_numpad_tag(false);
+        assert!(!key_passes(&rshift_up), "not the Shift we hold");
+        assert!(!key_passes(&key(VK_LSHIFT, 0x2a, LLKHF_UP, 0)), "the host's own Left Shift");
+        assert!(!key_passes(&key(VK_LSHIFT, NUMPAD_LSHIFT_SCAN, LLKHF_UP, 0x5a5a)), "with another tag");
+        assert!(!key_passes(&key(VK_RSHIFT, NUMPAD_LSHIFT_SCAN, LLKHF_UP, 0)));
+        assert!(key_passes(&lshift_up));
+        assert!(!key_passes(&lshift_up), "two for one numpad key");
+        assert!(key_passes(&key(VK_HOME, 0x47, LLKHF_INJECTED, down)));
+        // The press comes after the numpad key's release; marked injected or not.
+        let up = new_numpad_tag(false);
+        assert!(key_passes(&key(VK_HOME, 0x47, LLKHF_INJECTED | LLKHF_UP, up)));
+        assert!(key_passes(&key(VK_LSHIFT, NUMPAD_LSHIFT_SCAN, LLKHF_INJECTED, 0)));
+        assert!(!key_passes(&key(VK_LSHIFT, NUMPAD_LSHIFT_SCAN, 0, 0)));
+        let right = new_numpad_tag(true);
+        assert!(key_passes(&rshift_up));
+        assert!(key_passes(&key(VK_HOME, 0x47, LLKHF_INJECTED, right)));
+        // Only until shortly after our SendInput call.
+        let late = new_numpad_tag(true);
+        sent_for_test(late, Duration::from_secs(1));
+        assert!(!key_passes(&rshift_up), "outlived its SendInput call");
     }
 
     #[test]
