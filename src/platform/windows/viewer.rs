@@ -97,6 +97,7 @@ struct Framebuffer {
     h: usize,
     px: LockedBuf,
     dirty: Option<Rect>,
+    resizes: core::ResizePacer,
 }
 
 struct Saved {
@@ -110,12 +111,15 @@ unsafe impl Send for Saved {}
 /// Process-wide viewer state shared by the UI thread, the keyboard hook and session threads.
 struct App {
     hwnd: AtomicUsize,
-    fb: Mutex<Framebuffer>,
+    fb: core::FrameLock<Framebuffer>,
     fb_w: AtomicU32,
     fb_h: AtomicU32,
     /// Height of the docked bar above the remote image (0 in full screen).
     top: AtomicI32,
     cursor: AtomicU8,
+    /// A WM_APP_FRAME / WM_APP_CURSOR is waiting (see `post_once`).
+    frame_posted: AtomicBool,
+    cursor_posted: AtomicBool,
     hook_active: AtomicBool,
     mods: AtomicU8,
     swallowed: Mutex<HashSet<u16>>,
@@ -161,6 +165,25 @@ impl App {
         if enqueue(&mut lock(&self.events), ev) {
             unsafe { PostMessageW(self.hwnd(), WM_APP_EVENT, 0, 0) };
         }
+    }
+
+    /// The framebuffer, locked on the UI thread / on a session's reader (`core::FrameLock`).
+    fn ui_fb(&self) -> MutexGuard<'_, Framebuffer> {
+        self.fb.ui().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn reader_fb(&self) -> MutexGuard<'_, Framebuffer> {
+        self.fb.reader().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Posts `msg` unless one is still waiting (`pending`, which its handler clears before doing
+/// the work). Wakeups the host triggers go through here, so however fast it sends, at most
+/// one of each kind waits: the queue never fills up (posts would then fail, including the
+/// viewer's own), and the message loop lets input go between them (`next_message`).
+fn post_once(hwnd: HWND, pending: &AtomicBool, msg: u32) {
+    if !pending.swap(true, Ordering::SeqCst) && unsafe { PostMessageW(hwnd, msg, 0, 0) } == 0 {
+        pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -256,7 +279,9 @@ impl Session {
     }
 
     fn send(&self, m: ClientMsg) {
-        self.out.send(m);
+        if !self.out.send(m) && self.out.stalled() {
+            self.end(EndKind::Network, core::STALLED.into());
+        }
     }
 
     fn is_ended(&self) -> bool {
@@ -493,11 +518,19 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
     }
     let app = App {
         hwnd: AtomicUsize::new(0),
-        fb: Mutex::new(Framebuffer { w, h, px: LockedBuf::new(w * h * 4), dirty: None }),
+        fb: core::FrameLock::new(Framebuffer {
+            w,
+            h,
+            px: LockedBuf::new(w * h * 4),
+            dirty: None,
+            resizes: core::ResizePacer::new(Instant::now()),
+        }),
         fb_w: AtomicU32::new(w as u32),
         fb_h: AtomicU32::new(h as u32),
         top: AtomicI32::new(0),
         cursor: AtomicU8::new(Cursor::Arrow as u8),
+        frame_posted: AtomicBool::new(false),
+        cursor_posted: AtomicBool::new(false),
         hook_active: AtomicBool::new(false),
         mods: AtomicU8::new(0),
         swallowed: Mutex::new(HashSet::new()),
@@ -586,7 +619,9 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
 
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+        let mut after_host = false;
+        while next_message(&mut msg, after_host) {
+            after_host = host_triggered(&msg, hwnd);
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -601,10 +636,33 @@ fn run_window(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> 
     // Pending reconnect results hold live connections: close them.
     lock(&app.events).clear();
     // Wipe the remote screen contents before exiting.
-    lock(&app.fb).px = LockedBuf::new(0);
+    app.ui_fb().px = LockedBuf::new(0);
     match ui.and_then(|u| u.exit_error) {
         Some(e) => Err(e.into()),
         None => Ok(()),
+    }
+}
+
+/// Messages posted for the host: frames, cursor shapes and events.
+fn host_triggered(msg: &MSG, hwnd: HWND) -> bool {
+    msg.hwnd == hwnd && matches!(msg.message, WM_APP_FRAME | WM_APP_CURSOR | WM_APP_EVENT)
+}
+
+/// The next message for the loop in `run_window`; false at WM_QUIT. GetMessage returns
+/// posted messages before input, timers and paint. At most one of each kind the host triggers
+/// waits (`post_once`), but a host that sends fast enough posts the next one while this thread
+/// handles the last, so one would always be waiting: input, the tick and repaints would never
+/// get a turn. After such a message, waiting input, then a due timer, then a repaint go first.
+unsafe fn next_message(msg: &mut MSG, after_host: bool) -> bool {
+    unsafe {
+        if after_host
+            && (PeekMessageW(msg, null_mut(), 0, 0, PM_REMOVE | PM_QS_INPUT) != 0
+                || PeekMessageW(msg, null_mut(), WM_TIMER, WM_TIMER, PM_REMOVE) != 0
+                || PeekMessageW(msg, null_mut(), 0, 0, PM_REMOVE | PM_QS_PAINT) != 0)
+        {
+            return msg.message != WM_QUIT;
+        }
+        GetMessageW(msg, null_mut(), 0, 0) > 0
     }
 }
 
@@ -674,8 +732,10 @@ fn read_session(
                 }
             }
             ServerMsg::Cursor(c) => {
-                app.cursor.store(c as u8, Ordering::SeqCst);
-                unsafe { PostMessageW(app.hwnd(), WM_APP_CURSOR, 0, 0) };
+                // Only a new shape needs a wakeup; WM_SETCURSOR shows the latest on every move.
+                if app.cursor.swap(c as u8, Ordering::SeqCst) != c as u8 {
+                    post_once(app.hwnd(), &app.cursor_posted, WM_APP_CURSOR);
+                }
             }
             ServerMsg::Clipboard(t) => {
                 if let Some(c) = lock(&s.clipboard).as_ref() {
@@ -708,15 +768,31 @@ fn read_session(
 /// Applies one tiles message of session `s`; returns true when it completed a frame.
 fn apply_tiles(app: &App, s: &Session, dec: &mut Decoder, p: &[u8]) -> Result<bool> {
     let hdr = codec::parse_header(p)?;
-    let mut fb = lock(&app.fb);
-    if (hdr.width, hdr.height) != (fb.w, fb.h) {
+    let size = (hdr.width, hdr.height);
+    // A new size gets its buffer allocated and page-locked, and the old one wiped (up to
+    // 256 MiB each), outside the lock: under it only the buffers are swapped, so the UI thread
+    // never waits for either. Declared before `fb`, so even an early return drops them after
+    // the lock is released.
+    let (mut fresh, mut old) = (None, None);
+    let mut fb = loop {
+        let mut fb = app.reader_fb();
+        if (fb.w, fb.h) == size || fresh.is_some() {
+            break fb;
+        }
         if hdr.width * hdr.height > MAX_PIXELS {
             bail!("remote screen {}x{} is too large", hdr.width, hdr.height);
         }
+        let wait = fb.resizes.wait(Instant::now());
+        drop(fb);
+        std::thread::sleep(wait);
+        fresh = Some(LockedBuf::new(hdr.width * hdr.height * 4));
+    };
+    if (fb.w, fb.h) != size
+        && let Some(px) = fresh.take()
+    {
         log!("remote screen is now {}x{}", hdr.width, hdr.height);
-        fb.px = LockedBuf::new(hdr.width * hdr.height * 4);
-        fb.w = hdr.width;
-        fb.h = hdr.height;
+        old = Some(std::mem::replace(&mut fb.px, px));
+        (fb.w, fb.h) = size;
         fb.dirty = Some(Rect { x: 0, y: 0, w: fb.w, h: fb.h });
         app.fb_w.store(fb.w as u32, Ordering::SeqCst);
         app.fb_h.store(fb.h as u32, Ordering::SeqCst);
@@ -736,8 +812,10 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut Decoder, p: &[u8]) -> Result<bo
     if hdr.last {
         // Acked on this session's own queue: never on a newer session after a reconnect.
         s.send(ClientMsg::Ack(hdr.frame));
-        unsafe { PostMessageW(app.hwnd(), WM_APP_FRAME, 0, 0) };
+        post_once(app.hwnd(), &app.frame_posted, WM_APP_FRAME);
     }
+    // A replaced (or unneeded) buffer is wiped only now: lock released, frame on its way.
+    drop((old, fresh));
     Ok(hdr.last)
 }
 
@@ -1564,7 +1642,7 @@ fn start_clipboard(s: &Arc<Session>) {
 /// Darkens the last frame (shown while reconnecting).
 fn dim_framebuffer() {
     let app = APP.get().unwrap();
-    dim(lock(&app.fb).px.as_mut_slice());
+    dim(app.ui_fb().px.as_mut_slice());
     unsafe { InvalidateRect(app.hwnd(), null(), 0) };
 }
 
@@ -1832,7 +1910,7 @@ fn paint(hwnd: HWND) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let (cw, ch) = client_size(hwnd);
         let top = app.top.load(Ordering::SeqCst).clamp(0, ch.max(0));
-        let fb = lock(&app.fb);
+        let fb = app.ui_fb();
         let (fw, fh) = (fb.w as i32, fb.h as i32);
         let d = image_rect(hwnd, fw, fh);
         let black = GetStockObject(BLACK_BRUSH);
@@ -1876,7 +1954,7 @@ fn paint(hwnd: HWND) {
 fn invalidate_dirty(hwnd: HWND) {
     let app = APP.get().unwrap();
     let (dirty, fw, fh) = {
-        let mut fb = lock(&app.fb);
+        let mut fb = app.ui_fb();
         (fb.dirty.take(), fb.w as i64, fb.h as i64)
     };
     let Some(r) = dirty else { return };
@@ -2099,6 +2177,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             WM_ERASEBKGND => 1,
             WM_APP_FRAME => {
+                app.frame_posted.store(false, Ordering::SeqCst);
                 invalidate_dirty(hwnd);
                 0
             }
@@ -2150,6 +2229,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 0
             }
             WM_APP_CURSOR => {
+                app.cursor_posted.store(false, Ordering::SeqCst);
                 if cursor_inside(hwnd) {
                     SetCursor(cursor_handle(app.cursor.load(Ordering::SeqCst)));
                 }
@@ -2416,6 +2496,52 @@ mod tests {
             Event::Ended { generation: 1, kind: EndKind::Closed, reason: String::new(), lifetime: Duration::ZERO, since_notice: None };
         assert!(enqueue(&mut q, ended));
         assert_eq!(q.len(), MAX_EVENTS + 2);
+    }
+
+    /// Posted to a null window, messages go to this test thread's own queue (no window).
+    #[test]
+    fn host_wakeups_wait_once_and_let_timers_in() {
+        let take = |kind: u32| {
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            let mut n = 0;
+            while unsafe { PeekMessageW(&mut msg, null_mut(), kind, kind, PM_REMOVE) } != 0 {
+                n += 1;
+            }
+            n
+        };
+        take(WM_APP_FRAME); // creates the queue
+        let pending = AtomicBool::new(false);
+        for _ in 0..10_000 {
+            post_once(null_mut(), &pending, WM_APP_FRAME);
+        }
+        assert_eq!(take(WM_APP_FRAME), 1);
+        // Until the handler clears the flag, nothing more is posted; then the next one is.
+        post_once(null_mut(), &pending, WM_APP_FRAME);
+        assert_eq!(take(WM_APP_FRAME), 0);
+        pending.store(false, Ordering::SeqCst);
+        post_once(null_mut(), &pending, WM_APP_FRAME);
+        post_once(null_mut(), &pending, WM_APP_FRAME);
+        assert_eq!(take(WM_APP_FRAME), 1);
+
+        // A due timer and two posted wakeups: GetMessage alone returns the posts first; right
+        // after a host-triggered message, the timer goes first.
+        let timer = unsafe { SetTimer(null_mut(), 0, 10, None) };
+        assert_ne!(timer, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..2 {
+            unsafe { PostMessageW(null_mut(), WM_APP_FRAME, 0, 0) };
+        }
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        assert!(unsafe { next_message(&mut msg, false) });
+        assert_eq!(msg.message, WM_APP_FRAME);
+        assert!(host_triggered(&msg, null_mut()) && !host_triggered(&msg, std::ptr::dangling_mut()));
+        assert!(unsafe { next_message(&mut msg, true) });
+        assert_eq!(msg.message, WM_TIMER);
+        assert!(!host_triggered(&msg, null_mut()));
+        assert!(unsafe { next_message(&mut msg, false) });
+        assert_eq!(msg.message, WM_APP_FRAME);
+        unsafe { KillTimer(null_mut(), timer) };
+        take(WM_TIMER);
     }
 
     #[test]

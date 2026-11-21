@@ -15,12 +15,12 @@ use crate::codec::{self, Decoder, Rect};
 use crate::log;
 use crate::proto::*;
 use crate::util::{Result, Secret};
-use crate::viewer::ViewerOptions;
+use crate::viewer::{FrameLock, Next, OutQueue, ResizePacer, ViewerOptions};
 use std::collections::HashSet;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Mutex, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 const XK_HANGUL: u32 = 0xff31;
 const XK_HANGUL_HANJA: u32 = 0xff34;
@@ -62,11 +62,12 @@ struct Framebuffer {
     dirty: Option<Rect>,
     /// The remote size changed: everything must be rescaled.
     resized: bool,
+    resizes: ResizePacer,
 }
 
 /// State shared between the network thread and the window thread.
 struct Shared {
-    fb: Mutex<Framebuffer>,
+    fb: FrameLock<Framebuffer>,
     cursor: AtomicU8,
     cursor_changed: AtomicBool,
     closed: Mutex<Option<String>>,
@@ -75,8 +76,9 @@ struct Shared {
 
 impl Shared {
     fn new(w: usize, h: usize, waker: Waker) -> Shared {
+        let fb = Framebuffer { w, h, px: LockedBuf::new(w * h * 4), dirty: None, resized: true, resizes: ResizePacer::new(Instant::now()) };
         Shared {
-            fb: Mutex::new(Framebuffer { w, h, px: LockedBuf::new(w * h * 4), dirty: None, resized: true }),
+            fb: FrameLock::new(fb),
             cursor: AtomicU8::new(Cursor::Arrow as u8),
             cursor_changed: AtomicBool::new(false),
             closed: Mutex::new(None),
@@ -91,6 +93,15 @@ impl Shared {
         }
         drop(c);
         self.waker.wake();
+    }
+
+    /// The framebuffer, locked on the window thread / on the network thread (`FrameLock`).
+    fn ui_fb(&self) -> MutexGuard<'_, Framebuffer> {
+        self.fb.ui().unwrap()
+    }
+
+    fn reader_fb(&self) -> MutexGuard<'_, Framebuffer> {
+        self.fb.reader().unwrap()
     }
 }
 
@@ -134,12 +145,28 @@ fn on_server_msg(
     match msg {
         ServerMsg::Tiles(p) => {
             let hdr = codec::parse_header(p)?;
-            let mut fb = shared.fb.lock().unwrap();
-            if (hdr.width, hdr.height) != (fb.w, fb.h) {
+            let size = (hdr.width, hdr.height);
+            // A new size gets its buffer allocated and locked, and the old one wiped, outside
+            // the lock `present` takes; under it only the buffers are swapped. Declared before
+            // `fb`, so even an early return drops them after the lock is released.
+            let (mut fresh, mut old) = (None, None);
+            let mut fb = loop {
+                let mut fb = shared.reader_fb();
+                if (fb.w, fb.h) == size || fresh.is_some() {
+                    break fb;
+                }
                 check_size(hdr.width, hdr.height)?;
+                let wait = fb.resizes.wait(Instant::now());
+                drop(fb);
+                std::thread::sleep(wait);
+                fresh = Some(LockedBuf::new(hdr.width * hdr.height * 4));
+            };
+            if (fb.w, fb.h) != size
+                && let Some(px) = fresh.take()
+            {
                 log!("remote screen is now {}x{}", hdr.width, hdr.height);
-                fb.px = LockedBuf::new(hdr.width * hdr.height * 4);
-                (fb.w, fb.h) = (hdr.width, hdr.height);
+                old = Some(std::mem::replace(&mut fb.px, px));
+                (fb.w, fb.h) = size;
                 fb.resized = true;
             }
             let (fw, fh) = (fb.w, fb.h);
@@ -149,6 +176,10 @@ fn on_server_msg(
             drop(fb);
             if hdr.last {
                 shared.waker.wake();
+            }
+            // A replaced (or unneeded) buffer is wiped only now: lock released, window woken.
+            drop((old, fresh));
+            if hdr.last {
                 return Ok(Some(ClientMsg::Ack(hdr.frame)));
             }
         }
@@ -181,7 +212,7 @@ fn on_server_msg(
 fn net_loop(
     reader: &mut RecordReader<TcpStream>,
     shared: &Shared,
-    out: &mpsc::Sender<ClientMsg>,
+    out: &OutQueue,
     clip: Option<&Clipboard>,
     mut sound: Option<Sound>,
 ) -> Result<()> {
@@ -487,7 +518,7 @@ impl View {
 
     /// Brings the window up to date with the framebuffer.
     fn present(&mut self, shared: &Shared) -> Result<()> {
-        let mut fb = shared.fb.lock().unwrap();
+        let mut fb = shared.ui_fb();
         let resized = std::mem::take(&mut fb.resized);
         let full = self.layout(fb.w, fb.h)? || resized;
         let dirty = fb.dirty.take();
@@ -584,7 +615,7 @@ impl View {
 /// Keyboard, mouse and window-event handling on top of the view.
 struct Ui {
     view: View,
-    out: mpsc::Sender<ClientMsg>,
+    out: Arc<OutQueue>,
     view_only: bool,
     sas: bool,
     /// Local Ctrl/Alt keys held (evdev codes).
@@ -600,7 +631,7 @@ struct Ui {
 }
 
 impl Ui {
-    fn new(view: View, out: mpsc::Sender<ClientMsg>, view_only: bool, sas: bool) -> Result<Ui> {
+    fn new(view: View, out: Arc<OutQueue>, view_only: bool, sas: bool) -> Result<Ui> {
         let mut ui = Ui {
             view,
             out,
@@ -813,6 +844,9 @@ impl Ui {
     fn run(&mut self, shared: &Shared, wake: &Wake) -> Result<()> {
         loop {
             self.pump()?;
+            if self.closed.is_none() && self.out.stalled() {
+                self.closed = Some(crate::viewer::STALLED.into());
+            }
             if self.closed.is_some() || shared.closed.lock().unwrap().is_some() {
                 return Ok(());
             }
@@ -851,16 +885,19 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
 
     let wake = Wake::new()?;
     let shared = Shared::new(w, h, wake.waker()?);
-    let (tx, rx) = mpsc::channel::<ClientMsg>();
+    // Shared with the Windows viewer: acks keep only the newest, and a host that stops reading
+    // ends the session instead of making the queue grow without end.
+    let out = Arc::new(OutQueue::default());
     let r = std::thread::scope(|s| -> Result<()> {
         let shared = &shared;
+        let queue = &*out;
         s.spawn(move || {
             let r = (|| -> Result<()> {
                 loop {
-                    let m = match rx.recv_timeout(Duration::from_secs(5)) {
-                        Ok(m) => m,
-                        Err(mpsc::RecvTimeoutError::Timeout) => ClientMsg::Ping(0),
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    let m = match queue.next(Duration::from_secs(5)) {
+                        Next::Msg(m) => m,
+                        Next::Idle => ClientMsg::Ping(0),
+                        Next::Closed => return Ok(()),
                     };
                     let mut b = Vec::with_capacity(16);
                     m.encode(&mut b);
@@ -873,9 +910,9 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
         });
 
         let clip = if opts.clipboard && flags & F_CLIPBOARD != 0 {
-            let tx = tx.clone();
+            let out = out.clone();
             match Clipboard::spawn(move |t| {
-                let _ = tx.send(ClientMsg::Clipboard(t));
+                let _ = out.send(ClientMsg::Clipboard(t));
             }) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -889,11 +926,10 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
             }
             None
         };
-        let net_tx = tx.clone();
         // Played on the network thread; the player stops when the connection ends.
         let sound = opts.audio.then(Sound::default);
         s.spawn(move || {
-            let r = net_loop(&mut reader, shared, &net_tx, clip.as_ref(), sound);
+            let r = net_loop(&mut reader, shared, queue, clip.as_ref(), sound);
             shared.close(match r {
                 Err(e) if e.to_string() != channel::CLOSED => format!("connection lost: {e}"),
                 _ => "the host closed the connection".into(),
@@ -901,7 +937,7 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
         });
 
         let ui = View::create(conn, &title(&host_name, target), w, h, opts.fullscreen)
-            .and_then(|view| Ui::new(view, tx, view_only, flags & F_SAS != 0));
+            .and_then(|view| Ui::new(view, out.clone(), view_only, flags & F_SAS != 0));
         let r = ui.and_then(|mut ui| {
             let r = ui.run(shared, &wake);
             if let Some(reason) = ui.closed.take() {
@@ -914,12 +950,13 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
         if let Err(e) = &r {
             shared.close(format!("display error: {e}"));
         }
-        // Unblock the network threads: the reader sees the socket close, the writer its channel.
+        // Unblock the network threads: the reader sees the socket close, the writer its queue.
         let _ = stream.shutdown(Shutdown::Both);
+        out.close();
         r
     });
     // Wipe the remote screen contents before returning.
-    shared.fb.lock().unwrap().px = LockedBuf::new(0);
+    shared.ui_fb().px = LockedBuf::new(0);
     r?;
     match shared.closed.lock().unwrap().take() {
         Some(reason) if reason != "closed" => Err(reason.into()),
@@ -1017,6 +1054,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn size_changes_swap_the_buffer() {
+        let wake = Wake::new().unwrap();
+        let shared = Shared::new(8, 8, wake.waker().unwrap());
+        let mut dec = Decoder::new().unwrap();
+        let mut tiles = |id: u32, w: usize, h: usize| {
+            let msg = codec::pack(id, w, h, &[]).remove(0);
+            on_server_msg(&shared, &mut dec, ServerMsg::decode(&msg).unwrap(), None, None)
+        };
+        shared.ui_fb().resized = false;
+        assert_eq!(tiles(1, 8, 8).unwrap(), Some(ClientMsg::Ack(1)));
+        assert!(!shared.ui_fb().resized);
+        assert_eq!(tiles(2, 16, 4).unwrap(), Some(ClientMsg::Ack(2)));
+        let fb = shared.ui_fb();
+        assert_eq!((fb.w, fb.h, fb.px.len(), fb.resized), (16, 4, 16 * 4 * 4, true));
+        drop(fb);
+        assert!(tiles(3, 8193, 8192).is_err());
+        assert_eq!(shared.ui_fb().w, 16);
+    }
+
     /// Encodes `frame` the way a host does and feeds it to the viewer's message handler.
     fn deliver(shared: &Shared, codec: &mut (codec::Encoder, Decoder), frame: &[u8], w: usize, h: usize, id: u32) {
         let rects = codec.0.encode(frame, w, h);
@@ -1033,8 +1090,12 @@ mod tests {
         [px[0], px[1], px[2]]
     }
 
-    fn drain_messages(rx: &mpsc::Receiver<ClientMsg>) -> Vec<ClientMsg> {
-        rx.try_iter().collect()
+    fn drain_messages(out: &OutQueue) -> Vec<ClientMsg> {
+        std::iter::from_fn(|| match out.next(Duration::ZERO) {
+            Next::Msg(m) => Some(m),
+            _ => None,
+        })
+        .collect()
     }
 
     /// Pumps X events until `done` holds (or fails after a few seconds).
@@ -1086,8 +1147,7 @@ mod tests {
         let wake = Wake::new().unwrap();
         let shared = Shared::new(w, h, wake.waker().unwrap());
         let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - pipeline", w, h, false).unwrap();
-        let (tx, _rx) = mpsc::channel();
-        let mut ui = Ui::new(view, tx, false, false).unwrap();
+        let mut ui = Ui::new(view, Arc::default(), false, false).unwrap();
         let win = ui.view.win;
         ui.view.conn.configure_window(win, x11::CONFIG_X | x11::CONFIG_Y, &[800, 60]).unwrap();
         ui.view.conn.sync().unwrap();
@@ -1131,8 +1191,8 @@ mod tests {
         let wake = Wake::new().unwrap();
         let shared = Shared::new(rw, rh, wake.waker().unwrap());
         let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - test", rw, rh, false).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let mut ui = Ui::new(view, tx, false, false).unwrap();
+        let rx = Arc::new(OutQueue::default());
+        let mut ui = Ui::new(view, rx.clone(), false, false).unwrap();
         // 90% of 400x300 keeps the aspect ratio: 360x270, so the image fills the window.
         assert_eq!(ui.view.size, (360, 270));
         ui.view.conn.sync().unwrap();
@@ -1152,7 +1212,7 @@ mod tests {
             }
         }
         deliver(&shared, &mut codec, &frame, rw, rh, 2);
-        let dirty = shared.fb.lock().unwrap().dirty.unwrap();
+        let dirty = shared.ui_fb().dirty.unwrap();
         assert!(dirty.y <= 100 && dirty.y + dirty.h >= 140 && dirty.h < rh, "{dirty:?}");
         ui.sync_remote(&shared).unwrap();
         ui.view.conn.sync().unwrap();
