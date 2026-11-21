@@ -58,6 +58,8 @@ const T_TICK: usize = 1;
 const T_RECONNECT: usize = 2;
 /// A frame waits for its turn to be painted (`show_frame`).
 const T_FRAME: usize = 3;
+/// What was painted unsmoothed while it moved is to be smoothed (`Scaling::Rough`).
+const T_REFINE: usize = 4;
 const TICK_MS: u32 = 250;
 
 const MOD_CTRL: u8 = 1;
@@ -399,8 +401,10 @@ impl Pull {
 struct Asked {
     due: u32,
     value: u32,
-    /// The latest ask was the hello's wish, not a click: a refusal needs no toast.
-    hello: bool,
+    /// The latest ask was no click but the hello's wish, or the viewer turning off again what
+    /// the host turned on by itself (`Ui::on_state`, as often as the host likes): its answer
+    /// shows no toast and waits for the tick, like the host's own changes.
+    quiet: bool,
 }
 
 /// What a `State` from the host is, next to the `Set`s sent for its key.
@@ -418,13 +422,13 @@ impl Asked {
     fn sent(&mut self, value: u32) {
         self.due = self.due.saturating_add(1);
         self.value = value;
-        self.hello = false;
+        self.quiet = false;
     }
 
     /// The hello asked for `value`; the host answers that with one `State` as well.
     fn wished(&mut self, value: u32) {
         self.sent(value);
-        self.hello = true;
+        self.quiet = true;
     }
 
     /// `states` `State`s arrived for the key; what the latest of them is.
@@ -436,6 +440,15 @@ impl Asked {
             std::cmp::Ordering::Equal => Reply::Latest(self.value),
             std::cmp::Ordering::Less => Reply::Unasked,
         }
+    }
+
+    /// `reply`, and whether the latest `State` answers a click (not a `quiet` ask): only that
+    /// shows a refusal toast and the bar at once.
+    fn answer(&mut self, states: u32) -> (Reply, bool) {
+        let quiet = self.quiet;
+        let reply = self.reply(states);
+        let clicked = matches!(reply, Reply::Latest(_)) && !quiet;
+        (reply, clicked)
     }
 }
 
@@ -727,7 +740,20 @@ fn writer_loop(s: &Session, mut w: RecordWriter<TcpStream>) {
     }
 }
 
+/// Ends the session if its reader panics (a framebuffer that cannot be allocated, say), rather
+/// than leaving the window on the last frame with no error and no reconnect.
+struct EndOnPanic<'a>(&'a Session);
+
+impl Drop for EndOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.end(EndKind::Fatal, "the viewer failed while handling the host's data (out of memory?)".into());
+        }
+    }
+}
+
 fn reader_loop(s: &Session, mut reader: RecordReader<TcpStream>) {
+    let _end = EndOnPanic(s);
     let mut audio = AudioSink::default();
     let mut downloads = Downloads::default();
     let r = read_session(s, &mut reader, &mut audio, &mut downloads);
@@ -815,6 +841,9 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut core::TileDecoder, p: &[u8]) ->
         let wait = fb.resizes.wait(Instant::now());
         drop(fb);
         std::thread::sleep(wait);
+        // This reader's own copy of the screen goes first, so that two screens' worth is
+        // held at most: the old framebuffer and the new one, then the new one and a new copy.
+        dec.forget();
         fresh = Some(LockedBuf::new(hdr.width * hdr.height * 4));
     };
     if (fb.w, fb.h) != size
@@ -1360,14 +1389,12 @@ impl Ui {
         if k >= self.unavailable.len() {
             return;
         }
-        // While later `Set`s are unanswered, the latest of them decides.
-        let from_hello = self.asked[k].hello;
-        let reply = self.asked[k].reply(states);
+        // While later `Set`s are unanswered, the latest of them decides. Clicked for, rather
+        // than wished in the hello, refused here or changed by the host: `requested`.
+        let (reply, requested) = self.asked[k].answer(states);
         if reply == Reply::Stale {
             return;
         }
-        // Clicked for, rather than wished in the hello or changed by the host.
-        let requested = matches!(reply, Reply::Latest(_)) && !from_hello;
         if value == STATE_UNAVAILABLE {
             self.unavailable[k] = true;
             let label = match key {
@@ -1401,7 +1428,10 @@ impl Ui {
                         self.prefs.privacy = on;
                     }
                     if refuse {
+                        // No click: its answer (unavailable, say) must not buy the host a toast
+                        // and a relayout of the bar for every two `State`s it sends.
                         self.request(key, 0);
+                        self.asked[k].quiet = true;
                     }
                 }
                 _ => {}
@@ -1969,11 +1999,18 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
 
 /// Frames are repainted at most this often (a host sends at most 120 a second).
 const FRAME_GAP: Duration = Duration::from_millis(8);
-/// Smooth (HALFTONE) scaling takes 5-8 ns per source pixel painted, or per window pixel when
-/// enlarging: about 40 ms for a whole 4K frame, 300 ms for 8192x8192. One paint smooths at
-/// most this many (15-25 ms); the rest of the update follows in the next WM_PAINT, and input
-/// and the keyboard hook get their turn in between.
-const PAINT_PIXELS: i64 = 3 << 20;
+/// Smooth (HALFTONE) scaling takes 5-10 ns per source pixel painted, or per window pixel when
+/// enlarging: 40-90 ms for a whole 4K frame, 300-500 ms for 8192x8192 shown on 4K. One paint
+/// smooths at most this many, a whole 4K frame shrunk into a window or a whole 1440p one
+/// enlarged to 4K included, so that such an update shows one frame. A larger one (`Scaling`)
+/// is scaled by dropping pixels while the picture moves (COLORONCOLOR: 10-20 ms for 8192x8192
+/// on 4K) and smoothed once it stands still, in bands of this many with input and the keyboard
+/// hook getting their turn in between: whatever its screen size, a host never makes one paint
+/// take longer than a 4K screen does.
+const PAINT_PIXELS: i64 = 8 << 20;
+/// What was painted unsmoothed while it moved (`Scaling::Rough`) is smoothed once no such
+/// update came for this long (ms).
+const REFINE_MS: u32 = 150;
 /// A remote screen shown at less than a quarter of its width and height (a thumbnail) is
 /// scaled by dropping pixels (COLORONCOLOR, a few ms at any size) instead of smoothed, so an
 /// enormous screen announced by a host does not make every frame cost a smoothing of all of it.
@@ -1984,16 +2021,21 @@ const SMOOTH_MAX_SHRINK: i64 = 16;
 struct Pace {
     /// When the latest paint started.
     painted: Option<Instant>,
-    /// Part of a smoothed update is still to be painted (`paint_band`).
+    /// Part of a still picture is still to be smoothed (`Scaling::Band`).
     banding: bool,
     /// A frame arrived while banding: shown after the last band.
     waiting: bool,
     /// `T_FRAME` is set.
     timer: bool,
+    /// Window area of the frames shown since the latest paint (`invalidate_dirty`).
+    fresh: Option<RECT>,
+    /// Window area painted unsmoothed (`Scaling::Rough`), to be smoothed at `T_REFINE`.
+    rough: Option<RECT>,
 }
 
 thread_local! {
-    static PACE: Cell<Pace> = const { Cell::new(Pace { painted: None, banding: false, waiting: false, timer: false }) };
+    static PACE: Cell<Pace> =
+        const { Cell::new(Pace { painted: None, banding: false, waiting: false, timer: false, fresh: None, rough: None }) };
 }
 
 /// How long a new frame waits to be painted after a paint that started at `painted`.
@@ -2024,16 +2066,55 @@ fn paint_band(update: &RECT, image: &RECT, src: i64, dst: i64) -> Option<(RECT, 
     Some((RECT { left, top, right, bottom: split }, RECT { left, top: split, right, bottom }))
 }
 
+/// How `paint` scales an update.
+enum Scaling {
+    /// Smoothed (HALFTONE), in one pass.
+    Smooth,
+    /// Dropping pixels (COLORONCOLOR): a thumbnail (`smooth`).
+    Fast,
+    /// Dropping pixels for now, in one pass: new frames that changed more than one paint
+    /// smooths. In bands they would show parts of different frames, as the session's reader
+    /// keeps copying in newer ones meanwhile. Smoothed once the picture stands still.
+    Rough,
+    /// Smoothed, the first rect now and the second in the next WM_PAINT: more than one paint
+    /// smooths, of a picture that stands still (new frames wait for the last band).
+    Band(RECT, RECT),
+}
+
+/// How an update (window coordinates) of `image` (showing `src` remote pixels on `dst`) is
+/// painted, `fresh` being the area of it new frames changed.
+fn scaling(update: &RECT, fresh: Option<&RECT>, image: &RECT, src: i64, dst: i64) -> Scaling {
+    if !smooth(src, dst) {
+        return Scaling::Fast;
+    }
+    match paint_band(update, image, src, dst) {
+        None => Scaling::Smooth,
+        Some(_) if fresh.is_some_and(|f| paint_band(f, image, src, dst).is_some()) => Scaling::Rough,
+        Some((band, rest)) => Scaling::Band(band, rest),
+    }
+}
+
+/// The smallest rect holding `a` (if any) and `b`.
+fn union_rect(a: Option<RECT>, b: RECT) -> RECT {
+    a.map_or(b, |a| RECT { left: a.left.min(b.left), top: a.top.min(b.top), right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) })
+}
+
 /// Shows the frames decoded since the last call: invalidates what they changed, at most once
-/// per `FRAME_GAP`, and not while a smoothed update is still being painted in bands (or the
-/// next frame's invalidation would restart it at the top every time, and the bottom would
-/// never be painted); then after its last band.
+/// per `FRAME_GAP`, and not while a still picture is being smoothed in bands (or the next
+/// frame's invalidation would restart it at the top every time, and the bottom would never be
+/// painted); then after its last band. A frame that changed more than one paint smooths does
+/// not wait: it is painted at once, unsmoothed, along with the bands left (`Scaling::Rough`).
 fn show_frame(hwnd: HWND) {
     let mut p = PACE.get();
     let now = Instant::now();
     // (Bands follow each other at once; one that never came, say for a minimized window,
     // holds frames back for a second at most.)
     if p.banding && p.painted.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1)) {
+        if large_frame_waiting(hwnd) {
+            PACE.set(Pace { banding: false, waiting: false, ..p });
+            invalidate_dirty(hwnd);
+            return;
+        }
         p.waiting = true;
     } else if !p.timer {
         let wait = frame_wait(now, p.painted);
@@ -2051,7 +2132,8 @@ fn show_frame(hwnd: HWND) {
 fn paint(hwnd: HWND) {
     let app = APP.get().unwrap();
     let started = Instant::now();
-    let mut rest = None;
+    let fresh = PACE.get().fresh;
+    let (mut rest, mut rough) = (None, None);
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
@@ -2088,16 +2170,21 @@ fn paint(hwnd: HWND) {
                 SetDIBitsToDevice(hdc, d.left, d.top, fw as u32, fh as u32, 0, 0, 0, fh as u32, bits, &bmi, DIB_RGB_COLORS);
             } else {
                 let (src, dst) = (fw as i64 * fh as i64, dw as i64 * dh as i64);
-                if smooth(src, dst) {
+                let how = scaling(&ps.rcPaint, fresh.as_ref(), &d, src, dst);
+                if matches!(how, Scaling::Fast | Scaling::Rough) {
+                    SetStretchBltMode(hdc, COLORONCOLOR);
+                } else {
                     SetStretchBltMode(hdc, HALFTONE);
                     SetBrushOrgEx(hdc, 0, 0, null_mut());
+                }
+                match how {
                     // Smoothing costs what the clip region covers: paint one band of a large update.
-                    if let Some((band, more)) = paint_band(&ps.rcPaint, &d, src, dst) {
+                    Scaling::Band(band, more) => {
                         IntersectClipRect(hdc, band.left, band.top, band.right, band.bottom);
                         rest = Some(more);
                     }
-                } else {
-                    SetStretchBltMode(hdc, COLORONCOLOR);
+                    Scaling::Rough => rough = Some(ps.rcPaint),
+                    Scaling::Smooth | Scaling::Fast => {}
                 }
                 StretchDIBits(hdc, d.left, d.top, dw, dh, 0, 0, fw, fh, bits, &bmi, DIB_RGB_COLORS, SRCCOPY);
             }
@@ -2107,10 +2194,18 @@ fn paint(hwnd: HWND) {
         if let Some(r) = &rest {
             InvalidateRect(hwnd, r, 0);
         }
+        if rough.is_some() {
+            // (Again at every such update: it comes once the picture stands still.)
+            SetTimer(hwnd, T_REFINE, REFINE_MS, None);
+        }
     }
     let mut p = PACE.get();
     p.painted = Some(started);
+    p.fresh = None;
     p.banding = rest.is_some();
+    if let Some(r) = rough {
+        p.rough = Some(union_rect(p.rough, r));
+    }
     let show = !p.banding && std::mem::take(&mut p.waiting);
     PACE.set(p);
     if show {
@@ -2118,30 +2213,60 @@ fn paint(hwnd: HWND) {
     }
 }
 
-/// Invalidates the window region covering the remote pixels that changed.
-fn invalidate_dirty(hwnd: HWND) {
-    let app = APP.get().unwrap();
-    let (dirty, fw, fh) = {
-        let mut fb = app.ui_fb();
-        (fb.dirty.take(), fb.w as i64, fb.h as i64)
-    };
-    let Some(r) = dirty else { return };
-    if fw <= 0 || fh <= 0 {
-        return;
+/// At `T_REFINE`: smooths what was painted unsmoothed while it moved (`Scaling::Rough`).
+fn refine(hwnd: HWND) {
+    unsafe { KillTimer(hwnd, T_REFINE) };
+    let p = PACE.get();
+    if let Some(r) = p.rough {
+        PACE.set(Pace { rough: None, ..p });
+        unsafe { InvalidateRect(hwnd, &r, 0) };
     }
-    let d = image_rect(hwnd, fw as i32, fh as i32);
+}
+
+/// The window area showing remote pixels `r` of a `fw`x`fh` screen shown in `d`, with two
+/// pixels of slack for the halftone filter.
+fn window_area(d: &RECT, r: &Rect, fw: i64, fh: i64) -> RECT {
     let (dw, dh) = ((d.right - d.left) as i64, (d.bottom - d.top) as i64);
-    if dw <= 0 || dh <= 0 {
-        return;
-    }
-    // Two pixels of slack for the halftone filter.
-    let wr = RECT {
+    RECT {
         left: d.left + (r.x as i64 * dw / fw) as i32 - 2,
         top: d.top + (r.y as i64 * dh / fh) as i32 - 2,
         right: d.left + (((r.x + r.w) as i64 * dw + fw - 1) / fw) as i32 + 2,
         bottom: d.top + (((r.y + r.h) as i64 * dh + fh - 1) / fh) as i32 + 2,
+    }
+}
+
+/// The window area showing the remote pixels changed since they were last shown
+/// (`Framebuffer::dirty`, taken if `take`), with the image rect and its remote and window
+/// pixel counts.
+fn dirty_area(hwnd: HWND, take: bool) -> Option<(RECT, RECT, i64, i64)> {
+    let app = APP.get().unwrap();
+    let (dirty, fw, fh) = {
+        let mut fb = app.ui_fb();
+        (if take { fb.dirty.take() } else { fb.dirty }, fb.w as i64, fb.h as i64)
     };
+    let r = dirty?;
+    if fw <= 0 || fh <= 0 {
+        return None;
+    }
+    let d = image_rect(hwnd, fw as i32, fh as i32);
+    let (dw, dh) = ((d.right - d.left) as i64, (d.bottom - d.top) as i64);
+    if dw <= 0 || dh <= 0 {
+        return None;
+    }
+    Some((window_area(&d, &r, fw, fh), d, fw * fh, dw * dh))
+}
+
+/// Invalidates the window region covering the remote pixels that changed.
+fn invalidate_dirty(hwnd: HWND) {
+    let Some((wr, ..)) = dirty_area(hwnd, true) else { return };
     unsafe { InvalidateRect(hwnd, &wr, 0) };
+    let p = PACE.get();
+    PACE.set(Pace { fresh: Some(union_rect(p.fresh, wr)), ..p });
+}
+
+/// Whether the frames waiting to be shown changed more than one paint smooths (`Scaling::Rough`).
+fn large_frame_waiting(hwnd: HWND) -> bool {
+    dirty_area(hwnd, false).is_some_and(|(wr, d, src, dst)| smooth(src, dst) && paint_band(&wr, &d, src, dst).is_some())
 }
 
 /// Maps a client-area point to remote screen coordinates.
@@ -2269,7 +2394,7 @@ fn on_key(app: &App, vk: u16, scan: u16, extended: bool, up: bool, hooked: bool)
     }
     // Not a key of the keyboard (AltGr's Left Ctrl): the host's own layout decides what AltGr
     // does, and as Ctrl here it would turn AltGr+Enter and AltGr+End into the hotkeys.
-    let scan = if up && vk == VK_LCONTROL { left_ctrl_release(&lock(&app.routes), scan) } else { scan };
+    let scan = if vk == VK_LCONTROL { left_ctrl_scan(&lock(&app.routes), scan) } else { scan };
     let simulated = is_simulated(vk, scan);
     let bit = if simulated { 0 } else { mod_bit(vk) };
     if bit != 0 {
@@ -2452,11 +2577,15 @@ fn altgr_ctrl_queued(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, time: u32) ->
     queued && altgr_ctrl(msg, wp, lp, time, &next)
 }
 
-/// The scancode a Left Ctrl release is handled under, `ALTGR_CTRL` for AltGr's. A window
+/// The scancode a Left Ctrl event is handled under, `ALTGR_CTRL` for AltGr's. A window
 /// message cannot always tell the two apart (`altgr_ctrl`: the Right Alt may not be queued
-/// yet), so a release whose own press is not held goes where the other one's went: a press
-/// taken for a real Left Ctrl went to the host and set Ctrl here, and is released as one.
-fn left_ctrl_release(routes: &HashMap<u16, bool>, scan: u16) -> u16 {
+/// yet), so a press or release whose own key is not held goes where the other one's went: a
+/// press, its auto-repeats (Windows repeats AltGr's Left Ctrl with its Right Alt, each told
+/// apart or not) and its release share one route. A press taken for a real Left Ctrl went to
+/// the host and set Ctrl here, and is repeated and released as one. (So a real Left Ctrl
+/// pressed while AltGr is held counts as AltGr's, and AltGr's while a real one is held as
+/// that one: rare chords, and nothing is left held either way.)
+fn left_ctrl_scan(routes: &HashMap<u16, bool>, scan: u16) -> u16 {
     let held = |key: u16| routes.contains_key(&key);
     if is_simulated(VK_LCONTROL, scan) {
         if !held(scan) && held(VK_LCONTROL) { modifier_scan(VK_LCONTROL).0 } else { scan }
@@ -2694,6 +2823,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         PACE.set(Pace { timer: false, ..PACE.get() });
                         show_frame(hwnd);
                     }
+                    T_REFINE => refine(hwnd),
                     _ => {}
                 }
                 0
@@ -3107,26 +3237,68 @@ mod tests {
         assert!(smooth(1280 * 720, 2560 * 1440));
         let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
         let image = rect(0, 40, 1920, 1120);
-        // A small update is painted whole.
-        assert!(paint_band(&rect(10, 50, 200, 300), &image, 3840 * 2160, 1920 * 1080).is_none());
-        // A whole 4K frame in a 1080p window: four source pixels behind each window pixel.
+        let (k4, k8, p1080) = (3840 * 2160, 7680 * 4320, 1920 * 1080);
+        // A small update is painted whole, and so is a whole 4K frame in a 1080p window (four
+        // source pixels behind each window pixel), or a whole 1440p one enlarged to 4K (enlarging
+        // costs per window pixel).
+        assert!(paint_band(&rect(10, 50, 200, 300), &image, k4, p1080).is_none());
         let all = rect(0, 0, 1920, 1200);
-        let (band, rest) = paint_band(&all, &image, 3840 * 2160, 1920 * 1080).unwrap();
-        let rows = PAINT_PIXELS / (1920 * 4);
+        assert!(paint_band(&all, &image, k4, p1080).is_none());
+        let screen = rect(0, 0, 3840, 2160);
+        assert!(paint_band(&screen, &screen, 2560 * 1440, k4).is_none());
+        // 8K in a 1080p window: bands of `PAINT_PIXELS` of work.
+        let (band, rest) = paint_band(&all, &image, k8, p1080).unwrap();
+        let rows = PAINT_PIXELS / (1920 * 16);
         assert_eq!((band.left, band.top, band.right, band.bottom), (0, 40, 1920, 40 + rows as i32));
         assert_eq!((rest.left, rest.top, rest.right, rest.bottom), (0, 40 + rows as i32, 1920, 1120));
         // Band after band makes its way down to the bottom.
         let (mut update, mut bands) = (all, 0);
-        while let Some((_, rest)) = paint_band(&update, &image, 3840 * 2160, 1920 * 1080) {
+        while let Some((_, rest)) = paint_band(&update, &image, k8, p1080) {
             (update, bands) = (rest, bands + 1);
         }
-        assert_eq!(bands, 2, "three paints");
-        // Enlarging costs per window pixel; a band is at least one row; nothing outside the image.
-        assert!(paint_band(&rect(0, 40, 1920, 1120), &image, 1280 * 720, 1920 * 1080).is_none());
+        assert_eq!(bands, 3, "four paints");
+        // A band is at least one row; nothing outside the image.
         let narrow = rect(0, 0, 4, 4);
         let (band, _) = paint_band(&narrow, &narrow, 8192 * 8192, 16).unwrap();
         assert_eq!(band.bottom - band.top, 1);
-        assert!(paint_band(&rect(0, 0, 1920, 40), &image, 3840 * 2160, 1920 * 1080).is_none());
+        assert!(paint_band(&rect(0, 0, 1920, 40), &image, k8, p1080).is_none());
+    }
+
+    #[test]
+    fn moving_pictures_are_never_painted_in_bands() {
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let kind = |s: Scaling| match s {
+            Scaling::Smooth => "smooth",
+            Scaling::Fast => "fast",
+            Scaling::Rough => "rough",
+            Scaling::Band(..) => "band",
+        };
+        let (image, all, small) = (rect(0, 40, 1920, 1120), rect(0, 0, 1920, 1200), rect(100, 100, 300, 200));
+        let (k4, k8, p1080) = (3840 * 2160, 7680 * 4320, 1920 * 1080);
+        // A 4K host in a 1080p window: every update smoothed whole, frames or not.
+        assert_eq!(kind(scaling(&all, Some(&all), &image, k4, p1080)), "smooth");
+        assert_eq!(kind(scaling(&all, None, &image, k4, p1080)), "smooth");
+        // An 8K one: frames changing that much drop pixels, in one pass, until the picture stands
+        // still; then it is smoothed in bands, as is a still picture shown afresh (a resize).
+        assert_eq!(kind(scaling(&all, Some(&all), &image, k8, p1080)), "rough");
+        assert_eq!(kind(scaling(&all, None, &image, k8, p1080)), "band");
+        // A small change goes along with the bands of a larger update (later ones wait for them)
+        // and is smoothed whole on its own.
+        assert_eq!(kind(scaling(&all, Some(&small), &image, k8, p1080)), "band");
+        assert_eq!(kind(scaling(&small, Some(&small), &image, k8, p1080)), "smooth");
+        // A thumbnail always drops pixels.
+        assert_eq!(kind(scaling(&all, Some(&all), &image, 8192 * 8192, p1080)), "fast");
+        assert_eq!(kind(scaling(&small, None, &image, 8192 * 8192, p1080)), "fast");
+        // What was painted unsmoothed adds up until it is smoothed.
+        let r = union_rect(Some(rect(10, 20, 30, 40)), rect(0, 30, 20, 50));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 20, 30, 50));
+        let r = union_rect(None, small);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 300, 200));
+        // The window area of a change, with slack for the halftone filter.
+        let a = window_area(&image, &Rect { x: 0, y: 0, w: 3840, h: 2160 }, 3840, 2160);
+        assert_eq!((a.left, a.top, a.right, a.bottom), (-2, 38, 1922, 1122));
+        let a = window_area(&image, &Rect { x: 1, y: 1, w: 2, h: 2 }, 3840, 2160);
+        assert_eq!((a.left, a.top, a.right, a.bottom), (-2, 38, 4, 44));
     }
 
     #[test]
@@ -3177,11 +3349,37 @@ mod tests {
         // An answer to the hello alone is not one the user clicked for.
         let mut a = Asked::default();
         a.wished(1);
-        assert!(a.hello);
-        assert_eq!(a.reply(1), Reply::Latest(1));
+        assert!(a.quiet);
+        assert_eq!(a.answer(1), (Reply::Latest(1), false));
         a.wished(1);
         a.sent(0);
-        assert!(!a.hello);
+        assert!(!a.quiet);
+        assert_eq!(a.answer(2), (Reply::Latest(0), true));
+    }
+
+    #[test]
+    fn the_viewers_own_refusals_are_no_clicks() {
+        // The host turns sound on by itself, then reports it unavailable, again and again. Each
+        // time the viewer turns it off again (as `on_state` does), and the host's answer to that
+        // is no answer to a click: no refusal toast, and no relayout of the bar.
+        let (mut a, mut on) = (Asked::default(), false);
+        for _ in 0..3 {
+            let (reply, clicked) = a.answer(1);
+            assert!(!clicked);
+            let refuse;
+            (on, refuse) = feature_state(on, &reply, 1);
+            assert!(!on && refuse);
+            a.sent(0);
+            a.quiet = true;
+            assert_eq!(a.answer(1), (Reply::Latest(0), false));
+        }
+        assert_eq!(a.due, 0);
+        // A click while that refusal is unanswered is one again; its answer comes last.
+        a.sent(0);
+        a.quiet = true;
+        a.sent(1);
+        assert_eq!(a.answer(1), (Reply::Stale, false));
+        assert_eq!(a.answer(1), (Reply::Latest(1), true));
     }
 
     #[test]
@@ -3397,29 +3595,83 @@ mod tests {
         // AltGr pressed while the hook was gone and released through a fresh one: its Left
         // Ctrl is the same key both times, and nothing is left held.
         assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_release(&r, ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL), ALTGR_CTRL);
         assert!(!stays_local(false, MOD_ALT, ALTGR_CTRL, true, true, &mut r));
         assert!(r.is_empty());
         // Its press taken for a real Left Ctrl (the Right Alt was not queued yet) went to the
         // host and set Ctrl: the release, told apart, still lets go of it there and here.
         assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
-        let scan = left_ctrl_release(&r, ALTGR_CTRL);
+        let scan = left_ctrl_scan(&r, ALTGR_CTRL);
         assert!(!is_simulated(VK_LCONTROL, scan));
         assert_eq!((scan, mod_bit(VK_LCONTROL)), (0x1d, MOD_CTRL));
         assert!(!stays_local(false, 0, VK_LCONTROL, true, true, &mut r));
         assert!(r.is_empty());
         // And the other way round: its release taken for a real one ends its own route.
         assert!(!stays_local(false, 0, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_release(&r, 0x1d), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, 0x1d), ALTGR_CTRL);
         assert!(!stays_local(false, 0, ALTGR_CTRL, true, true, &mut r));
         assert!(r.is_empty());
-        // Both held (a real Left Ctrl with AltGr), or neither: each release is what it says.
+        // Both held, or neither: each event is what it says.
         assert!(!stays_local(false, MOD_CTRL, VK_LCONTROL, false, true, &mut r));
         assert!(!stays_local(false, MOD_CTRL, ALTGR_CTRL, false, true, &mut r));
-        assert_eq!(left_ctrl_release(&r, ALTGR_CTRL), ALTGR_CTRL);
-        assert_eq!(left_ctrl_release(&r, 0x1d), 0x1d);
-        assert_eq!(left_ctrl_release(&HashMap::new(), ALTGR_CTRL), ALTGR_CTRL);
-        assert_eq!(left_ctrl_release(&HashMap::new(), 0x1d), 0x1d);
+        assert_eq!(left_ctrl_scan(&r, ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&r, 0x1d), 0x1d);
+        assert_eq!(left_ctrl_scan(&HashMap::new(), ALTGR_CTRL), ALTGR_CTRL);
+        assert_eq!(left_ctrl_scan(&HashMap::new(), 0x1d), 0x1d);
+    }
+
+    /// `on_key` for a Left Ctrl event (`scan` as the hook or `altgr_ctrl` names it) with a
+    /// session that takes input: whether it goes to the host; `routes` and `mods` follow.
+    fn left_ctrl_event(routes: &mut HashMap<u16, bool>, mods: &mut u8, scan: u16, up: bool) -> bool {
+        let scan = left_ctrl_scan(routes, scan);
+        if is_simulated(VK_LCONTROL, scan) {
+            stays_local(false, *mods, scan, up, true, routes);
+            return false;
+        }
+        if up {
+            *mods &= !mod_bit(VK_LCONTROL);
+        } else {
+            *mods |= mod_bit(VK_LCONTROL);
+        }
+        !stays_local(false, *mods, VK_LCONTROL, up, true, routes)
+    }
+
+    #[test]
+    fn a_left_ctrl_is_repeated_where_its_press_went() {
+        let (mut r, mut mods) = (HashMap::new(), 0);
+        // AltGr held while Windows had dropped the hook: its press reached the window before
+        // its Right Alt and was taken for a real Left Ctrl, which went to the host. A fresh
+        // hook tells the auto-repeats and the release apart: they are still that Left Ctrl's,
+        // so the host lets go of it, and Ctrl is not left set here.
+        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false));
+        for _ in 0..4 {
+            assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+        }
+        assert_eq!(mods, MOD_CTRL);
+        assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
+        assert!(r.is_empty() && mods == 0);
+        // The other way round: told apart when pressed, one auto-repeat through the window not
+        // told apart, released told apart. Nothing goes to the host, nothing is left held.
+        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+        assert!(!left_ctrl_event(&mut r, &mut mods, 0x1d, false));
+        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
+        assert!(r.is_empty() && mods == 0);
+        // A real Left Ctrl alone, and AltGr alone, are untouched.
+        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false) && left_ctrl_event(&mut r, &mut mods, 0x1d, false));
+        assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, true));
+        assert!(!left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false) && !left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, true));
+        assert!(r.is_empty() && mods == 0);
+        // A real Left Ctrl held, then AltGr: AltGr's goes with the real one. Let go in either
+        // order, nothing stays held on the host.
+        for real_first in [true, false] {
+            assert!(left_ctrl_event(&mut r, &mut mods, 0x1d, false));
+            assert!(left_ctrl_event(&mut r, &mut mods, ALTGR_CTRL, false));
+            let order = if real_first { [0x1d, ALTGR_CTRL] } else { [ALTGR_CTRL, 0x1d] };
+            assert!(left_ctrl_event(&mut r, &mut mods, order[0], true));
+            assert!(!left_ctrl_event(&mut r, &mut mods, order[1], true));
+            assert!(r.is_empty() && mods == 0);
+        }
     }
 
     #[test]

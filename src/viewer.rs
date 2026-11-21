@@ -197,7 +197,8 @@ pub const CONTROL_DEPTH: usize = 4096;
 /// Bytes of text (clipboard, mostly) allowed to wait among those control messages: eight full
 /// clipboards. Counting entries alone would let a host that stops reading hold `CONTROL_DEPTH`
 /// clipboard texts of up to 1 MiB each, a host-set text echoed back by a local clipboard
-/// manager being one way to make them.
+/// manager being one way to make them. A new clipboard text replaces a waiting one (`send`),
+/// so only texts with keys or clicks between them, each of which may paste one, add up.
 pub const CONTROL_BYTES: usize = 8 << 20;
 /// Why a session ends when its `OutQueue` gave up.
 pub const STALLED: &str = "the host stopped reading what this viewer sends";
@@ -237,6 +238,20 @@ fn held_bytes(m: &ClientMsg) -> usize {
     }
 }
 
+/// Where in `control` a new clipboard text goes in place of a waiting one: the latest one,
+/// unless a key or a mouse button was queued after it. That may paste it on the host, which
+/// must have it first.
+fn waiting_text(control: &VecDeque<ClientMsg>) -> Option<usize> {
+    for (i, m) in control.iter().enumerate().rev() {
+        match m {
+            ClientMsg::Clipboard(_) => return Some(i),
+            ClientMsg::Key { .. } | ClientMsg::MouseButton { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// What `OutQueue::next` produced.
 #[derive(Debug, PartialEq)]
 pub enum Next {
@@ -256,27 +271,35 @@ impl Default for OutQueue {
 impl OutQueue {
     /// Queues a control message; false once the queue is closed. A mouse move replaces a
     /// mouse move still waiting at the end of the queue, so a slow link does not replay a
-    /// backlog of stale positions, and an ack replaces any waiting ack. With `CONTROL_DEPTH`
-    /// messages or `CONTROL_BYTES` of text waiting the queue closes as `stalled`: the caller
-    /// should end the session. (One message is always taken while nothing waits.)
+    /// backlog of stale positions, and an ack replaces any waiting ack. A clipboard text
+    /// replaces a waiting one in its place (`waiting_text`), so copying again and again over a
+    /// slow link sends only the latest. With `CONTROL_DEPTH` messages or `CONTROL_BYTES` of
+    /// text waiting the queue closes as `stalled`: the caller should end the session. (One
+    /// message is always taken while nothing waits.)
     pub fn send(&self, m: ClientMsg) -> bool {
         let mut s = lock(&self.state);
         if s.closed {
             return false;
         }
+        let replaces = if matches!(m, ClientMsg::Clipboard(_)) { waiting_text(&s.control) } else { None };
         match (s.control.back_mut(), &m) {
             (_, &ClientMsg::Ack(id)) => s.ack = Some(id),
             (Some(last @ ClientMsg::MouseMove { .. }), ClientMsg::MouseMove { .. }) => *last = m,
             _ => {
-                let bytes = held_bytes(&m);
-                if s.control.len() >= CONTROL_DEPTH || (!s.control.is_empty() && s.control_bytes + bytes > CONTROL_BYTES) {
+                let freed = replaces.map_or(0, |i| held_bytes(&s.control[i]));
+                let bytes = s.control_bytes - freed + held_bytes(&m);
+                let full = replaces.is_none() && s.control.len() >= CONTROL_DEPTH;
+                if full || (!s.control.is_empty() && bytes > CONTROL_BYTES) {
                     s.stalled = true;
                     drop(s);
                     self.close();
                     return false;
                 }
-                s.control_bytes += bytes;
-                s.control.push_back(m)
+                s.control_bytes = bytes;
+                match replaces {
+                    Some(i) => s.control[i] = m,
+                    None => s.control.push_back(m),
+                }
             }
         }
         self.ready.notify_one();
@@ -469,6 +492,14 @@ impl TileDecoder {
             bail!("the host sends far more screen updates than a real host can");
         }
         Ok(bbox)
+    }
+
+    /// Wipes and frees the reader's copy of the screen; the next `decode` makes a new one. For a
+    /// size change, before the new framebuffer is allocated: the old one, the new one and this
+    /// copy (up to 256 MiB each) are then never held at once.
+    pub fn forget(&mut self) {
+        self.back = LockedBuf::new(0);
+        (self.w, self.h) = (0, 0);
     }
 
     /// Copies the rects the latest `decode` drew into `fb` (the same size), from `*at` (rect,
@@ -721,14 +752,16 @@ mod tests {
     fn queued_text_is_bounded_in_bytes() {
         let q = OutQueue::default();
         let text = || ClientMsg::Clipboard("x".repeat(MAX_CLIPBOARD));
+        // Ctrl+V after each text: each one may be pasted, so none replaces another.
+        let paste = || ClientMsg::Key { vk: b'V' as u16, scan: 0x2f, flags: 0 };
         let full = CONTROL_BYTES / MAX_CLIPBOARD;
         for _ in 0..full {
-            assert!(q.send(text()));
+            assert!(q.send(text()) && q.send(paste()));
         }
         // Small messages still fit; the writer taking a text makes room for another.
         assert!(q.send(ClientMsg::Refresh));
         assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Clipboard(_))));
-        assert!(q.send(text()));
+        assert!(q.send(text()) && q.send(paste()));
         assert!(!q.stalled());
         // Far fewer than `CONTROL_DEPTH` entries, but the bytes are what a host must not pile up.
         assert!(!q.send(text()));
@@ -739,6 +772,41 @@ mod tests {
         assert!(q.send(ClientMsg::FileData { id: 1, data: vec![0; CONTROL_BYTES + 1] }));
         assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::FileData { .. })));
         assert!(q.send(text()) && q.send(ClientMsg::Key { vk: 1, scan: 0, flags: 0 }) && !q.stalled());
+    }
+
+    #[test]
+    fn copying_again_sends_only_the_latest_text() {
+        let q = OutQueue::default();
+        let text = |c: char| ClientMsg::Clipboard(c.to_string().repeat(MAX_CLIPBOARD));
+        q.send(ClientMsg::Key { vk: b'A' as u16, scan: 0x1e, flags: 0 });
+        // A slow link: copied a hundred times while pings and mouse moves queue up between
+        // the copies, far more than `CONTROL_BYTES`. One text waits, the latest, in the place of
+        // the first.
+        for i in 0..100u32 {
+            assert!(q.send(text(char::from(b'a' + (i % 26) as u8))), "copy {i}");
+            assert!(q.send(ClientMsg::Ping(i as u64)) && q.send(ClientMsg::MouseMove { x: i as u16, y: 0 }));
+        }
+        assert!(!q.stalled());
+        assert_eq!(lock(&q.state).control_bytes, MAX_CLIPBOARD);
+        assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Key { .. })));
+        assert!(matches!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Clipboard(t)) if t == "v".repeat(MAX_CLIPBOARD)));
+        assert_eq!(q.next(Duration::ZERO), Next::Msg(ClientMsg::Ping(0)));
+        // A key or a click after a text may paste it on the host, which must have it first:
+        // the next text waits behind them, and one after that replaces that next one.
+        let small = |t: &str| ClientMsg::Clipboard(t.into());
+        let pastes: [fn() -> ClientMsg; 2] =
+            [|| ClientMsg::Key { vk: b'V' as u16, scan: 0x2f, flags: 0 }, || ClientMsg::MouseButton { button: BTN_RIGHT, down: true }];
+        for paste in pastes {
+            let q = OutQueue::default();
+            for m in [small("a"), paste(), ClientMsg::Ping(1), small("b"), small("c")] {
+                assert!(q.send(m));
+            }
+            for want in [small("a"), paste(), ClientMsg::Ping(1), small("c")] {
+                assert_eq!(q.next(Duration::ZERO), Next::Msg(want));
+            }
+            assert_eq!(q.next(Duration::ZERO), Next::Idle);
+            assert_eq!(lock(&q.state).control_bytes, 0);
+        }
     }
 
     #[test]
@@ -803,10 +871,15 @@ mod tests {
         // A framebuffer of another size is left alone.
         let mut other = vec![7u8; 16];
         assert!(td.copy(&mut other, &mut (0, 0)) && other == [7; 16]);
-        // A new size gets a new copy of the screen.
+        // A new size gets a new copy of the screen; one forgotten before (a size change) as well.
         let msg = crate::codec::pack(2, 16, 8, &[solid(0, 0, 16, 8, 30)]).remove(0);
         assert_eq!(td.decode(&msg[1..], 16, 8).unwrap(), Some(Rect { x: 0, y: 0, w: 16, h: 8 }));
         assert_eq!(td.back.len(), 16 * 8 * 4);
+        td.forget();
+        assert_eq!(td.back.len(), 0);
+        assert_eq!(td.decode(&msg[1..], 16, 8).unwrap(), Some(Rect { x: 0, y: 0, w: 16, h: 8 }));
+        let mut fb = vec![0u8; 16 * 8 * 4];
+        assert!(td.copy(&mut fb, &mut (0, 0)) && fb == [30, 30, 30, 255].repeat(16 * 8));
         assert!(td.decode(&msg[1..], 8193, 8192).is_err());
     }
 
