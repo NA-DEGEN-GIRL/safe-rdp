@@ -97,12 +97,17 @@ static STOP: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     // DLLs loaded from here on (by us or by Windows on our behalf) come from System32 only,
-    // never from this executable's folder, where anyone may have left a file; the imports
-    // themselves are covered by /DEPENDENTLOADFLAG (build.rs).
+    // never from this executable's folder, where anyone may have left a file. That includes
+    // every DLL we import that is not a KnownDLL, and whatever those import: build.rs has them
+    // loaded on first use, so nothing may call into them before this line.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
-        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) == 0 {
+            // Then the first use of one of those DLLs would look in this folder first.
+            eprintln!("error: cannot limit where DLLs are loaded from: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = dispatch(&args) {
