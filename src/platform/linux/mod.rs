@@ -13,7 +13,20 @@ pub mod viewer;
 mod x11;
 pub mod xvfb;
 
+use std::ffi::c_ulong;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+
+// Constants and structure layouts of the C library and the kernel are written out by hand in
+// this module and the ones above, in the Linux parts of net.rs and files.rs, and in
+// crypto/openssl.rs. They were checked against the kernel's uapi headers and glibc's and musl's
+// for these architectures only; others differ (open flags on arm and powerpc, SOL_SOCKET and
+// MAP_ANONYMOUS on mips, the size of time_t and off_t on 32-bit ones), so check them before
+// adding one here.
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
+)))]
+compile_error!("safe-rdp's Linux system interface was checked for 64-bit x86_64, aarch64 and riscv64 only");
 
 mod libc {
     use std::ffi::{c_char, c_int, c_long};
@@ -36,7 +49,8 @@ mod libc {
     unsafe extern "C" {
         pub fn time(t: *mut i64) -> i64;
         pub fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-        pub fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+        /// Takes four `unsigned long` arguments after `option`.
+        pub fn prctl(option: c_int, ...) -> c_int;
         pub fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
         pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
         pub fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
@@ -69,7 +83,7 @@ mod libc {
 /// Per-process hardening: no core dumps and no ptrace attach by other same-user processes,
 /// so screen contents and keys cannot be scraped from this process's memory that way.
 pub fn init_process() {
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) };
 }
 
 static STOP_FLAG: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
