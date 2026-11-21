@@ -11,9 +11,15 @@
 //!
 //! Ctrl+Alt+Del cannot be synthesised with SendInput; the agent signals a SYSTEM-only event
 //! and the service calls SendSAS (requires the SoftwareSASGeneration policy, `--enable-sas`).
+//!
+//! Only administrators can read the service's key, so the fingerprint of that key
+//! (`keys::fingerprint`) is recorded in the service's registry key, which every user may read:
+//! the launcher and the CLI compare it with the user's own key. `service rekey` replaces the key
+//! alone, leaving the options the service was installed with as they are.
 
 use super::keystore;
-use crate::util::{Error, Result, wide};
+use crate::keys;
+use crate::util::{Error, Result, Secret, wide};
 use crate::{bail, log};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -26,7 +32,10 @@ use windows_sys::Win32::Security::Authentication::Identity::SendSAS;
 use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::JobObjects::*;
-use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, REG_DWORD, RegSetKeyValueW};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, RegSetValueExW,
+};
 use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows_sys::Win32::System::Services::*;
 use windows_sys::Win32::System::Threading::*;
@@ -44,6 +53,17 @@ const SYSTEM_ONLY: &str = "D:P(A;;GA;;;SY)";
 const FIREWALL_RULE: &str = "safe-rdp";
 /// How long a stopping agent may take to end its session before it is killed.
 const AGENT_STOP_WAIT: Duration = Duration::from_secs(5);
+/// Below the service's own registry key, which inherits from Services: every user may read it,
+/// only SYSTEM and Administrators may change it, and it goes when the service is removed.
+const PARAMETERS_KEY: &str = r"SYSTEM\CurrentControlSet\Services\SafeRdpHost\Parameters";
+/// The fingerprint of the key the service was given.
+const FINGERPRINT_VALUE: &str = "KeyFingerprint";
+/// In front of `service install|rekey`'s other arguments: the fingerprint of the key the caller
+/// means the service to get.
+const EXPECT_KEY_ARG: &str = "--expect-key";
+/// Exit code of `service install|rekey` refusing a key other than the expected one. The launcher
+/// runs them elevated and cannot see what they print, so this is how it learns why.
+pub const EXIT_OTHER_KEY: i32 = 3;
 
 static AGENT_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 static STATUS: AtomicUsize = AtomicUsize::new(0);
@@ -177,14 +197,139 @@ fn open_service(scm: &Sc) -> Option<Sc> {
     (!h.is_null()).then_some(Sc(h))
 }
 
-fn stop_and_wait(svc: &Sc) {
+/// Stops the service, waiting up to 20 s; true once it has stopped.
+fn stop_and_wait(svc: &Sc) -> bool {
     unsafe {
         let mut st: SERVICE_STATUS = std::mem::zeroed();
         ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st);
         let t = Instant::now();
-        while QueryServiceStatus(svc.0, &mut st) != 0 && st.dwCurrentState != SERVICE_STOPPED && t.elapsed() < Duration::from_secs(20) {
+        let mut known = QueryServiceStatus(svc.0, &mut st) != 0;
+        while known && st.dwCurrentState != SERVICE_STOPPED && t.elapsed() < Duration::from_secs(20) {
             std::thread::sleep(Duration::from_millis(250));
+            known = QueryServiceStatus(svc.0, &mut st) != 0;
         }
+        known && st.dwCurrentState == SERVICE_STOPPED
+    }
+}
+
+/// Splits `--expect-key <fingerprint>`, which comes first, off `service install|rekey`'s
+/// arguments.
+pub fn expected_key(args: &[String]) -> Result<(Option<String>, &[String])> {
+    let (expect, rest) = match args {
+        [flag, fp, rest @ ..] if flag == EXPECT_KEY_ARG => {
+            let fp = fp.to_ascii_lowercase();
+            if !keys::is_fingerprint(&fp) {
+                bail!("{EXPECT_KEY_ARG} expects a key fingerprint: 16 hex digits, as `safe-rdp service status` shows them");
+            }
+            (Some(fp), rest)
+        }
+        [flag] if flag == EXPECT_KEY_ARG => bail!("{EXPECT_KEY_ARG} needs a value"),
+        _ => (None, args),
+    };
+    if rest.iter().any(|a| a == EXPECT_KEY_ARG) {
+        bail!("{EXPECT_KEY_ARG} must come first");
+    }
+    Ok((expect, rest))
+}
+
+/// The account this process runs as, for messages.
+fn account() -> String {
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!(r"{d}\{u}"),
+        (_, Ok(u)) if !u.is_empty() => u,
+        _ => "this account".into(),
+    }
+}
+
+/// Why the key stored for `account` (fingerprint `have`; None: no readable key) is refused when
+/// the one with fingerprint `expect` was asked for.
+fn other_key_message(account: &str, have: Option<&str>, expect: &str) -> String {
+    let what = match have {
+        Some(fp) => format!("the key stored for {account} (fingerprint {fp}) is not the one asked for ({expect})"),
+        None => format!("no readable key is stored for {account}, and the one asked for has fingerprint {expect}"),
+    };
+    format!(
+        "{what}, so nothing was changed.\n\
+         The service gets the key of the account that runs this command; when another account approves the administrator \
+         prompt, that is the approving account. Store the key there first (`safe-rdp key import` signed in as {account}), \
+         or run this from an elevated terminal of the account that has it."
+    )
+}
+
+/// The key for the service: the one stored for the account that runs this, which is the
+/// account that approved the administrator prompt when a standard user asked. With `expect`
+/// any key but the one with that fingerprint is refused, and the process exits with
+/// EXIT_OTHER_KEY before anything has changed.
+fn key_for_service(expect: Option<&str>) -> Result<Secret<32>> {
+    let key = keystore::load_user_key();
+    let Some(expect) = expect else {
+        return key.map_err(|e| Error::msg(format!("{e}\nThe service uses the key stored for the installing user.")));
+    };
+    let have = key.as_ref().ok().map(keys::fingerprint);
+    if have.as_deref() == Some(expect) {
+        return key;
+    }
+    drop(key);
+    log!("error: {}", other_key_message(&account(), have.as_deref(), expect));
+    std::process::exit(EXIT_OTHER_KEY);
+}
+
+fn reg_error(what: &str, code: u32) -> Error {
+    Error::msg(format!("{what}: {}", std::io::Error::from_raw_os_error(code as i32)))
+}
+
+fn write_fingerprint(root: HKEY, subkey: &str, fp: &str) -> Result<()> {
+    let mut key: HKEY = null_mut();
+    let r = unsafe { RegCreateKeyExW(root, wide(subkey).as_ptr(), 0, null(), REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, null(), &mut key, null_mut()) };
+    if r != ERROR_SUCCESS {
+        return Err(reg_error(&format!("cannot open {subkey}"), r));
+    }
+    // A REG_SZ's size counts its terminating zero.
+    let data = wide(fp);
+    let r = unsafe { RegSetValueExW(key, wide(FINGERPRINT_VALUE).as_ptr(), 0, REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32) };
+    unsafe { RegCloseKey(key) };
+    if r != ERROR_SUCCESS {
+        return Err(reg_error("cannot record the key's fingerprint", r));
+    }
+    Ok(())
+}
+
+/// The recorded fingerprint; None if there is none, or what is there is no fingerprint.
+fn read_fingerprint(root: HKEY, subkey: &str) -> Result<Option<String>> {
+    let mut buf = [0u16; 32];
+    let mut size = size_of_val(&buf) as u32;
+    let (sub, value) = (wide(subkey), wide(FINGERPRINT_VALUE));
+    let r = unsafe { RegGetValueW(root, sub.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr().cast(), &mut size) };
+    match r {
+        ERROR_SUCCESS => {}
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_MORE_DATA | ERROR_UNSUPPORTED_TYPE => return Ok(None),
+        e => return Err(reg_error("cannot read the service's key fingerprint", e)),
+    }
+    let n = (size as usize / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..n]);
+    let s = s.trim_end_matches('\0');
+    Ok(keys::is_fingerprint(s).then(|| s.to_string()))
+}
+
+fn delete_fingerprint(root: HKEY, subkey: &str) -> Result<()> {
+    match unsafe { RegDeleteKeyValueW(root, wide(subkey).as_ptr(), wide(FINGERPRINT_VALUE).as_ptr()) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(()),
+        e => Err(reg_error("cannot remove the recorded key fingerprint", e)),
+    }
+}
+
+/// The fingerprint of the key the service was given, as `service install` or `service rekey`
+/// recorded it; None if nothing was recorded (as by an earlier safe-rdp). Any user may read it.
+pub fn key_fingerprint() -> Result<Option<String>> {
+    read_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)
+}
+
+/// Records the fingerprint of the key just stored. Without it nobody can tell which key the
+/// service has, and everybody is told so: not worth failing over.
+fn record_key_fingerprint(fp: &str) {
+    match write_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY, fp) {
+        Ok(()) => log!("key fingerprint {fp} recorded, for users to compare with their own key"),
+        Err(e) => log!("warning: {e}; users cannot tell which key the service has"),
     }
 }
 
@@ -213,9 +358,14 @@ fn netsh(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-pub fn install(host_args: &[String], port: u16, enable_sas: bool) -> Result<()> {
+/// `expect`: the fingerprint of the key the caller means the service to get (see
+/// `key_for_service`).
+pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option<&str>) -> Result<()> {
     let scm = open_scm()?;
-    let key = keystore::load_user_key().map_err(|e| format!("{e}\nThe service uses the key stored for the installing user."))?;
+    let key = key_for_service(expect)?;
+    // The old fingerprint goes before the key it names: a recorded one is never wrong, at worst
+    // missing.
+    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
 
     if let Some(svc) = open_service(&scm) {
         log!("stopping the existing service...");
@@ -270,6 +420,8 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool) -> Result<()> 
                 Sc(h)
             }
         };
+        // Its registry key exists now.
+        record_key_fingerprint(&keys::fingerprint(&key));
         let mut desc = wide("Remote desktop host for Tailscale peers (safe-rdp).");
         let d = SERVICE_DESCRIPTIONW { lpDescription: desc.as_mut_ptr() };
         ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_DESCRIPTION, &d as *const _ as *const c_void);
@@ -325,11 +477,36 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// Gives the installed service the key stored for the account that runs this (see
+/// `key_for_service`) and starts it again; its command line, firewall rule and everything else
+/// stay as they are.
+pub fn rekey(expect: Option<&str>) -> Result<()> {
+    let scm = open_scm()?;
+    let svc = open_service(&scm).ok_or("the service is not installed; install it with `safe-rdp service install`")?;
+    let key = key_for_service(expect)?;
+    delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
+    log!("stopping the service...");
+    // The agent reads the key when it starts: one still running would keep the old key.
+    if !stop_and_wait(&svc) {
+        bail!("the service did not stop, so its key was not replaced; try again");
+    }
+    let key_path = keystore::save_service_key(&key)?;
+    log!("service key replaced in {} (SYSTEM/Administrators only)", key_path.display());
+    record_key_fingerprint(&keys::fingerprint(&key));
+    drop(key);
+    if unsafe { StartServiceW(svc.0, 0, null()) } == 0 {
+        return Err(Error::last_os("StartServiceW"));
+    }
+    log!("service '{SERVICE_NAME}' started again with the new key");
+    Ok(())
+}
+
 pub fn uninstall() -> Result<()> {
     let scm = open_scm()?;
     match open_service(&scm) {
         Some(svc) => {
             stop_and_wait(&svc);
+            delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY).ok();
             if unsafe { DeleteService(svc.0) } == 0 {
                 return Err(Error::last_os("DeleteService"));
             }
@@ -741,6 +918,72 @@ mod tests {
         let (name, rest) = agent_stop_event(rest);
         assert_eq!((name, rest.len()), (None, 5));
         assert_eq!(agent_stop_event(&["--stop-event".to_string()]).0, None);
+    }
+
+    #[test]
+    fn the_expected_key_comes_first() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = args(&["--expect-key", "891D3768F5C4F960", "--files", "--port", "47301"]);
+        let (expect, rest) = expected_key(&a).unwrap();
+        assert_eq!(expect.as_deref(), Some("891d3768f5c4f960"));
+        assert_eq!(rest, &a[2..]);
+        let a = args(&["--files", "--transfer-dir", r"D:\Uploads"]);
+        assert_eq!(expected_key(&a).unwrap(), (None, &a[..]));
+        assert_eq!(expected_key(&[]).unwrap(), (None, &[][..]));
+        for bad in [&["--expect-key"][..], &["--expect-key", "srdp1-00"], &["--expect-key", "--files"], &["--files", "--expect-key", "891d3768f5c4f960"]] {
+            assert!(expected_key(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn refusals_say_whose_key_and_what_to_do() {
+        let m = other_key_message(r"PC\admin", Some("0123456789abcdef"), "891d3768f5c4f960");
+        assert!(m.contains(r"PC\admin") && m.contains("0123456789abcdef") && m.contains("891d3768f5c4f960"), "{m}");
+        assert!(m.contains("nothing was changed") && m.contains("key import") && m.contains("approv"), "{m}");
+        let m = other_key_message("admin", None, "891d3768f5c4f960");
+        assert!(m.contains("no readable key") && m.contains("891d3768f5c4f960"), "{m}");
+        assert!(PARAMETERS_KEY.contains(&format!(r"\Services\{SERVICE_NAME}\")));
+    }
+
+    /// A registry key of a test's own under HKEY_CURRENT_USER\Software, removed on drop.
+    struct TestKey(String);
+
+    impl TestKey {
+        fn new() -> TestKey {
+            let mut r = [0u8; 8];
+            crate::crypto::random(&mut r).unwrap();
+            TestKey(format!(r"Software\safe-rdp-test-{:016x}", u64::from_ne_bytes(r)))
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyW};
+            unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&self.0).as_ptr()) };
+        }
+    }
+
+    #[test]
+    fn fingerprints_are_recorded_read_and_removed() {
+        use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER as HKCU;
+        let k = TestKey::new();
+        let read = || read_fingerprint(HKCU, &k.0).unwrap();
+        assert_eq!(read(), None);
+        delete_fingerprint(HKCU, &k.0).unwrap();
+        write_fingerprint(HKCU, &k.0, "891d3768f5c4f960").unwrap();
+        assert_eq!(read().as_deref(), Some("891d3768f5c4f960"));
+        // Whatever else is there names no key.
+        for junk in ["not a fingerprint", "891D3768F5C4F960", &"a".repeat(100)] {
+            write_fingerprint(HKCU, &k.0, junk).unwrap();
+            assert_eq!(read(), None, "{junk}");
+        }
+        let one = 1u32;
+        let r = unsafe { RegSetKeyValueW(HKCU, wide(&k.0).as_ptr(), wide(FINGERPRINT_VALUE).as_ptr(), REG_DWORD, &one as *const u32 as *const c_void, 4) };
+        assert_eq!(r, ERROR_SUCCESS);
+        assert_eq!(read(), None);
+        write_fingerprint(HKCU, &k.0, "0123456789abcdef").unwrap();
+        delete_fingerprint(HKCU, &k.0).unwrap();
+        assert_eq!(read(), None);
     }
 
     #[test]

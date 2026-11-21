@@ -41,7 +41,11 @@ USAGE:
 
   safe-rdp service install [HOST OPTIONS] [--enable-sas]   (Windows, elevated) run as a
                                      SYSTEM service: works on the lock/sign-in screen and UAC
+  safe-rdp service rekey             (Windows, elevated) give the installed service this
+                                     account's key, keeping its options; restarts it
   safe-rdp service uninstall | status
+                                     install and rekey take --expect-key <fingerprint> first:
+                                     refuse unless this account's key has it (see `status`)
 
   safe-rdp monitors                  List monitors
   safe-rdp bench [--monitor N]       Measure capture/encode speed on this machine
@@ -164,7 +168,8 @@ fn dispatch(args: &[String]) -> Result<()> {
         #[cfg(windows)]
         "service" => match rest.first().map(String::as_str) {
             Some("install") => {
-                let cli = parse_host(&rest[1..], true)?;
+                let (expect, args) = platform::service::expected_key(&rest[1..])?;
+                let cli = parse_host(args, true)?;
                 if cli.key_file.is_some() {
                     bail!("--key-file is not supported for the service; it uses this user's stored key");
                 }
@@ -172,15 +177,27 @@ fn dispatch(args: &[String]) -> Result<()> {
                 if cli.opts.transfer_dir.as_deref().is_some_and(|d| !d.is_absolute()) {
                     bail!("--transfer-dir needs a full path (such as D:\\Uploads) for the service");
                 }
-                platform::service::install(&rest[1..], cli.opts.port, cli.opts.sas)
+                platform::service::install(args, cli.opts.port, cli.opts.sas, expect.as_deref())
+            }
+            Some("rekey") => {
+                let (expect, args) = platform::service::expected_key(&rest[1..])?;
+                if let Some(a) = args.first() {
+                    bail!("unknown option '{a}' (usage: safe-rdp service rekey [--expect-key <fingerprint>])");
+                }
+                platform::service::rekey(expect.as_deref())
             }
             Some("uninstall") => platform::service::uninstall(),
             Some("status") => {
-                println!("{}", platform::service::status()?);
+                let status = platform::service::status()?;
+                println!("{status}");
+                if status != "not installed" {
+                    let recorded = platform::service::key_fingerprint().map_err(|e| e.to_string());
+                    println!("{}", service_key_line(recorded, keystore::user_key_fingerprint().as_deref()));
+                }
                 Ok(())
             }
             Some("run") => platform::service::run_dispatcher(rest[1..].to_vec()),
-            _ => bail!("usage: safe-rdp service install|uninstall|status"),
+            _ => bail!("usage: safe-rdp service install|rekey|uninstall|status"),
         },
         "monitors" => {
             platform::init_process();
@@ -457,6 +474,8 @@ fn keygen(args: &[String]) -> Result<()> {
     if replaced && !force {
         bail!("a key is already stored; use `safe-rdp key show`, or `keygen --force` to replace it");
     }
+    #[cfg(windows)]
+    let old = keystore::user_key_fingerprint();
     let k = keys::generate()?;
     let path = keystore::save_user_key(&k)?;
     println!("{}", keys::format_key(&k));
@@ -465,6 +484,8 @@ fn keygen(args: &[String]) -> Result<()> {
     eprintln!("On the other machine run `safe-rdp key import` and paste the line above.");
     eprintln!("Treat it like a password: anyone with this key and tailnet access can control the host.");
     warn_old_key_in_use(replaced, false);
+    #[cfg(windows)]
+    report_service_key(old.as_deref(), Some(&keys::fingerprint(&k)));
     Ok(())
 }
 
@@ -479,29 +500,72 @@ fn warn_old_key_in_use(had_key: bool, removed: bool) {
         };
         eprintln!("note: a `safe-rdp host` that is already running keeps the old key until it is restarted{launcher}.");
     }
-    #[cfg(windows)]
-    if let Some(w) = service_key_warning(platform::service::status().as_deref().map_err(|e| e.to_string()), removed) {
+}
+
+/// After the stored key changed: whether the background service has the key stored now, from
+/// the fingerprint it recorded. `old`, `new`: fingerprints of the key stored before and now
+/// (None: none, or unreadable).
+#[cfg(windows)]
+fn report_service_key(old: Option<&str>, new: Option<&str>) {
+    let status = platform::service::status();
+    let recorded = platform::service::key_fingerprint().map_err(|e| e.to_string());
+    if let Some(w) = service_key_warning(status.as_deref().map_err(|e| e.to_string()), recorded, old, new) {
         eprintln!("{w}");
     }
 }
 
-/// The service keeps the key it was installed with: what to tell after the stored key changed,
-/// given `service status` (or why it failed). Nothing when the service is not installed.
+/// The service keeps the key it was given: what to tell after the stored key changed, given
+/// `service status` (or why it failed), the fingerprint the service recorded for its key (None:
+/// it recorded none, as an earlier safe-rdp did not) and those of the key stored before and
+/// now (`old`, `new`; None: none, or unreadable). Nothing when the service is not installed.
 #[cfg(windows)]
-fn service_key_warning(status: std::result::Result<&str, String>, removed: bool) -> Option<String> {
-    Some(match status {
+fn service_key_warning(
+    status: std::result::Result<&str, String>,
+    recorded: std::result::Result<Option<String>, String>,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<String> {
+    let was = if new.is_some() { "old" } else { "removed" };
+    let fix = match new {
+        Some(n) => format!("to give it this key, run `safe-rdp service rekey --expect-key {n}` from an elevated terminal (or `service uninstall`)"),
+        None => "run `safe-rdp service uninstall` from an elevated terminal to remove it".to_string(),
+    };
+    match status {
         Ok("not installed") => return None,
-        Ok(_) if removed => "warning: the background service keeps the key it was installed with, so it still accepts the removed key;\n\
-                             run `safe-rdp service uninstall` from an elevated terminal to remove it"
-            .to_string(),
-        Ok(_) => "warning: the background service keeps the key it was installed with, so it still accepts the old key;\n\
-                  run `safe-rdp service install` again from an elevated terminal to give it this key (or `service uninstall`)"
-            .to_string(),
-        Err(e) => format!(
-            "warning: cannot check the background service ({e}); if it is installed, it keeps the key it was installed with\n\
-             until you reinstall or remove it from an elevated terminal"
+        Ok(_) => {}
+        Err(e) => {
+            return Some(format!(
+                "warning: cannot check the background service ({e}); if it is installed, it keeps the key it was given;\n{fix}"
+            ));
+        }
+    }
+    Some(match recorded {
+        Ok(Some(r)) if new == Some(r.as_str()) => format!("note: the background service already has this key (fingerprint {r})."),
+        Ok(Some(r)) if old == Some(r.as_str()) => format!("warning: the background service still has the {was} key (fingerprint {r}) and accepts it;\n{fix}"),
+        Ok(Some(r)) if new.is_some() => format!("warning: the background service has another key (fingerprint {r}), not this one;\n{fix}"),
+        Ok(Some(r)) if old.is_some() => format!("note: the background service has another key (fingerprint {r}), not the removed one."),
+        Ok(Some(r)) => format!("warning: the background service has the key with fingerprint {r}, which may be the removed one;\n{fix}"),
+        Ok(None) => format!(
+            "warning: cannot tell which key the background service has (it recorded none, as an earlier safe-rdp did not),\n\
+             so it may still accept the {was} key; {fix}"
         ),
+        Err(e) => format!("warning: cannot tell which key the background service has ({e}),\nso it may still accept the {was} key; {fix}"),
     })
+}
+
+/// `service status`'s line on the service's key: the fingerprint it recorded (None: none, as an
+/// earlier safe-rdp did not record it), compared with that of the key stored for this user.
+#[cfg(windows)]
+fn service_key_line(recorded: std::result::Result<Option<String>, String>, mine: Option<&str>) -> String {
+    let fix = |m: &str| format!("`safe-rdp service rekey --expect-key {m}` from an elevated terminal gives it yours");
+    match (recorded, mine) {
+        (Ok(Some(r)), Some(m)) if r == m => format!("key: {r}, the key stored for this user"),
+        (Ok(Some(r)), Some(m)) => format!("key: {r}, not the key stored for this user ({m});\n{}", fix(m)),
+        (Ok(Some(r)), None) => format!("key: {r} (no readable key is stored for this user)"),
+        (Ok(None), Some(m)) => format!("key: not recorded (as by an earlier safe-rdp);\n{}", fix(m)),
+        (Ok(None), None) => "key: not recorded (as by an earlier safe-rdp)".to_string(),
+        (Err(e), _) => format!("key: cannot tell ({e})"),
+    }
 }
 
 fn key_cmd(args: &[String]) -> Result<()> {
@@ -513,10 +577,15 @@ fn key_cmd(args: &[String]) -> Result<()> {
             let mut line = platform::read_secret("Paste key (input hidden): ")?;
             let k = keys::parse_key(&line);
             unsafe { util::wipe(line.as_bytes_mut()) };
+            let k = k?;
             let had_key = keystore::user_key_path()?.exists();
-            let path = keystore::save_user_key(&k?)?;
+            #[cfg(windows)]
+            let old = keystore::user_key_fingerprint();
+            let path = keystore::save_user_key(&k)?;
             eprintln!("Key stored in {}", path.display());
             warn_old_key_in_use(had_key, false);
+            #[cfg(windows)]
+            report_service_key(old.as_deref(), Some(&keys::fingerprint(&k)));
             Ok(())
         }
         Some("show") => {
@@ -524,9 +593,13 @@ fn key_cmd(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("forget") => {
+            #[cfg(windows)]
+            let old = keystore::user_key_fingerprint();
             if keystore::forget_user_key()? {
                 eprintln!("Stored key deleted.");
                 warn_old_key_in_use(true, true);
+                #[cfg(windows)]
+                report_service_key(old.as_deref(), None);
             } else {
                 eprintln!("No key was stored.");
             }
@@ -610,18 +683,56 @@ fn bench(args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
+    const OLD: &str = "0123456789abcdef";
+    const NEW: &str = "891d3768f5c4f960";
+    const OTHER: &str = "fedcba9876543210";
+
+    fn warning(recorded: std::result::Result<Option<&str>, &str>, old: Option<&str>, new: Option<&str>) -> String {
+        let recorded = recorded.map(|r| r.map(String::from)).map_err(String::from);
+        service_key_warning(Ok("running"), recorded, old, new).unwrap()
+    }
+
     #[test]
-    fn key_changes_warn_while_the_service_holds_the_old_key() {
-        assert_eq!(service_key_warning(Ok("not installed"), false), None);
-        assert_eq!(service_key_warning(Ok("not installed"), true), None);
-        for status in ["running", "stopped", "starting", "unknown"] {
-            let replaced = service_key_warning(Ok(status), false).unwrap();
-            assert!(replaced.contains("old key") && replaced.contains("service install"), "{replaced}");
-            let removed = service_key_warning(Ok(status), true).unwrap();
-            assert!(removed.contains("removed key") && removed.contains("service uninstall"), "{removed}");
+    fn key_changes_say_which_key_the_service_has() {
+        for new in [Some(NEW), None] {
+            assert_eq!(service_key_warning(Ok("not installed"), Ok(Some(OLD.into())), Some(OLD), new), None);
+            assert_eq!(service_key_warning(Ok("not installed"), Ok(None), None, new), None);
         }
+        // Replaced: the service has the new key already, the old one, or yet another.
+        let w = warning(Ok(Some(NEW)), Some(OLD), Some(NEW));
+        assert!(w.starts_with("note:") && w.contains("already has this key"), "{w}");
+        let w = warning(Ok(Some(OLD)), Some(OLD), Some(NEW));
+        assert!(w.starts_with("warning:") && w.contains("still has the old key") && w.contains(&format!("rekey --expect-key {NEW}")), "{w}");
+        let w = warning(Ok(Some(OTHER)), Some(OLD), Some(NEW));
+        assert!(w.contains("another key") && w.contains(OTHER) && w.contains(&format!("rekey --expect-key {NEW}")), "{w}");
+        // Removed: the service has the removed key, another one, or nobody can tell.
+        let w = warning(Ok(Some(OLD)), Some(OLD), None);
+        assert!(w.contains("still has the removed key") && w.contains("service uninstall") && !w.contains("rekey"), "{w}");
+        let w = warning(Ok(Some(OTHER)), Some(OLD), None);
+        assert!(w.starts_with("note:") && w.contains("not the removed one"), "{w}");
+        let w = warning(Ok(Some(OTHER)), None, None);
+        assert!(w.starts_with("warning:") && w.contains("may be the removed one"), "{w}");
         // Not knowing is no reason to stay quiet.
-        let unknown = service_key_warning(Err("access denied".into()), false).unwrap();
-        assert!(unknown.contains("access denied") && unknown.contains("reinstall"), "{unknown}");
+        for new in [Some(NEW), None] {
+            for w in [warning(Ok(None), Some(OLD), new), warning(Err("access denied"), Some(OLD), new)] {
+                assert!(w.starts_with("warning:") && w.contains("cannot tell") && w.contains("may still accept"), "{w}");
+            }
+        }
+        assert!(warning(Err("access denied"), None, Some(NEW)).contains("access denied"));
+        let w = service_key_warning(Err("access denied".into()), Ok(None), Some(OLD), Some(NEW)).unwrap();
+        assert!(w.contains("access denied") && w.contains(&format!("rekey --expect-key {NEW}")), "{w}");
+        let w = service_key_warning(Err("access denied".into()), Ok(None), Some(OLD), None).unwrap();
+        assert!(w.contains("access denied") && w.contains("service uninstall"), "{w}");
+    }
+
+    #[test]
+    fn service_status_compares_the_keys() {
+        let line = |r: std::result::Result<Option<&str>, &str>, mine| service_key_line(r.map(|r| r.map(String::from)).map_err(String::from), mine);
+        assert_eq!(line(Ok(Some(NEW)), Some(NEW)), format!("key: {NEW}, the key stored for this user"));
+        let l = line(Ok(Some(OLD)), Some(NEW));
+        assert!(l.contains(&format!("{OLD}, not the key stored")) && l.contains(&format!("rekey --expect-key {NEW}")), "{l}");
+        assert!(line(Ok(Some(OLD)), None).contains("no readable key"));
+        assert!(line(Ok(None), Some(NEW)).contains("not recorded") && line(Ok(None), Some(NEW)).contains(NEW));
+        assert!(line(Err("access denied"), Some(NEW)).contains("cannot tell (access denied)"));
     }
 }
