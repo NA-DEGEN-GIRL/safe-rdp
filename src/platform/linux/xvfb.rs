@@ -813,6 +813,11 @@ mod tests {
         let cleaner = File::open(&dir).unwrap();
         assert!(cleaner.try_lock().is_err(), "the directory is not locked");
         drop((kept, clone));
+        // A child another test forks just now shares the open directory until it execs.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cleaner.try_lock().is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(cleaner.try_lock().is_ok(), "still locked once nothing holds it");
         std::fs::remove_dir_all(&dir).unwrap();
     }

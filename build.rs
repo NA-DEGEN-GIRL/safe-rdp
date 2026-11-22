@@ -4,7 +4,8 @@
 //! No resource compiler is needed: the icon is drawn here and written as a `.res` file, which
 //! link.exe accepts as an input like an object file. Only binaries (and their unit-test harness)
 //! get these, not integration tests. `assets/icon.svg` is the same drawing for documents; keep
-//! the two in step. Binaries also never take a DLL from their own folder (see `/DELAYLOAD` below).
+//! the two in step. Binaries also keep Windows' DLL search out of their own folder (see
+//! `/DELAYLOAD` below).
 
 use std::path::{Path, PathBuf};
 
@@ -33,18 +34,20 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
     // The manifest carries its own trustInfo (asInvoker); do not let the linker add another.
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
-    // No DLL may come from the executable's own folder. The loader looks there first by
-    // default, so a DLL that lands beside safe-rdp.exe (a received file, a download, another
-    // user's file in a shared folder) would run as code in it, elevated during `service
-    // install`. A DLL imported at start-up is loaded before main() can change that, and its own
-    // imports follow its own load flags, usually none: wtsapi32 brought sspicli.dll, dxgi
-    // brought powrprof.dll and with it umpdc.dll, from beside the executable. So:
+    // Windows must never look for a DLL in the executable's own folder. Its DLL search looks
+    // there first by default, so a DLL that lands beside safe-rdp.exe (a received file, a
+    // download, another user's file in a shared folder) would run as code in it, elevated during
+    // `service install`. A DLL imported at start-up is loaded before main() can change that, and
+    // its own imports follow its own load flags, usually none: wtsapi32 brought sspicli.dll,
+    // dxgi brought powrprof.dll and with it umpdc.dll, from beside the executable. So:
     // - The DLLs in DELAY_LOADED load on first use, after main() has made System32 the only
     //   place DLLs come from (SetDefaultDllDirectories), and their imports with them.
     // - Everything still imported at start-up is a KnownDLL: Windows maps those, and what they
     //   import, from its own copies. /DEPENDENTLOADFLAG 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32)
     //   also looks for the executable's own imports in System32 only.
-    // tests/dll_imports.rs checks the built executable for both.
+    // tests/dll_imports.rs checks the built executable for both. Not covered: the common
+    // controls v6 that app.manifest asks for come through Windows' side-by-side mechanism, from
+    // the WinSxS store, unless files placed beside the executable redirect it (README).
     println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     for dll in DELAY_LOADED {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");

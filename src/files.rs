@@ -3,12 +3,12 @@
 //!
 //! Receiving side guarantees:
 //! * names are a single plain path component (`proto::valid_file_name`), never a path;
-//! * data goes to a hidden, randomly named `.srdp-*.part` file created exclusively (on Windows
-//!   nobody else can write, delete or rename it while the transfer holds it; elsewhere a
-//!   same-user program could still alter it, which only a length check catches), and only
-//!   becomes visible after the size and SHA-256 match and the part still holds that many bytes;
-//!   anything incomplete is
-//!   deleted (parts left behind by a crash or kill are removed after a day);
+//! * data goes to a randomly named `.srdp-*.part` file (hidden by its leading dot on Linux, not
+//!   on Windows) created exclusively (on Windows nobody else can write, delete or rename it
+//!   while the transfer holds it; elsewhere a same-user program could still alter it, which only
+//!   a length check catches), and only gets the file's name after the size and SHA-256 match and
+//!   the part still holds that many bytes; anything incomplete is deleted (parts left behind by a
+//!   crash or kill are removed after a day);
 //! * existing files are never overwritten (`name (1).ext`, `name (2).ext`, ...);
 //! * received files are marked as coming from another machine (Windows: Mark of the Web, written
 //!   when the part is created), so SmartScreen / Office Protected View treat them as untrusted;
@@ -481,6 +481,25 @@ impl Outgoing {
     }
 }
 
+/// For tests, which save into the temp folder: whether its volume has room for what they write
+/// and still keeps the `keep` reserve. If not, says so, and the calling test skips its saving
+/// rather than fail on a PC that is merely short of disk space.
+#[cfg(test)]
+pub(crate) fn room_for_tests(keep: Reserve) -> bool {
+    /// More than the tests running at once announce or write.
+    const TEST_BYTES: u64 = 256 << 20;
+    let mut r = [0u8; 8];
+    crate::crypto::random(&mut r).unwrap();
+    let probe = std::env::temp_dir().join(format!("srdp-test-space-{}", crate::util::hex_encode(&r)));
+    let space = File::create(&probe).ok().and_then(|f| space(&f));
+    let _ = std::fs::remove_file(&probe);
+    let fits = room(space, TEST_BYTES, keep);
+    if let Err(reserve) = fits {
+        eprintln!("saving files skipped: the temp folder's volume has less than {} free beyond the {} it keeps", amount(TEST_BYTES), amount(reserve));
+    }
+    fits.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +514,9 @@ mod tests {
 
     #[test]
     fn roundtrip_and_no_overwrite() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let src_dir = tmpdir("src");
         let dst_dir = tmpdir("dst");
         let src = src_dir.join("report.txt");
@@ -534,6 +556,9 @@ mod tests {
 
     #[test]
     fn parts_are_private_to_each_transfer() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("parts");
         // The same name and id twice at once (ids restart in every session): no collision.
         let mut a = Incoming::begin(&dir, 1, 1, "same.bin").unwrap();
@@ -580,6 +605,9 @@ mod tests {
 
     #[test]
     fn a_part_changed_behind_the_transfer_is_never_published() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("changed");
         let data = [7u8; 4096];
         let sum = crate::crypto::sha256(&[&data]);
@@ -616,6 +644,9 @@ mod tests {
 
     #[test]
     fn long_names_still_get_unique_names() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("long");
         let name = format!("{}.txt", "가".repeat(83)); // 253 bytes
         assert_eq!(receive(&dir, 1, &name, b"1").file_name().unwrap().to_str().unwrap(), name);
@@ -634,6 +665,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_names_overflow_and_checksum() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("bad");
         assert!(Incoming::begin(&dir, 1, 1, "../x").is_err());
         assert!(Incoming::begin(&dir, 1, 1, "a\\b").is_err());
@@ -698,6 +732,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&t);
         }
         // Any other folder is fine.
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("not-exe");
         assert_eq!(receive(&dir, 1, "dxgi.dll", b"x").file_name().unwrap(), "dxgi.dll");
         let _ = std::fs::remove_dir_all(&dir);
@@ -742,6 +779,9 @@ mod tests {
 
     #[test]
     fn each_transfer_keeps_its_reserve() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("reserve");
         let inc = Incoming::begin(&dir, 1, 10, "x.bin").unwrap();
         assert_eq!(inc.reserve, Reserve::Ordinary);
@@ -764,6 +804,9 @@ mod tests {
 
     #[test]
     fn free_space_is_read_from_the_open_part() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("space");
         let inc = Incoming::begin(&dir, 1, 10, "x.bin").unwrap();
         let (free, total) = space(inc.file.as_ref().unwrap()).expect("the volume reports no size");
@@ -774,6 +817,9 @@ mod tests {
 
     #[test]
     fn announced_bytes_are_counted_until_they_arrive() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("promised");
         let mut inc = Incoming::begin(&dir, 1, 3 * SPACE_RECHECK, "big.bin").unwrap();
         assert_eq!(inc.promised, 3 * SPACE_RECHECK);
@@ -794,6 +840,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_abandoned_part_is_removed_through_its_handle() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("handle");
         let mut inc = Incoming::begin(&dir, 1, 10, "x.bin").unwrap();
         inc.write(b"12345").unwrap();
@@ -815,6 +864,9 @@ mod tests {
 
     #[test]
     fn folder_usage_counts_without_following_links() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
         let dir = tmpdir("usage");
         assert_eq!(dir_usage(&dir).unwrap(), (0, 0));
         std::fs::write(dir.join("a"), [0u8; 100]).unwrap();
