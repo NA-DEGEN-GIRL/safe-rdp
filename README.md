@@ -377,8 +377,10 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
 - Independent review: the 40 issues found by per-area reviewers were checked by other agents that tried to refute them, then fixed;
   the fixed code was attacked again and the remaining issues were fixed in two more rounds; finally a new reviewer re-examined all
   the fixes for regressions, and the 6 issues found there were fixed as well. A later full review found 25 more medium-severity
-  issues; they were fixed, the fixes were verified separately, and what that verification found was fixed in a further round
-- Unit and integration tests: 289 on Windows, 213 on Linux + 18 integration tests that need Xvfb or PipeWire (`cargo test -- --ignored`)
+  issues; they were fixed over several rounds, each round's fixes attacked by separate agents trying to refute them, until a final
+  review of the whole change found nothing of medium severity or above that was not fixed
+- Unit and integration tests: 310 on Windows (3 of them check the built executable's DLL imports), 221 on Linux + 25 that need
+  Xvfb, PipeWire, Tailscale or a long run (`cargo test -- --ignored`)
   - Crypto: SHA-256, HMAC (RFC 4231), HKDF (RFC 5869), AES-GCM (NIST), ECDH (NIST CAVS), fixed CNG↔OpenSSL byte vectors
   - Codec: [MS-XCA] spec examples, cabinet.dll golden streams and cross-decoding, fuzzing with 30,000 malformed streams, lossy codec PSNR and ffmpeg cross-checks
   - Host sessions end to end (settings, files, flow control, session replacement and reconnects), viewer reconnect policy and flood limits, launcher command line, JSON/Tailscale parsing
