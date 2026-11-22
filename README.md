@@ -276,10 +276,11 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
 - On Windows, safe-rdp.exe imports at start-up only DLLs that Windows maps, with what they import, from its own copies
   (KnownDLLs); every other DLL it uses is loaded on first use and looked for in System32 only. So a `dxgi.dll` or `sspicli.dll`
   lying beside it (in Downloads, a shared folder, among received files) is not loaded. Windows' side-by-side mechanism is the
-  exception: a `safe-rdp.exe.config`, an assembly manifest and a `comctl32.dll` placed beside it can still make Windows load that
-  copy of the common controls. So keep safe-rdp.exe where only you or administrators can write
-- The only parsing before authentication is one fixed-length 101-byte message. The whole handshake has a 10-second deadline (a peer
-  cannot hang on by trickling one byte at a time), concurrent unauthenticated connections are capped at 8 in total, 2 per address and
+  exception: a `safe-rdp.exe.config` and an assembly manifest placed beside it can still redirect the common controls it asks for,
+  and through them make Windows load any DLL from that folder. So keep safe-rdp.exe where only you or administrators can write
+- The only parsing before authentication is one fixed-length 101-byte message. The handshake and the viewer's first message (its
+  hello, at most 13 bytes) share one 10-second deadline from accept (a peer cannot hang on by trickling one byte at a time), and
+  until a viewer is let in or turned away, concurrent connections are capped at 8 in total, 2 per address and
   (for IPv6 outside Tailscale) 4 per /64, failed addresses get a 1-second delay, and logging before authentication is limited to a few
   lines per minute
 - After authentication, every message, tile coordinate and decompressed size is still validated (a single message that would draw more

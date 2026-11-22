@@ -45,9 +45,11 @@ fn main() {
     // - Everything still imported at start-up is a KnownDLL: Windows maps those, and what they
     //   import, from its own copies. /DEPENDENTLOADFLAG 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32)
     //   also looks for the executable's own imports in System32 only.
-    // tests/dll_imports.rs checks the built executable for both. Not covered: the common
-    // controls v6 that app.manifest asks for come through Windows' side-by-side mechanism, from
-    // the WinSxS store, unless files placed beside the executable redirect it (README).
+    // tests/dll_imports.rs checks the built executable for both. Not covered: side-by-side
+    // redirection. Because app.manifest depends on the common controls v6, a .config file and an
+    // assembly manifest placed beside the executable can redirect that dependency to a private
+    // assembly, whose manifest may name any DLL, KnownDLLs and delay-loaded ones included; Windows
+    // then loads it from that folder. Only a folder nobody else can write to rules this out (README).
     println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     for dll in DELAY_LOADED {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");

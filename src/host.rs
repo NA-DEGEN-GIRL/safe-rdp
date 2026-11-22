@@ -2714,6 +2714,9 @@ mod tests {
         ClientMsg::Ping(1).encode(&mut b);
         RecordWriter::new(vs.try_clone().unwrap(), vk.send).send(&b).unwrap();
         assert!(matches!(received.recv().unwrap(), Ok(ClientMsg::Ping(1))));
+        // Let the receiving thread get back into its read: a kick before it checks `stop` again
+        // would have it take the drain slot itself (`Parting(None)`), with no deadline to move.
+        std::thread::sleep(Duration::from_millis(200));
         ctl.kick_with_notice("another viewer connected to this host", &drains);
         drop(received);
         // The deadline, brought forward from `DRAIN_FOR` after the kick.
@@ -3255,18 +3258,44 @@ mod session_tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        // Pull: the copied files arrive one after another; one that vanished is reported.
-        if !files::room_for_tests(files::Reserve::Ordinary) {
-            return;
+        // Pull: the copied files arrive one after another; one that vanished is reported. Skipped
+        // on a volume short of space; the takeover and stop checks below still run.
+        let host = TestHost::start(|o| o.copied_files = || PULL_FILES.get().cloned().unwrap_or_default());
+        let mut c = host.connect(ViewerOptions::default());
+        if files::room_for_tests(files::Reserve::Ordinary) {
+            pull_copied_files(&mut c);
         }
+
+        // A second viewer replaces the first at once, although the first keeps its socket open
+        // (the old session must not linger in a blocked read until its I/O timeout).
+        let t = Instant::now();
+        let mut c2 = host.connect(ViewerOptions::default());
+        assert!(t.elapsed() < Duration::from_secs(3), "handover took {:?}", t.elapsed());
+        let t = Instant::now();
+        while c.conn.reader.recv().is_ok() {
+            assert!(t.elapsed() < Duration::from_secs(10), "the first viewer was not disconnected");
+        }
+        c2.frame(1);
+        c2.ping(9);
+
+        // Stopping the host ends its session promptly, with the viewer still connected.
+        let t = Instant::now();
+        drop(host);
+        assert!(t.elapsed() < Duration::from_secs(3), "stopping took {:?}", t.elapsed());
+        let t = Instant::now();
+        while c2.conn.reader.recv().is_ok() {
+            assert!(t.elapsed() < Duration::from_secs(10), "the session outlived the host");
+        }
+    }
+
+    /// The pull part of `view_only_pull_and_replacement`.
+    fn pull_copied_files(c: &mut Client) {
         let src = tmpdir("pull-src");
         let dst = tmpdir("pull-dst");
         let a: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
         std::fs::write(src.join("a.txt"), &a).unwrap();
         std::fs::write(src.join("empty.bin"), b"").unwrap();
         PULL_FILES.set(vec![src.join("a.txt"), src.join("missing.txt"), src.join("empty.bin")]).unwrap();
-        let host = TestHost::start(|o| o.copied_files = || PULL_FILES.get().cloned().unwrap_or_default());
-        let mut c = host.connect(ViewerOptions::default());
         c.send(ClientMsg::FilePull);
         let mut current: Option<Incoming> = None;
         let mut received = Vec::new();
@@ -3303,27 +3332,6 @@ mod session_tests {
         assert!(std::fs::read(&received[1].1).unwrap().is_empty());
         assert!(notices.len() == 1 && notices[0].contains("missing.txt"), "{notices:?}");
         c.frame(1);
-
-        // A second viewer replaces the first at once, although the first keeps its socket open
-        // (the old session must not linger in a blocked read until its I/O timeout).
-        let t = Instant::now();
-        let mut c2 = host.connect(ViewerOptions::default());
-        assert!(t.elapsed() < Duration::from_secs(3), "handover took {:?}", t.elapsed());
-        let t = Instant::now();
-        while c.conn.reader.recv().is_ok() {
-            assert!(t.elapsed() < Duration::from_secs(10), "the first viewer was not disconnected");
-        }
-        c2.frame(1);
-        c2.ping(9);
-
-        // Stopping the host ends its session promptly, with the viewer still connected.
-        let t = Instant::now();
-        drop(host);
-        assert!(t.elapsed() < Duration::from_secs(3), "stopping took {:?}", t.elapsed());
-        let t = Instant::now();
-        while c2.conn.reader.recv().is_ok() {
-            assert!(t.elapsed() < Duration::from_secs(10), "the session outlived the host");
-        }
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
     }

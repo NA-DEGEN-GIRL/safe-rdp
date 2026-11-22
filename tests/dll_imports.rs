@@ -1,8 +1,8 @@
 //! Windows never looks for a DLL of the built safe-rdp.exe in its own folder (build.rs, main()):
 //! what it imports at start-up is a KnownDLL, which Windows maps together with its imports from
 //! its own copies; everything else is delay-loaded, after main() has limited the DLL search to
-//! System32. (The common controls v6 its manifest asks for come through side-by-side instead,
-//! from the WinSxS store unless files placed beside it redirect them: see README.)
+//! System32. (Not covered: side-by-side redirection of its manifest's common controls v6 by
+//! files placed beside it, which can name any DLL: see build.rs and README.)
 //! This reads the executable's import tables and checks that on this Windows: a new import that
 //! is not a KnownDLL would be looked for beside the executable, together with its own imports,
 //! before main() runs.

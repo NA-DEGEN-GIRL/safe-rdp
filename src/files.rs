@@ -495,7 +495,8 @@ pub(crate) fn room_for_tests(keep: Reserve) -> bool {
     let _ = std::fs::remove_file(&probe);
     let fits = room(space, TEST_BYTES, keep);
     if let Err(reserve) = fits {
-        eprintln!("saving files skipped: the temp folder's volume has less than {} free beyond the {} it keeps", amount(TEST_BYTES), amount(reserve));
+        // Through log! rather than eprintln!, which the test harness hides for passing tests.
+        crate::log!("saving files skipped: the temp folder's volume has less than {} free beyond the {} it keeps", amount(TEST_BYTES), amount(reserve));
     }
     fits.is_ok()
 }

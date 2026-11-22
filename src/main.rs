@@ -99,8 +99,8 @@ fn main() {
     // DLLs Windows looks for from here on (for us or on our behalf) come from System32 only,
     // never from this executable's folder, where anyone may have left a file. That includes
     // every DLL we import that is not a KnownDLL, and whatever those import: build.rs has them
-    // loaded on first use, so nothing may call into them before this line. (The common controls
-    // v6 of app.manifest come through side-by-side instead; see build.rs.)
+    // loaded on first use, so nothing may call into them before this line. (Side-by-side
+    // redirection, through files placed beside the executable, is not covered; see build.rs.)
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
@@ -600,6 +600,11 @@ fn key_cmd(args: &[String]) -> Result<()> {
             // to anything watching the file, as the launcher does while it shares).
             if keystore::load_user_key().is_ok_and(|old| old.0 == k.0) {
                 eprintln!("This key is already stored.");
+                #[cfg(windows)]
+                {
+                    let same = keys::fingerprint(&k);
+                    report_service_key(Some(&same), Some(&same));
+                }
                 return Ok(());
             }
             let had_key = keystore::user_key_path()?.exists();
