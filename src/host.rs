@@ -91,10 +91,14 @@ impl Default for HostOptions {
     }
 }
 
-/// Longest a handshake may take in all, however the peer paces its bytes.
+/// Longest a handshake and the viewer's hello after it may take in all, counted from the
+/// accept, however the peer paces its bytes.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Handshakes in progress at once, in all and per source (see `source`).
+/// The longest hello (`ClientMsg::Hello` with an instance): the most the host reads of a
+/// connection before it is let in.
+const MAX_HELLO: usize = 5 + 8;
+/// Connections not let in yet (handshake, hello) at once, in all and per source (see `source`).
 const MAX_PENDING: usize = 8;
 const MAX_PENDING_PER_ADDR: usize = 2;
 const MAX_PENDING_PER_NET: usize = 4;
@@ -433,11 +437,13 @@ fn count_down(map: &mut HashMap<IpAddr, usize>, key: IpAddr) {
     }
 }
 
-/// Handshakes in progress: at most `MAX_PENDING` in all, `MAX_PENDING_PER_ADDR` from one
-/// address and `MAX_PENDING_PER_NET` from one non-Tailscale IPv6 /64, so one peer without the
-/// key cannot keep everybody else out. A failed one leaves the total but keeps its source's
-/// place for `FAILURE_PENALTY`; at most `MAX_PENALTIES` do at once, so peers with many
-/// addresses cannot make the host hold ever more threads.
+/// Handshakes in progress, and authenticated connections until the host has answered their
+/// hello: at most `MAX_PENDING` in all, `MAX_PENDING_PER_ADDR` from one address and
+/// `MAX_PENDING_PER_NET` from one non-Tailscale IPv6 /64, so one peer without the key cannot
+/// keep everybody else out, nor one with it make the host hold ever more connections that wait
+/// for their hello. A failed handshake leaves the total but keeps its source's place for
+/// `FAILURE_PENALTY`; at most `MAX_PENALTIES` do at once, so peers with many addresses cannot
+/// make the host hold ever more threads.
 #[derive(Default)]
 struct Pending {
     total: usize,
@@ -488,7 +494,7 @@ impl Pending {
     }
 }
 
-/// A handshake's place in `Host::pending`, given back when dropped.
+/// A connection's place in `Host::pending`, given back when dropped.
 struct Slot {
     host: Arc<Host>,
     ip: IpAddr,
@@ -570,9 +576,9 @@ impl LogBudget {
     }
 }
 
-/// The handshake socket with an absolute deadline: each read and write gets only the time that
-/// is left. The socket's own timeouts restart with every byte, so a peer trickling its hello
-/// could otherwise hold a handshake slot for many minutes.
+/// The socket of a connection not let in yet with an absolute deadline: each read and write
+/// gets only the time that is left. The socket's own timeouts restart with every byte, so a
+/// peer trickling its handshake or hello could otherwise hold a pending slot for many minutes.
 struct Deadline<'a> {
     s: &'a TcpStream,
     until: Instant,
@@ -670,6 +676,7 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
                 continue;
             }
         };
+        let until = Instant::now() + HANDSHAKE_TIMEOUT;
         // Accepted sockets can inherit the listener's non-blocking mode (they do on Windows).
         if stream.set_nonblocking(false).is_err() {
             continue;
@@ -687,11 +694,9 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
         let h = host.clone();
         // If the thread cannot start, dropping the closure gives the slot back.
         let spawned = std::thread::Builder::new().name("session".into()).spawn(move || {
-            match authenticate(&h, &stream, peer) {
-                Some(keys) => {
-                    drop(slot);
-                    serve_session(&h, stream, peer, keys);
-                }
+            match authenticate(&h, &stream, peer, until) {
+                // The slot stays taken until the viewer is let in or turned away.
+                Some(keys) => serve_session(&h, stream, peer, keys, slot, until),
                 None => {
                     // Slow down guessing from this address without holding up anybody else.
                     slot.penalize();
@@ -708,9 +713,9 @@ pub fn serve(listener: TcpListener, opts: HostOptions, psk: Secret<32>, stop: &A
     Ok(())
 }
 
-fn authenticate(host: &Host, stream: &TcpStream, peer: SocketAddr) -> Option<channel::SessionKeys> {
+fn authenticate(host: &Host, stream: &TcpStream, peer: SocketAddr, until: Instant) -> Option<channel::SessionKeys> {
     let _ = stream.set_nodelay(true);
-    match handshake(stream, &host.psk.0, Instant::now() + HANDSHAKE_TIMEOUT) {
+    match handshake(stream, &host.psk.0, until) {
         Ok(k) => Some(k),
         Err(e) => {
             host.log_unauthenticated(peer.ip(), format_args!("authentication failed for {peer}: {e}"));
@@ -733,18 +738,24 @@ struct Hello {
     instance: u64,
 }
 
-/// Sets up an authenticated connection's records and reads the viewer's hello.
-fn read_hello(stream: TcpStream, keys: channel::SessionKeys) -> Result<(Arc<Out>, RecordReader<TcpStream>, Hello)> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let out = Arc::new(Out::new(RecordWriter::new(stream.try_clone()?, keys.send)));
-    let mut reader = RecordReader::new(stream, keys.recv);
-    match ClientMsg::decode(reader.recv()?)? {
-        ClientMsg::Hello { downscale, quality, monitor, flags, instance } => {
-            Ok((out, reader, Hello { downscale, quality, monitor, flags, instance }))
-        }
+/// Sets up an authenticated connection's records and reads the viewer's hello, by `until`
+/// however slowly it comes. A first record longer than any hello is refused before anything is
+/// allocated for it.
+fn read_hello(stream: TcpStream, keys: channel::SessionKeys, until: Instant) -> Result<(Arc<Out>, RecordReader<TcpStream>, Hello)> {
+    let w = stream.try_clone()?;
+    w.set_write_timeout(Some(IO_TIMEOUT))?;
+    // The hello comes through the writer's handle, which reads nothing after.
+    let mut first = RecordReader::new(Deadline { s: &w, until }, keys.recv);
+    let hello = match ClientMsg::decode(first.recv_max(MAX_HELLO)?)? {
+        ClientMsg::Hello { downscale, quality, monitor, flags, instance } => Hello { downscale, quality, monitor, flags, instance },
         _ => bail!("protocol error: viewer did not start with a hello"),
-    }
+    };
+    // Each of the session's reads may wait `IO_TIMEOUT`, not what the handshake or the hello
+    // left of the deadline: set only now, as Linux keeps one timeout per socket (Windows one
+    // per handle).
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    let reader = first.with_reader(stream);
+    Ok((Arc::new(Out::new(RecordWriter::new(w, keys.send))), reader, hello))
 }
 
 /// Whether a viewer whose hello has `flags` and `instance` may replace the live session, whose
@@ -763,10 +774,13 @@ fn refuse(out: &Out, sock: &TcpStream, text: &str) {
     }
 }
 
-fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys) {
+/// Serves an authenticated connection, which keeps its place among the pending ones (`slot`)
+/// until it is let in or turned away, so that neither connections waiting for their hello (due
+/// by `until`) nor ones being turned away pile up.
+fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: channel::SessionKeys, slot: Slot, until: Instant) {
     let Ok(sock) = stream.try_clone() else { return };
     // The hello first: whether this viewer may replace the live session depends on it.
-    let (out, reader, hello) = match read_hello(stream, keys) {
+    let (out, reader, hello) = match read_hello(stream, keys, until) {
         Ok(h) => h,
         Err(e) => {
             log!("no session for {peer}: {e}");
@@ -788,6 +802,8 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
         }
         cur.replace(ctl.clone())
     };
+    // Let in: the next viewer let in replaces this session, which no longer counts as pending.
+    drop(slot);
     if let Some(old) = old {
         log!("replacing the existing session");
         old.kick_with_notice("another viewer connected to this host", &host.drains);
@@ -2572,6 +2588,21 @@ mod tests {
         ((s, keys), viewer.join().unwrap())
     }
 
+    /// What `serve` does with a connection it accepted from an allowed peer.
+    fn serve_accepted(host: &Arc<Host>, s: TcpStream, peer: SocketAddr) {
+        let until = Instant::now() + HANDSHAKE_TIMEOUT;
+        lock(&host.pending).admit(peer.ip()).unwrap();
+        let slot = Slot { host: host.clone(), ip: peer.ip(), penalized: false };
+        let keys = handshake(&s, &PAIR_KEY, until).unwrap();
+        serve_session(host, s, peer, keys, slot, until);
+    }
+
+    fn hello_bytes(flags: u8, instance: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        ClientMsg::Hello { downscale: 1, quality: QUALITY_DEFAULT, monitor: MONITOR_DEFAULT, flags, instance }.encode(&mut b);
+        b
+    }
+
     /// Reads until the connection ends: the tiles records and the last notice that came.
     fn read_to_end(reader: &mut RecordReader<TcpStream>) -> (usize, Option<String>) {
         let (mut tiles, mut notice) = (0, None);
@@ -2725,8 +2756,7 @@ mod tests {
             std::thread::spawn(move || {
                 for _ in 0..2 {
                     let (s, peer) = l.accept().unwrap();
-                    let keys = handshake(&s, &PAIR_KEY, Instant::now() + Duration::from_secs(10)).unwrap();
-                    serve_session(&host, s, peer, keys);
+                    serve_accepted(&host, s, peer);
                 }
             })
         };
@@ -2743,6 +2773,85 @@ mod tests {
         }
         served.join().unwrap();
         assert!(!live.stopped() && lock(&host.current).as_ref().is_some_and(|c| Arc::ptr_eq(c, &live)));
+    }
+
+    #[test]
+    fn a_viewer_being_turned_away_keeps_its_pending_place() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let host = Arc::new(Host::new(HostOptions { copied_files: Vec::new, ..HostOptions::default() }, Secret(PAIR_KEY)));
+        let ((other, _), _other_viewer) = session_pair();
+        *lock(&host.current) = Some(Arc::new(SessionCtl::new(other, 7)));
+        let served = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let (s, peer) = l.accept().unwrap();
+                serve_accepted(&host, s, peer);
+            })
+        };
+        // Another viewer's automatic reconnect, which reads its refusal but does not hang up.
+        let mut s = TcpStream::connect(addr).unwrap();
+        let keys = channel::client_handshake(&mut s, &PAIR_KEY).unwrap();
+        RecordWriter::new(s.try_clone().unwrap(), keys.send).send(&hello_bytes(HELLO_RECONNECT, 8)).unwrap();
+        let mut r = RecordReader::new(s.try_clone().unwrap(), keys.recv);
+        assert!(matches!(ServerMsg::decode(r.recv().unwrap()), Ok(ServerMsg::Notice(_))));
+        // The host drains its connection for up to `FAREWELL`, as one of the pending ones, so
+        // that a key holder cannot make it turn away ever more connections at once either.
+        assert_eq!(lock(&host.pending).total, 1);
+        let t = Instant::now();
+        served.join().unwrap();
+        assert!(t.elapsed() < FAREWELL + Duration::from_secs(2), "turned away in {:?}", t.elapsed());
+        let p = lock(&host.pending);
+        assert!(p.total == 0 && p.per_addr.is_empty());
+    }
+
+    #[test]
+    fn the_hello_is_due_by_the_deadline_and_no_longer_than_any_hello() {
+        let longest = hello_bytes(HELLO_RECONNECT, u64::MAX);
+        assert_eq!(longest.len(), MAX_HELLO);
+        // On time: the session's records follow it, and each of its reads may wait `IO_TIMEOUT`
+        // again, not just what the handshake (here 300 ms) or the hello left of the deadline.
+        let ((hs, hk), (vs, vk)) = session_pair();
+        hs.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut w = RecordWriter::new(vs, vk.send);
+        w.send(&longest).unwrap();
+        let (_, mut reader, h) = read_hello(hs, hk, Instant::now() + Duration::from_millis(300)).unwrap();
+        assert_eq!((h.flags, h.instance), (HELLO_RECONNECT, u64::MAX));
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut ping = Vec::new();
+            ClientMsg::Ping(3).encode(&mut ping);
+            w.send(&ping).unwrap();
+            w
+        });
+        assert_eq!(ClientMsg::decode(reader.recv().unwrap()).unwrap(), ClientMsg::Ping(3));
+        drop(late.join().unwrap());
+        // A first record announced as long as any record may be: turned away as soon as its
+        // length is in, the 32 MiB neither waited for nor allocated.
+        let ((hs, hk), (mut vs, _)) = session_pair();
+        vs.write_all(&(channel::MAX_RECORD as u32).to_le_bytes()).unwrap();
+        let t = Instant::now();
+        let e = read_hello(hs, hk, t + Duration::from_secs(10)).err().expect("a 32 MiB hello was waited for").to_string();
+        assert!(e.starts_with("invalid record length") && t.elapsed() < Duration::from_secs(2), "{e} after {:?}", t.elapsed());
+        // A hello trickled a byte at a time, never quiet for a read's timeout: cut off at the deadline.
+        let ((hs, hk), (vs, vk)) = session_pair();
+        let mut rec = Vec::new();
+        RecordWriter::new(&mut rec, vk.send).send(&longest).unwrap();
+        let trickle = std::thread::spawn(move || {
+            for b in rec {
+                if (&vs).write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let t = Instant::now();
+        let r = read_hello(hs, hk, t + Duration::from_millis(800));
+        let took = t.elapsed();
+        trickle.join().unwrap();
+        let e = r.err().expect("a trickled hello was taken").to_string();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(took >= Duration::from_millis(700) && took < Duration::from_secs(3), "{took:?}");
     }
 }
 
@@ -3367,5 +3476,79 @@ mod session_tests {
             std::thread::sleep(Duration::from_millis(100));
         };
         c4.ping(5);
+    }
+
+    /// An authenticated connection to `host` that has not sent its hello; `None` if the host
+    /// turned it away before the handshake.
+    fn authenticated(host: &TestHost) -> Option<(TcpStream, channel::SessionKeys)> {
+        let mut s = TcpStream::connect(("127.0.0.1", host.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let keys = channel::client_handshake(&mut s, &PSK).ok()?;
+        Some((s, keys))
+    }
+
+    /// Whether the host closes `s` within `limit` (it sends nothing before the viewer's hello).
+    fn closed_within(s: &TcpStream, limit: Duration) -> bool {
+        s.set_read_timeout(Some(limit)).unwrap();
+        match (&mut &*s).read(&mut [0u8; 1]) {
+            Ok(n) => n == 0,
+            Err(e) => !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        }
+    }
+
+    #[test]
+    fn connections_without_their_hello_are_few_and_short_lived() {
+        let _serial = lock(&SERIAL);
+        let host = TestHost::start(|_| {});
+        // Authenticated connections that announce a 32 MiB first record and stay open: the host
+        // closes each at once, so none holds memory or a place, and the next one gets in.
+        let mut flood = Vec::new();
+        for i in 0..3 * MAX_PENDING {
+            let (mut s, _) = authenticated(&host).unwrap_or_else(|| panic!("connection {i} was turned away"));
+            s.write_all(&(channel::MAX_RECORD as u32).to_le_bytes()).unwrap();
+            assert!(closed_within(&s, Duration::from_secs(2)), "connection {i} was held");
+            flood.push(s);
+        }
+        // Hellos trickled slower than the deadline allows, on as many connections as there are
+        // places in all: only this address's share gets in, and only until the deadline.
+        let t = Instant::now();
+        let held: Vec<_> = (0..MAX_PENDING).filter_map(|_| authenticated(&host)).collect();
+        assert_eq!(held.len(), MAX_PENDING_PER_ADDR);
+        let tricklers: Vec<_> = held
+            .into_iter()
+            .map(|(s, keys)| {
+                let mut rec = Vec::new();
+                let mut b = Vec::new();
+                ClientMsg::Hello { downscale: 1, quality: QUALITY_DEFAULT, monitor: MONITOR_DEFAULT, flags: 0, instance: u64::MAX }.encode(&mut b);
+                RecordWriter::new(&mut rec, keys.send).send(&b).unwrap();
+                std::thread::spawn(move || {
+                    // A byte every 500 ms: the whole hello would take 16.5 s.
+                    for b in rec {
+                        if (&s).write_all(&[b]).is_err() || closed_within(&s, Duration::from_millis(500)) {
+                            break;
+                        }
+                    }
+                    t.elapsed()
+                })
+            })
+            .collect();
+        for h in tricklers {
+            let closed = h.join().unwrap();
+            let late = HANDSHAKE_TIMEOUT + Duration::from_secs(3);
+            assert!(closed >= HANDSHAKE_TIMEOUT - Duration::from_millis(500) && closed < late, "closed after {closed:?}");
+        }
+        // Other addresses get in meanwhile (`Pending`); this one once the deadline cut those off.
+        let target = format!("127.0.0.1:{}", host.port);
+        let t = Instant::now();
+        let mut c = loop {
+            match connect(&target, &ViewerOptions::default(), &Secret(PSK)) {
+                Ok(conn) => break Client::new(conn),
+                Err(e) => assert!(t.elapsed() < Duration::from_secs(5), "{e}"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        c.frame(1);
+        c.ping(1);
+        drop(flood);
     }
 }
