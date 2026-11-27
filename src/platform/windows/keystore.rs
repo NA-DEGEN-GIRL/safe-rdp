@@ -768,6 +768,12 @@ mod tests {
         set_dacl(&f, &Sd::parse("D:P(A;OICI;FA;;;WD)(A;OICI;0x1200a9;;;BU)").unwrap(), &child).unwrap();
         inherit_only(&f, &Sd::parse("D:").unwrap(), &child).unwrap();
         drop(f);
+        // The file inside as `reset_to_inherited` does it, by its own handle: one created with a
+        // protected DACL (as where the temp folder passes nothing on) takes nothing passed down.
+        let file = child.join("f");
+        let f = open_to_secure(&file).unwrap();
+        inherit_only(&f, &Sd::parse("D:").unwrap(), &file).unwrap();
+        drop(f);
         // Only what the parent passes on is left, inherited, and it reaches the file inside too.
         assert_eq!(dacl_sddl(&child), "D:AI(A;OICIID;FA;;;WD)");
         assert_eq!(dacl_sddl(&child.join("f")), "D:AI(A;ID;FA;;;WD)");
