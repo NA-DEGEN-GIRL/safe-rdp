@@ -281,7 +281,8 @@ pub fn sort_devices(devices: &mut [Device]) {
 fn device(v: &Value, is_self: bool) -> Option<Device> {
     v.as_object()?;
     let str_field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
-    let dns_name = clean(str_field("DNSName").trim_end_matches('.'), MAX_DNS_NAME);
+    // The root's dot goes after cleaning, which may leave one at the end.
+    let dns_name = clean(str_field("DNSName"), MAX_DNS_NAME).trim_end_matches('.').to_string();
     // Mullvad exit nodes appear as peers but are not the user's machines.
     if dns_name.to_ascii_lowercase().ends_with(".mullvad.ts.net") {
         return None;
@@ -305,11 +306,10 @@ fn device(v: &Value, is_self: bool) -> Option<Device> {
     })
 }
 
-/// Drops control and bidirectional-formatting characters (and the BOM) and limits the length.
+/// Drops control and deceptive format characters (`proto::deceptive`: bidi, line separators,
+/// invisible and tag characters, the BOM) and limits the length.
 fn clean(s: &str, max_chars: usize) -> String {
-    let bidi =
-        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
-    s.chars().filter(|&c| !c.is_control() && !bidi(c)).take(max_chars).collect::<String>().trim().to_string()
+    s.chars().filter(|&c| !crate::proto::deceptive(c)).take(max_chars).collect::<String>().trim().to_string()
 }
 
 #[cfg(test)]
@@ -428,6 +428,12 @@ mod tests {
         let st = parse_status(doc.as_bytes()).unwrap();
         assert_eq!(st.devices[0].name, "evilgnp.exe");
         assert_eq!(clean("\u{feff}a\u{061c}b\u{2067}c\u{2069}", 10), "abc");
+        // Line separators, invisible and tag characters too, as everywhere else (`proto::deceptive`).
+        assert_eq!(clean("a\u{2028}b\u{2029}c\u{200b}d\u{2060}e\u{e0041}f", 10), "abcdef");
+        // The trailing dot goes once what hid it is gone.
+        let doc = "{\"Peer\":{\"x\":{\"DNSName\":\"desk.example.ts.net.\\u200b\",\"TailscaleIPs\":[\"100.64.0.9\"]}}}";
+        let d = &parse_status(doc.as_bytes()).unwrap().devices[0];
+        assert_eq!((d.dns_name.as_str(), d.name.as_str()), ("desk.example.ts.net", "desk"));
         let long = format!("{{\"Peer\":{{\"x\":{{\"HostName\":\"{}\",\"TailscaleIPs\":[\"100.64.0.9\"]}}}}}}", "a".repeat(500));
         assert_eq!(parse_status(long.as_bytes()).unwrap().devices[0].name.len(), MAX_NAME);
     }

@@ -264,7 +264,7 @@ fn text(b: &[u8], max: usize) -> Result<String> {
 
 /// Control characters, and invisible format characters that reorder text (bidi overrides,
 /// marks and isolates), break lines or hide text, so `a\u{202E}gpj.exe` cannot pose as `aexe.jpg`.
-fn deceptive(c: char) -> bool {
+pub fn deceptive(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

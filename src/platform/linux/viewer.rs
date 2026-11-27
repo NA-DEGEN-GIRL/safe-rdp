@@ -1024,8 +1024,11 @@ pub fn run(target: &str, opts: ViewerOptions, psk: Secret<32>) -> Result<()> {
 
         let clip = if opts.clipboard && flags & F_CLIPBOARD != 0 {
             let out = out.clone();
+            // A view-only viewer still gets the host's clipboard, but changes nothing there.
             match Clipboard::spawn(move |t| {
-                let _ = out.send(ClientMsg::Clipboard(t));
+                if !view_only {
+                    let _ = out.send(ClientMsg::Clipboard(t));
+                }
             }) {
                 Ok(c) => Some(c),
                 Err(e) => {
