@@ -2,9 +2,6 @@
 //! (what is playing) on the host and `pw-play` plays the stream on the viewer. Raw 16-bit
 //! PCM flows over pipes, so nothing links against PipeWire.
 
-// host.rs / viewer.rs do not call this module yet.
-#![allow(dead_code)]
-
 use crate::log;
 use crate::platform::jitter::JitterBuffer;
 use crate::util::{Error, Result};
@@ -38,8 +35,9 @@ const CAPTURE_CHANNELS: u8 = 2;
 const CHUNK_MS: u32 = 20;
 /// Node latency asked of PipeWire for both streams.
 const LATENCY: &str = "20ms";
-/// How long `AudioCapture::start` waits for the first audio before trusting a silent child.
-const FIRST_DATA: Duration = Duration::from_secs(2);
+/// How long `AudioCapture::start` (on the host's input thread) gives `pw-record` to fail
+/// before trusting it: an idle sink's monitor sends nothing, not even silence.
+const START_GRACE: Duration = Duration::from_millis(100);
 /// Pipe to `pw-play`, kept small (about 40 ms at 48 kHz stereo) so it adds little latency.
 const PLAY_PIPE_BYTES: c_int = 8192;
 /// Jitter buffer: start at 40 ms queued (the pipe and PipeWire add the rest), cap at 300 ms.
@@ -156,20 +154,24 @@ impl AudioCapture {
     }
 
     /// `on_pcm(samples, rate, channels)` receives interleaved 16-bit PCM (48 kHz stereo) from
-    /// a capture thread in 20 ms chunks. Fails when `pw-record` cannot start or exits right
-    /// away; later exits (PipeWire restarts) are retried.
+    /// a capture thread in 20 ms chunks. Fails when `pw-record` cannot start or exits within
+    /// `START_GRACE`; later exits (PipeWire restarts) are retried.
     pub fn start(on_pcm: Box<dyn FnMut(&[i16], u32, u8) + Send>) -> Result<AudioCapture> {
         let binary = find_binary("pw-record").ok_or("pw-record not found (install pipewire-bin)")?;
+        if pipewire_socket().is_none() {
+            return Err("PipeWire is not running for this user".into());
+        }
         AudioCapture::run(Program { binary, args: record_args() }, on_pcm)
     }
 
     fn run(program: Program, on_pcm: OnPcm) -> Result<AudioCapture> {
         let stop = Arc::new(AtomicBool::new(false));
         let child: Slot = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::sync_channel(1);
+        // A rendezvous: the thread's report is either taken by this wait or refused, never left queued.
+        let (tx, rx) = mpsc::sync_channel(0);
         let (s, c) = (stop.clone(), child.clone());
         let thread = std::thread::Builder::new().name("audio-capture".into()).spawn(move || capture_thread(&program, on_pcm, &s, &c, tx))?;
-        let r = match rx.recv_timeout(FIRST_DATA) {
+        let r = match rx.recv_timeout(START_GRACE) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(()), // running, nothing routed to it yet
             Err(mpsc::RecvTimeoutError::Disconnected) => Err("audio capture thread exited".into()),
@@ -202,6 +204,12 @@ fn record_args() -> Vec<String> {
     ]
 }
 
+/// Tells `AudioCapture::run` how the start went while it is still waiting. False once it has
+/// stopped waiting: the problem is then logged and retried like any later one.
+fn report(ready: &mut Option<mpsc::SyncSender<Result<()>>>, r: Result<()>) -> bool {
+    ready.take().is_some_and(|tx| tx.send(r).is_ok())
+}
+
 fn capture_thread(program: &Program, mut on_pcm: OnPcm, stop: &AtomicBool, slot: &Mutex<Option<Child>>, ready: mpsc::SyncSender<Result<()>>) {
     let chunk_frames = (CAPTURE_RATE * CHUNK_MS / 1000) as usize;
     let mut bytes = vec![0u8; chunk_frames * CAPTURE_CHANNELS as usize * 2];
@@ -223,17 +231,12 @@ fn capture_thread(program: &Program, mut on_pcm: OnPcm, stop: &AtomicBool, slot:
                     out
                 }
                 Err(e) => {
-                    let e = Error::msg(format!("cannot start {}: {e}", program.binary.display()));
-                    match ready.take() {
-                        Some(tx) => {
-                            let _ = tx.send(Err(e));
-                            return;
-                        }
-                        None => {
-                            log!("audio capture: {e}");
-                            None
-                        }
+                    let e = format!("cannot start {}: {e}", program.binary.display());
+                    if report(&mut ready, Err(Error::msg(e.clone()))) {
+                        return;
                     }
+                    log!("audio capture: {e}");
+                    None
                 }
             }
         };
@@ -243,9 +246,7 @@ fn capture_thread(program: &Program, mut on_pcm: OnPcm, stop: &AtomicBool, slot:
                 for (s, b) in pcm.iter_mut().zip(bytes.as_chunks::<2>().0) {
                     *s = i16::from_le_bytes(*b);
                 }
-                if let Some(tx) = ready.take() {
-                    let _ = tx.send(Ok(()));
-                }
+                report(&mut ready, Ok(()));
                 chunks += 1;
                 if failing && chunks == healthy_chunks {
                     log!("audio capture resumed");
@@ -258,8 +259,7 @@ fn capture_thread(program: &Program, mut on_pcm: OnPcm, stop: &AtomicBool, slot:
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if let Some(tx) = ready.take() {
-            let _ = tx.send(Err("pw-record exited without audio (is PipeWire running?)".into()));
+        if report(&mut ready, Err("pw-record exited without audio (is PipeWire running?)".into())) {
             return;
         }
         if !failing {
@@ -431,9 +431,35 @@ mod tests {
     fn capture_fails_when_the_recorder_exits_without_audio() {
         let t = Instant::now();
         assert!(AudioCapture::run(sh("exit 1"), Box::new(|_, _, _| panic!("no audio expected"))).is_err());
-        assert!(t.elapsed() < FIRST_DATA, "noticed only after {:?}", t.elapsed());
+        assert!(t.elapsed() < START_GRACE, "noticed only after {:?}", t.elapsed());
         let missing = Program { binary: PathBuf::from("/nonexistent/pw-record"), args: vec![] };
         assert!(AudioCapture::run(missing, Box::new(|_, _, _| {})).is_err());
+    }
+
+    #[test]
+    fn capture_of_an_idle_sink_starts_at_once() {
+        // An idle sink's monitor: a recorder that runs and sends nothing.
+        let t = Instant::now();
+        let cap = AudioCapture::run(sh("exec sleep 30"), Box::new(|_, _, _| panic!("no audio expected"))).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(200), "start took {:?}", t.elapsed());
+        let child = pid(&cap.child);
+        drop(cap);
+        assert!(!running(child), "recorder survived the drop");
+
+        // One that exits without audio only after the start returned is restarted, not given up on.
+        let mark = std::env::temp_dir().join(format!("safe-rdp-test-capture-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let script = format!("if [ -e '{0}' ]; then head -c 3840 /dev/zero; else touch '{0}'; sleep 0.3; fi", mark.display());
+        let chunks = Arc::new(AtomicUsize::new(0));
+        let c = chunks.clone();
+        let cap = AudioCapture::run(sh(&script), Box::new(move |_, _, _| _ = c.fetch_add(1, Ordering::SeqCst))).unwrap();
+        let t = Instant::now();
+        while chunks.load(Ordering::SeqCst) == 0 && t.elapsed() < RETRY * 3 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(cap);
+        let _ = std::fs::remove_file(&mark);
+        assert!(chunks.load(Ordering::SeqCst) > 0, "recorder was not restarted");
     }
 
     #[test]
