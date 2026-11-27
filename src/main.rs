@@ -419,6 +419,9 @@ fn connect(args: &[String]) -> Result<()> {
         }
     }
     let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
+    // A view-only viewer changes nothing on the host, so it does not ask for the privacy
+    // screen either (nor does it send clipboard text or files; see the viewers).
+    o.privacy &= !o.view_only;
     let key = load_key(key_file.as_deref())?;
     platform::init_process();
     platform::viewer::run(&target, o, key)

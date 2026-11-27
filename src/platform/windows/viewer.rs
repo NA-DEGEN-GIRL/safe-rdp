@@ -334,9 +334,15 @@ impl Session {
 
     /// Stops every thread of this session (the reader notices the closed socket).
     fn shutdown(&self) {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::System::IO::CancelIoEx;
         self.ended.store(true, Ordering::SeqCst);
         self.out.close();
         let _ = self.sock.shutdown(Shutdown::Both);
+        // Windows does not wake a recv blocked in another thread on shutdown (`host.rs` has the
+        // same): cancelling the socket's I/O lets the reader end now and wipe its copy of the
+        // screen, rather than with the process (unwiped) or the host's next record.
+        unsafe { CancelIoEx(self.sock.as_raw_socket() as HANDLE, null()) };
         lock(&self.clipboard).take();
     }
 
@@ -344,8 +350,9 @@ impl Session {
         APP.get().unwrap().post(Event::Toast { generation: self.generation, tone, title, text, action });
     }
 
+    /// Not in a view-only session (the viewer's or the host's), which changes nothing on the host.
     fn files_allowed(&self) -> bool {
-        self.flags & F_FILES != 0
+        self.flags & F_FILES != 0 && !self.view_only
     }
 }
 
@@ -873,6 +880,11 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut core::TileDecoder, p: &[u8]) ->
     let (mut fresh, mut old) = (None, None);
     let mut fb = loop {
         let mut fb = app.reader_fb();
+        // Ended while it waited (paced, or allocating): the framebuffer may be a newer
+        // session's already, which an older message must not resize or draw on.
+        if s.is_ended() {
+            return Ok(false);
+        }
         if (fb.w, fb.h) == size || fresh.is_some() {
             break fb;
         }
@@ -907,6 +919,9 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut core::TileDecoder, p: &[u8]) ->
         let mut at = (0, 0);
         loop {
             let mut fb = app.reader_fb();
+            if s.is_ended() {
+                return Ok(false);
+            }
             // Resized again meanwhile (by an older session's reader): this message is outdated.
             if (fb.w, fb.h) != size {
                 break;
@@ -1243,6 +1258,10 @@ impl Ui {
         // `routes` stays: it follows keys held down here, whatever the session.
         app.mods.store(0, Ordering::SeqCst);
         lock(&app.swallowed).clear();
+        // Dropped mid-drag: a capture kept would take the clicks meant for the bar.
+        if app.buttons.swap(0, Ordering::SeqCst) != 0 {
+            unsafe { ReleaseCapture() };
+        }
     }
 
     /// The hello of an automatic reconnect.
@@ -1546,7 +1565,7 @@ impl Ui {
                 let on = !self.prefs.audio;
                 self.set_sound(on, true);
             }
-            toolbar::CMD_PRIVACY => {
+            toolbar::CMD_PRIVACY if !self.view_only => {
                 self.prefs.privacy = !self.prefs.privacy;
                 self.request(SET_PRIVACY, self.prefs.privacy as u32);
             }
@@ -1643,14 +1662,14 @@ impl Ui {
             scale_menu: self.setting(SET_DOWNSCALE),
             sas: if self.view_only { Feature::Hidden } else { self.feature(F_SAS, None, false) },
             clipboard: self.feature(F_CLIPBOARD, None, self.prefs.clipboard),
-            send_files: self.feature(F_FILES, None, false),
-            get_files: self.feature(F_FILES, None, false),
+            send_files: if self.view_only { Feature::Hidden } else { self.feature(F_FILES, None, false) },
+            get_files: if self.view_only { Feature::Hidden } else { self.feature(F_FILES, None, false) },
             sound: if self.flags & F_AUDIO != 0 && self.sound_local_failed {
                 Feature::NoLocal
             } else {
                 self.feature(F_AUDIO, Some(SET_AUDIO), self.prefs.audio)
             },
-            privacy: self.feature(F_PRIVACY, Some(SET_PRIVACY), self.prefs.privacy),
+            privacy: if self.view_only { Feature::Hidden } else { self.feature(F_PRIVACY, Some(SET_PRIVACY), self.prefs.privacy) },
             fullscreen: self.floating,
             ..BarModel::default()
         };
@@ -1770,8 +1789,9 @@ fn start_clipboard(s: &Arc<Session>) {
         return;
     }
     let weak = Arc::downgrade(s);
+    // A view-only session still gets the host's clipboard, but changes nothing there.
     match Clipboard::spawn(move |t| {
-        if let Some(s) = weak.upgrade() {
+        if let Some(s) = weak.upgrade().filter(|s| !s.view_only) {
             s.send(ClientMsg::Clipboard(t));
         }
     }) {
@@ -2808,20 +2828,19 @@ fn point(lp: LPARAM) -> (i32, i32) {
 }
 
 fn mouse_button(app: &App, hwnd: HWND, lp: LPARAM, button: u8, down: bool) {
+    let bit = 1u8 << button;
+    // The last button let go of ends the capture whether or not a session takes input (one may
+    // have ended mid-drag).
+    if !down && app.buttons.fetch_and(!bit, Ordering::SeqCst) & !bit == 0 {
+        unsafe { ReleaseCapture() };
+    }
     let Some(s) = app.input() else { return };
     let (x, y) = point(lp);
     let (x, y) = to_remote(hwnd, x, y);
     s.send(ClientMsg::MouseMove { x, y });
     s.send(ClientMsg::MouseButton { button, down });
-    let bit = 1u8 << button;
-    unsafe {
-        if down {
-            if app.buttons.fetch_or(bit, Ordering::SeqCst) == 0 {
-                SetCapture(hwnd);
-            }
-        } else if app.buttons.fetch_and(!bit, Ordering::SeqCst) & !bit == 0 {
-            ReleaseCapture();
-        }
+    if down && app.buttons.fetch_or(bit, Ordering::SeqCst) == 0 {
+        unsafe { SetCapture(hwnd) };
     }
 }
 
@@ -3071,6 +3090,58 @@ mod tests {
         let mut px = [255, 128, 8, 255, 0, 0, 0, 255];
         dim(&mut px);
         assert_eq!(px, [95, 48, 3, 255, 0, 0, 0, 255]);
+    }
+
+    /// A session over a loopback connection, with no threads; the other end is returned too.
+    fn loopback_session(flags: u32, view_only: bool) -> (Session, TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let peer = l.accept().unwrap().0;
+        let s = Session {
+            generation: 1,
+            out: OutQueue::default(),
+            sock,
+            flags,
+            view_only,
+            start: Instant::now(),
+            reconnected: false,
+            ended: AtomicBool::new(false),
+            frames: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(0),
+            rtt_ms: AtomicU64::new(UNSET),
+            last_notice_ms: AtomicU64::new(UNSET),
+            sound: AtomicBool::new(false),
+            pull: Mutex::new(Pull::default()),
+            clipboard: Mutex::new(None),
+            xfer: Mutex::new(Transfers::default()),
+        };
+        (s, peer)
+    }
+
+    #[test]
+    fn shutdown_wakes_a_reader_blocked_on_a_silent_host() {
+        use std::io::Read;
+        // The host stays connected and silent: only the shutdown can end the read.
+        let (s, _host) = loopback_session(0, false);
+        let mut sock = s.sock.try_clone().unwrap();
+        let reader = std::thread::spawn(move || sock.read(&mut [0u8; 16]));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reader.is_finished(), "nothing was sent, so the read blocks");
+        s.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reader.is_finished(), "the reader is still blocked after the shutdown");
+        assert!(s.is_ended());
+    }
+
+    #[test]
+    fn view_only_sessions_transfer_no_files() {
+        assert!(loopback_session(F_FILES, false).0.files_allowed());
+        assert!(!loopback_session(F_FILES, true).0.files_allowed());
+        assert!(!loopback_session(0, false).0.files_allowed());
     }
 
     #[test]

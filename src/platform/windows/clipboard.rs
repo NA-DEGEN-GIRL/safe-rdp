@@ -6,7 +6,7 @@
 
 use crate::platform::handover::Handover;
 use crate::proto::MAX_CLIPBOARD;
-use crate::util::{Error, Result, wide};
+use crate::util::{Error, Result, wide, wipe};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -133,10 +133,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_APP_SET if !state.is_null() => {
                 let s = &mut *state;
                 // Only the newest pending value matters.
-                if let Some(t) = s.pending.take() {
+                if let Some(mut t) = s.pending.take() {
                     if write_text(hwnd, &t) {
                         s.ignore_seq = GetClipboardSequenceNumber();
                     }
+                    wipe(t.as_bytes_mut());
                 }
                 0
             }
@@ -154,7 +155,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-fn open(hwnd: HWND) -> bool {
+pub fn open(hwnd: HWND) -> bool {
     // Another process may hold the clipboard briefly.
     for _ in 0..10 {
         if unsafe { OpenClipboard(hwnd) } != 0 {
@@ -175,18 +176,31 @@ pub fn read_text(hwnd: HWND) -> Option<String> {
         if !h.is_null() {
             let p = GlobalLock(h) as *const u16;
             if !p.is_null() {
-                let max = GlobalSize(h) / 2;
-                let len = (0..max).take_while(|&i| *p.add(i) != 0).count();
-                let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+                out = text_at(p, GlobalSize(h) / 2);
                 GlobalUnlock(h);
-                if s.len() <= MAX_CLIPBOARD {
-                    out = Some(s);
-                }
             }
         }
         CloseClipboard();
         out
     }
+}
+
+/// The NUL-terminated text in the `units` UTF-16 units at `p`, if it is at most `MAX_CLIPBOARD`
+/// bytes as UTF-8. Every unit is at least one byte of UTF-8, so text with more units than that
+/// is too long whatever it says: it is neither scanned to its end nor copied.
+unsafe fn text_at(p: *const u16, units: usize) -> Option<String> {
+    let max = units.min(MAX_CLIPBOARD + 1);
+    let len = (0..max).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+    if len > MAX_CLIPBOARD {
+        return None;
+    }
+    let mut s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) });
+    if s.len() > MAX_CLIPBOARD {
+        // SAFETY: zero bytes are valid UTF-8.
+        wipe(unsafe { s.as_bytes_mut() });
+        return None;
+    }
+    Some(s)
 }
 
 unsafe fn global_copy(bytes: &[u8]) -> HGLOBAL {
@@ -206,29 +220,62 @@ unsafe fn global_copy(bytes: &[u8]) -> HGLOBAL {
     }
 }
 
+/// Frees a block that never went to the clipboard, wiping it first.
+unsafe fn global_free_wiped(h: HGLOBAL) {
+    unsafe {
+        let p = GlobalLock(h) as *mut u8;
+        if !p.is_null() {
+            wipe(std::slice::from_raw_parts_mut(p, GlobalSize(h)));
+            GlobalUnlock(h);
+        }
+        GlobalFree(h);
+    }
+}
+
+/// Replaces the clipboard with `text` (remote text, or the launcher's key), kept out of
+/// clipboard history and cloud sync: if that cannot be asked for, the clipboard is left empty.
 pub fn write_text(hwnd: HWND, text: &str) -> bool {
-    let utf16: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    // Room for all of it up front (a UTF-16 unit per UTF-8 byte at most, and the NUL), so no
+    // copy is left behind by growing; wiped below.
+    let mut utf16 = Vec::with_capacity((text.len() + 1) * 2);
+    utf16.extend(text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes));
+    let ok = unsafe { put_text(hwnd, &utf16) };
+    wipe(&mut utf16);
+    ok
+}
+
+unsafe fn put_text(hwnd: HWND, utf16: &[u8]) -> bool {
     unsafe {
         if !open(hwnd) {
             return false;
         }
         EmptyClipboard();
-        let mut ok = false;
-        let h = global_copy(&utf16);
-        if !h.is_null() {
-            if SetClipboardData(CF_UNICODETEXT as u32, h).is_null() {
+        // Keep the text out of clipboard history and cloud sync, or leave no text at all.
+        let excluded = ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"].iter().all(|name| {
+            let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
+            let h = if fmt == 0 { null_mut() } else { global_copy(&0u32.to_le_bytes()) };
+            if h.is_null() {
+                return false;
+            }
+            if SetClipboardData(fmt, h).is_null() {
                 GlobalFree(h);
-            } else {
-                ok = true;
+                return false;
+            }
+            true
+        });
+        let mut ok = false;
+        if excluded {
+            let h = global_copy(utf16);
+            if !h.is_null() {
+                if SetClipboardData(CF_UNICODETEXT as u32, h).is_null() {
+                    global_free_wiped(h);
+                } else {
+                    ok = true;
+                }
             }
         }
-        // Keep remote text out of clipboard history and cloud sync.
-        for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
-            let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
-            let h = global_copy(&0u32.to_le_bytes());
-            if fmt != 0 && !h.is_null() && SetClipboardData(fmt, h).is_null() {
-                GlobalFree(h);
-            }
+        if !ok {
+            EmptyClipboard();
         }
         CloseClipboard();
         ok
@@ -490,6 +537,23 @@ mod tests {
         assert!(user.token.is_null());
         let here = std::thread::current().id();
         assert_eq!(user.act(|| std::thread::current().id()).unwrap(), here);
+    }
+
+    #[test]
+    fn clipboard_text_is_bounded_before_it_is_copied() {
+        let text = |units: &[u16]| unsafe { text_at(units.as_ptr(), units.len()) };
+        assert_eq!(text(&[b'h' as u16, b'i' as u16, 0, b'x' as u16]).as_deref(), Some("hi"));
+        assert_eq!(text(&[b'h' as u16, b'i' as u16]).as_deref(), Some("hi"), "no NUL: up to the block's end");
+        let mut a = vec![b'a' as u16; MAX_CLIPBOARD];
+        assert_eq!(text(&a).map(|s| s.len()), Some(MAX_CLIPBOARD));
+        // One unit over, and the NUL far beyond: refused without scanning on to it.
+        a.extend([b'a' as u16; 1 << 16]);
+        a.push(0);
+        assert_eq!(text(&a), None);
+        // Few enough units, but more bytes as UTF-8.
+        let ko = vec!['가' as u16; MAX_CLIPBOARD / 3 + 1];
+        assert_eq!(text(&ko), None);
+        assert!(text(&ko[..MAX_CLIPBOARD / 3]).is_some());
     }
 
     #[test]

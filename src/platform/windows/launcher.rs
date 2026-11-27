@@ -40,7 +40,7 @@ use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber};
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{LANG_KOREAN, SS_ENDELLIPSIS, SS_LEFT, SS_LEFTNOWORDWRAP, SS_NOPREFIX};
@@ -67,6 +67,8 @@ const TIMER_CLIPBOARD: usize = 2;
 const TIMER_KEY: usize = 3;
 const DEVICE_REFRESH_MS: u32 = 15_000;
 const CLIPBOARD_CLEAR_MS: u32 = 60_000;
+/// Next try at emptying the clipboard while another program holds it open.
+const CLIPBOARD_RETRY_MS: u32 = 1_000;
 /// How often a running host's key is compared with the stored one.
 const KEY_CHECK_MS: u32 = 2_000;
 /// Time a stopping host gets to exit on its own (its stdin is closed first) before it is killed.
@@ -2958,12 +2960,20 @@ impl App {
         }
     }
 
-    /// Enter activates Connect on the Connect page and Import in the key field.
+    /// Enter activates the drawn button that has the focus (unlike plain buttons, they do not
+    /// become the default by being focused), else Connect on the Connect page and Import in the
+    /// key field.
     fn default_id(&self) -> LRESULT {
-        let id = match self.page.get() {
-            Page::Connect => ID_CONNECT,
-            Page::Key if unsafe { GetFocus() } == self.c.k_import_text => ID_IMPORT,
-            _ => return 0,
+        let (c, focus) = (&self.c, unsafe { GetFocus() });
+        let drawn = [(c.c_connect, ID_CONNECT), (c.s_toggle, ID_SHARE), (c.k_create, ID_CREATE)];
+        let nav = (0..3).map(|i| (c.nav[i], ID_NAV + i as u16));
+        let id = match drawn.into_iter().chain(nav).find(|&(h, _)| h == focus) {
+            Some((_, id)) => id,
+            None => match self.page.get() {
+                Page::Connect => ID_CONNECT,
+                Page::Key if focus == c.k_import_text => ID_IMPORT,
+                _ => return 0,
+            },
         };
         (DC_HASDEFID << 16 | id as u32) as LRESULT
     }
@@ -3386,22 +3396,30 @@ impl App {
         self.update_share_ui();
     }
 
-    /// A host that `stop_sharing` stopped has exited: starts the one a key change asked for.
+    /// A host that `stop_sharing` stopped has exited: sharing is off now (whether or not its log
+    /// ended first, or was ever read), unless a key change asked for it to start again.
     fn on_host_stopped(&self, generation: u64) {
         let restart = {
             let mut st = self.st.borrow_mut();
-            if st.restart_after != Some(generation) {
-                return;
+            if generation == st.host_gen && st.host.is_none() && st.share == Share::Stopping {
+                st.share = Share::Off;
+                st.host_error = None;
             }
-            st.restart_after = None;
+            let due = st.restart_after == Some(generation);
+            if due {
+                st.restart_after = None;
+            }
             // Unless sharing was started again meanwhile, or no usable key is left.
-            st.host.is_none() && st.key == KeyState::Present
+            due && st.host.is_none() && st.key == KeyState::Present
         };
         if restart {
+            // Straight from "Stopping" to "Starting", with no "Off" shown in between.
             self.start_sharing();
             if self.st.borrow().host.is_some() {
                 self.log_note("the stored key changed: sharing restarted with the new key");
             }
+        } else {
+            self.update_share_ui();
         }
     }
 
@@ -3548,6 +3566,10 @@ impl App {
         });
         {
             let mut st = self.st.borrow_mut();
+            // Stopped by `stop_sharing`: `on_host_stopped` ends "Stopping", once it has exited.
+            if code.is_none() && st.share == Share::Stopping {
+                return;
+            }
             st.share = match (code, st.host_error.take()) {
                 (None, _) => Share::Off, // stopped by the user
                 (Some(_), Some(e)) => Share::Failed(e),
@@ -3994,16 +4016,26 @@ impl App {
         }
     }
 
-    /// Empties the clipboard if it still holds the key we put there.
+    /// Empties the clipboard if it still holds the key we put there. While another program has
+    /// it open, tries again shortly rather than leaving the key there.
     fn clear_clipboard(&self) {
         unsafe { KillTimer(self.hwnd, TIMER_CLIPBOARD) };
-        let Some(seq) = self.st.borrow_mut().clip_seq.take() else { return };
-        unsafe {
-            if GetClipboardSequenceNumber() == seq && OpenClipboard(self.hwnd) != 0 {
-                EmptyClipboard();
+        let Some(seq) = self.st.borrow().clip_seq else { return };
+        let ours = || unsafe { GetClipboardSequenceNumber() } == seq;
+        if ours() {
+            if !clipboard::open(self.hwnd) {
+                unsafe { SetTimer(self.hwnd, TIMER_CLIPBOARD, CLIPBOARD_RETRY_MS, None) };
+                return;
+            }
+            unsafe {
+                // Asked again while it is open, when nothing else can change it.
+                if ours() {
+                    EmptyClipboard();
+                }
                 CloseClipboard();
             }
         }
+        self.st.borrow_mut().clip_seq = None;
     }
 
     fn import_key(&self) {

@@ -1152,7 +1152,12 @@ fn animate(hwnd: HWND, s: &mut BarState) {
     }
 }
 
-fn slot_at(s: &BarState, x: i32) -> Option<Item> {
+/// The slot at (x, y) in a bar `height` high: none above or below it, where a captured mouse
+/// can be (a press dragged off the bar is let go of there to cancel it).
+fn slot_at(s: &BarState, x: i32, y: i32, height: i32) -> Option<Item> {
+    if !(0..height).contains(&y) {
+        return None;
+    }
     s.layout.slots.iter().find(|sl| x >= s.origin + sl.x && x < s.origin + sl.x + sl.w).map(|sl| sl.item)
 }
 
@@ -1349,14 +1354,14 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             WM_ERASEBKGND => 1,
             WM_MOUSEMOVE => {
-                let (x, _) = point(lp);
+                let ((x, y), h) = (point(lp), client_size(hwnd).1);
                 with_state(hwnd, |s: &mut BarState| {
                     if !s.tracking {
                         track_leave(hwnd);
                         s.tracking = true;
                     }
                     KillTimer(hwnd, T_HIDE);
-                    let hit = slot_at(s, x);
+                    let hit = slot_at(s, x, y, h);
                     if hit != s.hover {
                         s.hover = hit;
                         hide_hint(s);
@@ -1381,9 +1386,9 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 0
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                let (x, _) = point(lp);
+                let ((x, y), h) = (point(lp), client_size(hwnd).1);
                 with_state(hwnd, |s: &mut BarState| {
-                    s.pressed = slot_at(s, x).filter(|&i| spec_of(s, i).is_some_and(|sp| sp.enabled && sp.kind != Kind::Info));
+                    s.pressed = slot_at(s, x, y, h).filter(|&i| spec_of(s, i).is_some_and(|sp| sp.enabled && sp.kind != Kind::Info));
                     hide_hint(s);
                     KillTimer(hwnd, T_HINT);
                     InvalidateRect(hwnd, null(), 0);
@@ -1392,17 +1397,27 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 0
             }
             WM_LBUTTONUP => {
-                let (x, _) = point(lp);
+                let ((x, y), h) = (point(lp), client_size(hwnd).1);
                 let item = with_state(hwnd, |s: &mut BarState| {
                     let pressed = s.pressed.take();
                     InvalidateRect(hwnd, null(), 0);
-                    pressed.filter(|&p| slot_at(s, x) == Some(p))
+                    pressed.filter(|&p| slot_at(s, x, y, h) == Some(p))
                 })
                 .flatten();
                 ReleaseCapture();
                 if let Some(item) = item {
                     activate(hwnd, item);
                 }
+                0
+            }
+            WM_CAPTURECHANGED => {
+                // Capture taken away mid-press (a menu, another window): that press is over, so
+                // a later button-up here without a press of its own activates nothing.
+                with_state(hwnd, |s: &mut BarState| {
+                    if s.pressed.take().is_some() {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                });
                 0
             }
             WM_TIMER => {
@@ -1944,6 +1959,36 @@ mod tests {
 
     fn measure(_bold: bool, s: &str) -> i32 {
         7 * s.chars().count() as i32
+    }
+
+    #[test]
+    fn a_press_let_go_of_off_the_bar_hits_nothing() {
+        let slot = Slot { item: Item::Disconnect, x: 100, w: 40, label: false };
+        let s = BarState {
+            parent: null_mut(),
+            model: model(),
+            floating: false,
+            pinned: false,
+            keep: false,
+            menu_open: false,
+            show: true,
+            offset: 0,
+            x: 0,
+            specs: Vec::new(),
+            layout: Layout { slots: vec![slot], ..Layout::default() },
+            origin: 10,
+            hover: None,
+            pressed: None,
+            tracking: false,
+            hint: None,
+        };
+        assert_eq!(slot_at(&s, 115, 0, 40), Some(Item::Disconnect));
+        assert_eq!(slot_at(&s, 149, 39, 40), Some(Item::Disconnect));
+        assert_eq!(slot_at(&s, 150, 20, 40), None);
+        // Captured, the mouse reports points below and above the bar too.
+        assert_eq!(slot_at(&s, 120, 40, 40), None);
+        assert_eq!(slot_at(&s, 120, 400, 40), None);
+        assert_eq!(slot_at(&s, 120, -1, 40), None);
     }
 
     #[test]
