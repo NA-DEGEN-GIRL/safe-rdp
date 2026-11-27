@@ -27,7 +27,8 @@ safe-rdp is designed not to leave persistent data like this behind.
    receive files)
 2. Double-click `safe-rdp.exe` to open the launcher window (same as `safe-rdp gui`)
 3. **Key** tab: on one PC, *Create new key* → *Copy*; on the other PC, paste it under *Import* on the Key tab
-   (the copied key is kept out of clipboard history and cloud sync, and is cleared automatically after 60 seconds).
+   (the copied key is kept out of clipboard history and cloud sync, or not copied at all if Windows will not keep it out, and is
+   cleared automatically after 60 seconds, retried every second while another program holds the clipboard).
    Replacing or removing the key there restarts (or stops) sharing from the launcher and disconnects anyone connected;
    while it is sharing, a key changed in a terminal (`keygen --force`, `key import`, `key forget`) is picked up within about 2 seconds
 4. Remote PC: on the **Share this PC** tab, click *Start sharing*. Choose the features to allow (control, clipboard, files, sound, privacy screen;
@@ -41,7 +42,9 @@ sound, the privacy screen, full screen and disconnecting. In full screen it appe
 Buttons for features the host does not allow are hidden, and a dropped connection is re-established automatically
 (after 1, 2, 4, 8, 16, 30 seconds, giving up after 2 minutes; it stops at once if the key is wrong).
 An automatic reconnect takes back only its own session: if another viewer is connected by then, the host turns it away
-("another viewer is using this host") and the viewer stops. Connecting by hand still replaces whoever is connected.
+("another viewer is using this host") and the viewer stops (unless the connection dropped before the host had answered a
+single ping, so it may never have learned which viewer this is: then it keeps trying for the 2 minutes). Connecting by hand still
+replaces whoever is connected.
 This needs a viewer and a host of this version: with an older one on either end, an automatic reconnect replaces whoever
 is connected, as before.
 
@@ -49,7 +52,8 @@ is connected, as before.
 
 ```bash
 safe-rdp keygen                # create a key (printed once, stored for this account only)
-safe-rdp key import            # on the other PC: paste at the prompt (never taken as a command-line argument)
+safe-rdp key import            # on the other PC: paste at the prompt (never taken as a command-line argument;
+                               # Ctrl+C there turns terminal echo back on)
 safe-rdp host                  # remote PC: binds only to this PC's Tailscale IP (waits for Tailscale)
 safe-rdp devices               # list tailnet devices
 safe-rdp connect remote-pc     # MagicDNS name, Tailscale IP or host:port
@@ -89,16 +93,19 @@ loongarch) stop with a compile error until their system constants have been chec
   Xvfb is started with TCP disabled and a random cookie, which Xvfb and the host read from an in-memory file without a name
   (handed to Xvfb as a file descriptor), so nothing done to a file path (a tmp cleaner, another user re-creating a directory) can
   remove or replace it; start-up fails if Xvfb lets a client in without the cookie. Programs in the session get a 0600 copy in a
-  0700 directory under `$XDG_RUNTIME_DIR` (if it is the user's own and private), otherwise under the temporary directory, where
-  the host keeps it locked against tmp cleaners while it runs. When the host ends (Ctrl+C, SIGTERM or an abnormal exit) Xvfb and the session end with it.
+  0700 directory under `$XDG_RUNTIME_DIR` (if it is an absolute path, the user's own and private), otherwise under the temporary
+  directory (which must not be a symbolic link, must be owned by root or the user, and must be sticky if others can write to it),
+  where the host keeps it locked against tmp cleaners while it runs. When the host ends (Ctrl+C, SIGTERM or an abnormal exit) Xvfb and the session end with it.
   Conversely, when the session program ends (`exit` in the terminal) the host stops too. So do not start the `--session`
   command in the background; keep it running in the foreground (`exec program`).
   To keep other users on the same server from hijacking the virtual display, every connection checks with `SO_PEERCRED`
   that the X server is the Xvfb process we started, and the owner of `/tmp/.X11-unix` is checked as well.
 - **Viewer**: `safe-rdp connect` opens an X11 window (there is no connection bar; use the shortcuts and command-line options).
   It does not reconnect by itself, and X11 cannot keep its window out of screenshots or recordings (it warns at start).
-- The key is stored in `~/.config/safe-rdp/key` (directory 0700, file 0600). There is no OS encryption like Windows DPAPI,
-  so disk encryption is recommended.
+- The key is stored in `~/.config/safe-rdp/key` (directory 0700, file 0600; a relative `$XDG_CONFIG_HOME` is ignored). A key
+  file that is a symbolic link, belongs to another user or can be read by others is refused, and so is saving into a folder
+  others can write to. `key forget` overwrites the file in place before deleting it. There is no OS encryption like Windows
+  DPAPI, so disk encryption is recommended.
 
 Linux hosts have no privacy screen, no Ctrl+Alt+Del and no "Get copied files" (uploads work).
 
@@ -108,8 +115,8 @@ Linux hosts have no privacy screen, no Ctrl+Alt+Del and no "Get copied files" (u
 |---|---|
 | Quality | `Balanced` (the host's default unless it was started with `--quality`): only complex tiles such as photos and video are compressed lossily (JPEG-style, q80); text and UI stay lossless, and a lossy tile is resent losslessly once it has stayed unchanged for 0.3 s, even while other parts of the screen keep changing. `Low bandwidth`: q50, corrected after 1.5 s. `Lossless` (switching to it makes lossy tiles exact right away) |
 | Scale | 100/50/33/25% (`--downscale`), for viewing a 4K host on a laptop or over a slow link |
-| Monitor | Switch monitors during a session; `all` shows every monitor as one screen (DXGI, multiple GPUs included). Rotated and HDR monitors are supported |
-| Clipboard | Text; works only when both sides turn it on. Text from the remote is kept out of Win+V history and the cloud clipboard |
+| Monitor | Switch monitors during a session; `all` shows every monitor as one screen (DXGI, multiple GPUs included; beyond about 66 megapixels, two 8K screens, the host scales it down further). Rotated and HDR monitors are supported |
+| Clipboard | Text; works only when both sides turn it on. Text from the remote is kept out of Win+V history and the cloud clipboard (and not put on the clipboard if Windows will not keep it out) |
 | Files | Drop files on the viewer window or use *Send files* → `Downloads\safe-rdp` on the host. *Get copied files*: files copied (Ctrl+C) in Explorer on the host go to `Downloads\safe-rdp` on the viewer |
 | Sound | The host's system sound (WASAPI loopback / PipeWire), IMA ADPCM at about 390 kbit/s, about 90–130 ms latency |
 | Privacy screen | Blacks out the host monitor and blocks the host's local keyboard and mouse during remote use (Windows hosts) |
@@ -118,13 +125,15 @@ File transfer safeguards:
 - Only a single file name is accepted, never a path. Names ending in `.` or a space, device names such as `CON` and `NUL`, and
   bidirectional characters (RLO etc.) that disguise the extension are rejected
 - Files are received into a randomly named `.srdp-*.part` file (hidden by its leading dot on Linux; on Windows it is visible, but
-  other programs cannot write to or delete it meanwhile) and given their real name only if the size and SHA-256 match. Existing
-  files are never overwritten (`name (1).ext`)
+  other programs cannot write to or delete it meanwhile) and given their real name only if the size and SHA-256 match. Nothing
+  already there is ever replaced: not a file or folder, not a symbolic link that points nowhere, not another upload of the same
+  name finishing at the same moment (`name (1).ext`)
 - On Windows the *downloaded from the internet* mark (Mark of the Web) is attached as soon as receiving starts, so SmartScreen and
   Office Protected View apply. Transfers are refused on drives that cannot carry the mark (FAT/exFAT)
 - The viewer accepts files only after you click *Get copied files* (at most 1000 per click; the request expires if the transfer
   stalls for more than 30 seconds, and you are told if files arrived after it expired). Copied files on network paths
-  (`\\server\...` or a mapped network drive) are never sent
+  (`\\server\...` or a mapped network drive) are never sent; each file is checked again once opened, so one whose folder has
+  meanwhile been redirected to a network share is refused
 - A received file must leave 1% of its volume free (256 MiB to 2 GiB; 5% in the service's own folder, see below), counting other
   transfers still arriving; this is checked again every 64 MiB, and a transfer stops if the disk fills up meanwhile. An abandoned
   partial file is deleted (on Windows through its open handle, never by its path)
@@ -156,7 +165,9 @@ safe-rdp service uninstall
 
 What installation does:
 
-1. Copies the executable to `C:\Program Files\safe-rdp\` (so it runs as SYSTEM from a location only administrators can modify)
+1. Copies the executable to `C:\Program Files\safe-rdp\` (so it runs as SYSTEM from a location only administrators can modify;
+   standard users can read and run that copy). This comes first: if the copy fails (say, the installed copy is open), the key and
+   fingerprint stay as they were and the previous service is started again
 2. Stores the key in `%ProgramData%\safe-rdp\service.key` — folder/file ACLs allow only SYSTEM and Administrators, and the contents are encrypted with DPAPI (machine scope)
 3. Registers the `SafeRdpHost` service (automatic start, restart on failure) and records the key's fingerprint at
    `HKLM\SYSTEM\CurrentControlSet\Services\SafeRdpHost\Parameters\KeyFingerprint` (users can read it, only administrators can change it,
@@ -187,7 +198,8 @@ The "Continue" button Explorer shows when you open this folder only adds read ac
 given write access the service refuses to start. In that case `safe-rdp service status` shows why, and running `service install`
 again restores the permissions.
 With `--files` and no `--transfer-dir`, the service saves uploads to `%ProgramData%\safe-rdp\incoming` (administrators only), also at
-the sign-in and lock screens. That folder takes at most 1000 files / 64 GiB in all until an administrator empties it, and a file is
+the sign-in and lock screens. That folder takes at most 1000 files / 64 GiB in all until an administrator empties it (partial files
+left for over 24 hours, as after a crash, are cleared before that is counted), and a file is
 accepted there only if its volume keeps 5% free (1 to 16 GiB). With `--transfer-dir <full path>` (`service install` refuses a relative
 one) uploads are saved as the user signed in on the console: only while someone is signed in, and only if that user can create files
 in the folder. *Get copied files* always needs a signed-in user. The service (session 0) starts an *agent* with a SYSTEM token in the active console session,
@@ -201,7 +213,8 @@ contents; a log over 4 MiB is moved to `.old` and a new one is started, so logs 
 Host (host / service install):
   --bind <ip>              Bind address (default: this PC's Tailscale IPv4, waiting until there is one)
   --port <n>               TCP port (default 47300)
-  --allow <ip>[,<ip>...]   Accept only these addresses (default: all Tailscale peers)
+  --allow <ip>[,<ip>...]   Accept only these addresses (default: all Tailscale peers; an empty list or entry is an
+                           error, and ::ffff:a.b.c.d counts as a.b.c.d, here and in --bind)
   --allow-non-tailscale    Allow binding/peers outside the Tailscale ranges (not recommended)
   --monitor <n|all>        Monitor shown first (1 = primary, the default; see `safe-rdp monitors`);
                            viewers can switch to any monitor of this PC
@@ -221,7 +234,8 @@ Host (host / service install):
 Viewer (connect):
   --fullscreen             Start in full screen
   --clipboard              Share the text clipboard (the host must allow it too)
-  --view-only              Do not send input
+  --view-only              Do not send input, clipboard text or files, nor ask for the privacy screen
+                           (the host's clipboard still arrives)
   --downscale <2|3|4>      Receive at 1/N resolution
   --quality <q>            lossless | balanced | low (default: the host's --quality, else balanced)
   --monitor <n|all>        Host monitor to view (1 = primary)
@@ -235,7 +249,10 @@ Viewer (connect):
 Clipboard, files, sound and the privacy screen are all enabled only **if the host explicitly allows them** (off by default);
 the viewer's clipboard and sound are opt-in as well.
 Other commands: `safe-rdp monitors`, `safe-rdp bench` (capture/encode speed), `safe-rdp key show|forget`,
-`safe-rdp probe` (a diagnostic tool that connects without a screen and tests latency, bandwidth, input, settings and file transfer).
+`safe-rdp probe` (a diagnostic tool that connects without a screen and tests latency, bandwidth, input, settings and file transfer;
+`--seconds` is at most 86400, and `--pull` exits with an error unless every file it was sent arrived whole).
+Commands that take no options (`gui`, `devices`, `monitors`, `key show|forget`, `service status|uninstall`) refuse any extra
+argument, so `safe-rdp key forget --help` changes nothing.
 After `keygen --force`, `key import` or `key forget`, a `safe-rdp host` that is already running keeps the old key until it is restarted.
 
 ## Security design
@@ -264,7 +281,8 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   HMAC-SHA256(key, "safe-rdp/1 key fingerprint"). It reveals nothing about the 256-bit key, and that label can never equal the
   32-byte ECDH secret the handshake feeds to HMAC under the same key.
 - **Records**: AES-256-GCM, one key per direction, 64-bit counter nonces (replay, reordering or tampering ends the session at once),
-  the length field is authenticated as AAD too, records are at most 32 MiB.
+  the length field is authenticated as AAD too, records are at most 32 MiB. A record that could not be sent whole ends the
+  session, so nothing is ever sent after it (the Windows viewer then reconnects).
 - NIST CAVS vectors and fixed AES-GCM vectors, run on both platforms, check that Windows (CNG) and Linux (OpenSSL) produce the same bytes.
 
 ### Minimal attack surface
@@ -279,8 +297,10 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   exception: a `safe-rdp.exe.config` and an assembly manifest placed beside it can still redirect the common controls it asks for,
   and through them make Windows load any DLL from that folder. So keep safe-rdp.exe where only you or administrators can write
 - The only parsing before authentication is one fixed-length 101-byte message. The handshake and the viewer's first message (its
-  hello, at most 13 bytes) share one 10-second deadline from accept (a peer cannot hang on by trickling one byte at a time), and
-  until a viewer is let in or turned away, concurrent connections are capped at 8 in total, 2 per address and
+  hello, at most 13 bytes) share one 10-second deadline from accept (a peer cannot hang on by trickling one byte at a time); the
+  viewer likewise gives the handshake and the host's first message (at most 4097 bytes) one 20-second deadline. Until a viewer
+  is let in or turned away (one replacing a session: until the old session has let go, at most 5 s more), concurrent
+  connections are capped at 8 in total, 2 per address and
   (for IPv6 outside Tailscale) 4 per /64, failed addresses get a 1-second delay, and logging before authentication is limited to a few
   lines per minute
 - After authentication, every message, tile coordinate and decompressed size is still validated (a single message that would draw more
@@ -297,7 +317,8 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   1-second burst) ends the session; size changes are paced (8 back to back, then one per second); merged frame and cursor wakeups
   let input and repaints in between; one paint of the Windows viewer smooths at most about a whole 4K frame (a larger picture is
   shown unsmoothed while it moves and smoothed about 150 ms after it stops), so no host makes a paint cost more than a 4K screen
-- A view-only session cannot send input, and it cannot change the host clipboard, transfer files or use the privacy screen either
+- A view-only session (host or viewer `--view-only`) cannot send input, and it cannot change the host clipboard, transfer files or
+  use the privacy screen either
 - When a new viewer authenticates, the existing session is replaced (one session at a time). The replaced viewer is told why
   ("another viewer connected to this host") and does not reconnect; the host keeps its connection open until it has read that
   notice (up to 20 s, at most 4 such connections at once), without making the newcomer wait
@@ -305,7 +326,8 @@ okm = HKDF-Expand(prk, "safe-rdp/2 keys" | th, 128)
   cannot reach the input desktop (a plain host at the lock screen or a UAC prompt) are retried every 0.5 s, during the session
   and for up to 10 minutes after it; the next session takes over any still owed and keeps retrying them for as long as it lasts,
   whether or not its viewer sends input. A host that stops while they are still owed cannot release them
-- Stopping the host with Ctrl+C/SIGTERM goes through the same cleanup
+- Stopping the host with Ctrl+C/SIGTERM goes through the same cleanup, and also ends replaced sessions still finishing and the
+  connections still showing that notice
 
 ### No leftover screen data
 
@@ -378,8 +400,12 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
   the fixed code was attacked again and the remaining issues were fixed in two more rounds; finally a new reviewer re-examined all
   the fixes for regressions, and the 6 issues found there were fixed as well. A later full review found 25 more medium-severity
   issues; they were fixed over several rounds, each round's fixes attacked by separate agents trying to refute them, until a final
-  review of the whole change found nothing of medium severity or above that was not fixed
-- Unit and integration tests: 310 on Windows (3 of them check the built executable's DLL imports), 221 on Linux + 25 that need
+  review of the whole change found nothing of medium severity or above that was not fixed. An external review by another model
+  then raised 24 more points (fail-open `--allow ""`, a junction race when the service resets its folder's permissions,
+  pointer-only DXGI frames, forged X11 events, record counters after a failed send, uploads replacing a file of the same name and
+  more); each was checked against the code first, and all but one (a claimed borrow held across message boxes, which Rust's
+  rules for temporaries rule out) were fixed, with tests wherever the logic can run without a desktop or administrator rights
+- Unit and integration tests: 333 on Windows (3 of them check the built executable's DLL imports), 243 on Linux + 29 that need
   Xvfb, PipeWire, Tailscale or a long run (`cargo test -- --ignored`)
   - Crypto: SHA-256, HMAC (RFC 4231), HKDF (RFC 5869), AES-GCM (NIST), ECDH (NIST CAVS), fixed CNG↔OpenSSL byte vectors
   - Codec: [MS-XCA] spec examples, cabinet.dll golden streams and cross-decoding, fuzzing with 30,000 malformed streams, lossy codec PSNR and ffmpeg cross-checks
