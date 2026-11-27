@@ -1,7 +1,6 @@
 //! Portable viewer plumbing: resolving the host, connecting, authenticating and the hello
 //! exchange (used by the platform viewers and by `probe`), plus the session helpers the
-//! platform viewers share: a prioritised send queue, the reconnect policy, link statistics
-//! and PCM helpers.
+//! platform viewers share: a prioritised send queue, the reconnect policy and link statistics.
 
 // Until the X11 viewer is implemented only the Windows viewer uses this module.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -619,21 +618,6 @@ pub fn stats_text(rtt_ms: Option<u64>, fps: f64, mbps: f64) -> String {
     format!("{rtt} ms · {:.0} fps · {rate} Mbit/s", fps.clamp(0.0, 999.0))
 }
 
-/// Sample rates and channel counts the viewer accepts for playback.
-pub fn audio_format_ok(rate: u32, channels: u8) -> bool {
-    (8000..=192_000).contains(&rate) && (1..=2).contains(&channels)
-}
-
-/// Decodes `AUDIO_PCM16` (little-endian interleaved samples) into `out`.
-pub fn pcm16_le(data: &[u8], out: &mut Vec<i16>) -> Result<()> {
-    if data.len() % 2 != 0 {
-        bail!("odd PCM16 payload length");
-    }
-    out.clear();
-    out.extend(data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
-    Ok(())
-}
-
 /// "45 %" style progress of `done` out of `total` bytes (an empty file is complete).
 pub fn percent(done: u64, total: u64) -> u32 {
     if total == 0 { 100 } else { (done.min(total) as u128 * 100 / total as u128) as u32 }
@@ -1071,15 +1055,5 @@ mod tests {
         assert!(check_screen_size(0, 1080).is_err() && check_screen_size(1920, 0).is_err());
         assert!(check_screen_size(8193, 8192).is_err());
         assert!(check_screen_size(65535, 65535).is_err());
-    }
-
-    #[test]
-    fn pcm_and_audio_formats() {
-        let mut out = vec![9];
-        pcm16_le(&[0x01, 0x00, 0xff, 0xff, 0x00, 0x80], &mut out).unwrap();
-        assert_eq!(out, [1, -1, i16::MIN]);
-        assert!(pcm16_le(&[1, 2, 3], &mut out).is_err());
-        assert!(audio_format_ok(48000, 2) && audio_format_ok(8000, 1));
-        assert!(!audio_format_ok(48000, 0) && !audio_format_ok(48000, 3) && !audio_format_ok(1, 2) && !audio_format_ok(u32::MAX, 1));
     }
 }

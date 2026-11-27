@@ -27,7 +27,7 @@ use crate::proto::*;
 use crate::screen::{Area, MonitorSel};
 use crate::util::{Result, Secret};
 use crate::{bail, log};
-use crate::audio::AdpcmEncoder;
+use crate::audio::AudioSender;
 #[cfg(windows)]
 use crate::platform::clipboard::FileUser;
 use std::collections::HashMap;
@@ -144,12 +144,10 @@ const OWN_DIR_BYTES: u64 = MAX_FILE_SIZE;
 const OWN_DIR_FILES: usize = 1000;
 /// Longest a file chunk waits for frames and replies to go first.
 const BULK_YIELD: Duration = Duration::from_millis(100);
-/// Audio packet length.
-const AUDIO_PACKET_MS: usize = 20;
+/// Audio packet length: one message each.
+const AUDIO_PACKET_MS: usize = crate::audio::PACKET_MS as usize;
 /// Audio packets waiting for the network before new ones are dropped (~160 ms).
 const AUDIO_QUEUE: usize = 8;
-const MAX_AUDIO_CHANNELS: u8 = 8;
-const MAX_AUDIO_RATE: u32 = 384_000;
 /// Decode limit for `Notice` and `FileResult` text.
 const MAX_TEXT: usize = 4096;
 
@@ -1640,29 +1638,28 @@ impl Drop for Held {
 
 /// Interleaved PCM covering `AUDIO_PACKET_MS`.
 struct AudioPacket {
-    seq: u32,
     rate: u32,
     channels: u8,
     pcm: Vec<i16>,
 }
 
 /// Cuts the capture callback's PCM into packets for the sender thread. It never blocks: when
-/// the network falls behind, packets are dropped and the gap shows in `seq`.
+/// the network falls behind, packets are dropped.
 struct Packetizer {
     tx: mpsc::SyncSender<AudioPacket>,
     rate: u32,
     channels: u8,
     pending: Vec<i16>,
-    seq: u32,
 }
 
 impl Packetizer {
     fn new(tx: mpsc::SyncSender<AudioPacket>) -> Packetizer {
-        Packetizer { tx, rate: 0, channels: 0, pending: Vec::new(), seq: 0 }
+        Packetizer { tx, rate: 0, channels: 0, pending: Vec::new() }
     }
 
     fn push(&mut self, pcm: &[i16], rate: u32, channels: u8) {
-        if rate == 0 || rate > MAX_AUDIO_RATE || channels == 0 || channels > MAX_AUDIO_CHANNELS {
+        // Formats the stream cannot carry never reach the queue.
+        if !crate::audio::valid_format(rate, channels) {
             return;
         }
         if (rate, channels) != (self.rate, self.channels) {
@@ -1679,15 +1676,14 @@ impl Packetizer {
             pcm = &pcm[take..];
             if self.pending.len() == n {
                 let pcm = std::mem::replace(&mut self.pending, Vec::with_capacity(n));
-                let _ = self.tx.try_send(AudioPacket { seq: self.seq, rate, channels, pcm });
-                self.seq = self.seq.wrapping_add(1);
+                let _ = self.tx.try_send(AudioPacket { rate, channels, pcm });
             }
         }
     }
 }
 
 /// Streams the host's sound while held: capture callback -> `Packetizer` -> bounded queue ->
-/// sender thread (ADPCM, then the network).
+/// sender thread (`audio::AudioSender`, then the network).
 struct AudioStream {
     _capture: Held,
     stop: Arc<AtomicBool>,
@@ -1723,8 +1719,9 @@ impl Drop for AudioStream {
 }
 
 fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, stop: &AtomicBool) {
-    let mut enc: Option<(u8, AdpcmEncoder)> = None;
-    let mut data = Vec::new();
+    // ADPCM in 20 ms messages; silence is skipped, and the encoder restarts after it and on a
+    // format change.
+    let mut sender = AudioSender::new();
     loop {
         let p = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(p) => p,
@@ -1734,21 +1731,9 @@ fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, st
         if stop.load(Ordering::SeqCst) || ctl.stopped() {
             return;
         }
-        // The ADPCM encoder takes mono or stereo only; silence is not worth sending.
-        if !(1..=2).contains(&p.channels) || p.pcm.iter().all(|&s| s == 0) {
-            continue;
-        }
-        if enc.as_ref().is_some_and(|(ch, _)| *ch != p.channels) {
-            enc = None;
-        }
-        let (_, e) = enc.get_or_insert_with(|| (p.channels, AdpcmEncoder::new(p.channels)));
-        data.clear();
-        e.encode(&p.pcm, &mut data);
-        if data.is_empty() {
-            continue;
-        }
-        let m = ServerMsg::Audio { seq: p.seq, rate: p.rate, channels: p.channels, codec: AUDIO_IMA_ADPCM, data: &data };
-        if out.send(&m).is_err() {
+        let mut failed = false;
+        sender.push(&p.pcm, p.rate, p.channels, |m| failed = failed || out.send(&m).is_err());
+        if failed {
             return;
         }
     }
@@ -2481,7 +2466,6 @@ mod tests {
         let got = packets(&rx);
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|a| a.pcm.len() == 1764 && a.rate == 44100 && a.channels == 2));
-        assert_eq!((got[0].seq, got[1].seq), (0, 1));
         assert_eq!(&got[0].pcm[..882], &piece[..]);
         // A format change drops the partial packet; a stray half frame is ignored.
         p.push(&[1; 961], 48000, 1);
@@ -2489,13 +2473,14 @@ mod tests {
         p.push(&[2; 1919], 48000, 2);
         let got = packets(&rx);
         assert_eq!(got.len(), 2);
-        assert_eq!((got[0].seq, got[0].pcm.len(), got[0].channels), (2, 960, 1));
-        assert_eq!((got[1].seq, got[1].pcm.len(), got[1].channels), (3, 1920, 2));
+        assert_eq!((got[0].pcm.len(), got[0].channels), (960, 1));
+        assert_eq!((got[1].pcm.len(), got[1].channels), (1920, 2));
         assert_eq!(&got[1].pcm[..3], &[5, 5, 2]);
-        // Nonsense formats are dropped.
+        // Formats the stream cannot carry are dropped.
         p.push(&[1; 4000], 0, 2);
         p.push(&[1; 4000], 48000, 0);
-        p.push(&[1; 4000], 48000, 9);
+        p.push(&[1; 4000], 48000, 3);
+        p.push(&[1; 4000], 4000, 1);
         p.push(&[1; 4000], 10_000_000, 1);
         assert!(packets(&rx).is_empty());
     }
@@ -2509,10 +2494,10 @@ mod tests {
             p.push(&[0; 960], 48000, 1);
         }
         assert!(t.elapsed() < Duration::from_secs(1));
-        // The queue kept the first two; the rest were dropped but still counted.
-        assert_eq!(packets(&rx).iter().map(|a| a.seq).collect::<Vec<_>>(), [0, 1]);
+        // The queue kept the first two; the rest were dropped.
+        assert_eq!(packets(&rx).len(), 2);
         p.push(&[0; 960], 48000, 1);
-        assert_eq!(packets(&rx).iter().map(|a| a.seq).collect::<Vec<_>>(), [10]);
+        assert_eq!(packets(&rx).len(), 1);
         // Nobody listening any more: still no blocking and no panic.
         drop(rx);
         p.push(&[0; 960], 48000, 1);

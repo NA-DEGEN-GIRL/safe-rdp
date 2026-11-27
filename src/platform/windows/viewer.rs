@@ -12,7 +12,6 @@
 //! through `App::events` + `WM_APP_EVENT`. A reconnect replaces the whole `Session`;
 //! anything still arriving from an old one is recognised by its generation number.
 
-use super::audio::AudioPlayer;
 use super::capture::CURSOR_IDS;
 use super::clipboard::Clipboard;
 use super::mem::LockedBuf;
@@ -44,7 +43,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::audio::AdpcmDecoder;
+use crate::audio::AudioReceiver;
 
 const WM_APP_FRAME: u32 = WM_APP + 1;
 const WM_APP_CURSOR: u32 = WM_APP + 2;
@@ -950,9 +949,8 @@ fn apply_tiles(app: &App, s: &Session, dec: &mut core::TileDecoder, p: &[u8]) ->
 /// Decodes and plays the host's audio while sound is on.
 #[derive(Default)]
 struct AudioSink {
-    player: Option<(AudioPlayer, u32, u8)>,
-    adpcm: Option<AdpcmDecoder>,
-    pcm: Vec<i16>,
+    rx: AudioReceiver,
+    /// The sound device failed and the UI was told, since sound was last switched on.
     failed: bool,
     warned: bool,
 }
@@ -960,39 +958,17 @@ struct AudioSink {
 impl AudioSink {
     fn play(&mut self, s: &Session, rate: u32, channels: u8, codec: u8, data: &[u8]) {
         if !s.sound.load(Ordering::Relaxed) {
-            self.player = None;
+            self.rx.stop();
+            self.failed = false;
             return;
         }
-        if self.failed || !core::audio_format_ok(rate, channels) {
-            return;
-        }
-        let decoded = match codec {
-            AUDIO_PCM16 => core::pcm16_le(data, &mut self.pcm),
-            AUDIO_IMA_ADPCM => {
-                self.pcm.clear();
-                self.adpcm.get_or_insert_with(AdpcmDecoder::new).decode(data, channels, &mut self.pcm)
+        let Err(e) = self.rx.play(rate, channels, codec, data) else { return };
+        if self.rx.device_failed() {
+            if !std::mem::replace(&mut self.failed, true) {
+                APP.get().unwrap().post(Event::SoundFailed { generation: s.generation, reason: e.to_string() });
             }
-            other => Err(format!("unknown audio codec {other}").into()),
-        };
-        if let Err(e) = decoded {
-            if !std::mem::replace(&mut self.warned, true) {
-                log!("cannot decode the host's audio: {e}");
-            }
-            return;
-        }
-        if self.player.as_ref().is_none_or(|(_, r, c)| (*r, *c) != (rate, channels)) {
-            self.player = None;
-            match AudioPlayer::new(rate, channels) {
-                Ok(p) => self.player = Some((p, rate, channels)),
-                Err(e) => {
-                    self.failed = true;
-                    APP.get().unwrap().post(Event::SoundFailed { generation: s.generation, reason: e.to_string() });
-                    return;
-                }
-            }
-        }
-        if let Some((p, ..)) = self.player.as_mut() {
-            p.push(&self.pcm);
+        } else if !std::mem::replace(&mut self.warned, true) {
+            log!("cannot decode the host's audio: {e}");
         }
     }
 }

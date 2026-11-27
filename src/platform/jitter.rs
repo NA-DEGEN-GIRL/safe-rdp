@@ -6,9 +6,6 @@
 //! queue passes `max`, or when it has stayed well above `start` for a while (bursts after a
 //! network stall, clock drift between host and viewer).
 
-// Used by the platform `AudioPlayer`s, which host.rs / viewer.rs do not call yet.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 
 /// Queue level above `start` that counts as excess latency.
@@ -58,14 +55,21 @@ impl JitterBuffer {
     }
 
     /// Frames waiting to be played.
+    #[cfg(test)]
     pub fn queued_frames(&self) -> usize {
         self.queue.len() / self.channels
     }
 
     /// Queues interleaved PCM (a trailing partial frame is ignored).
     pub fn push(&mut self, pcm: &[i16]) {
-        let n = pcm.len() - pcm.len() % self.channels;
-        self.queue.extend(&pcm[..n]);
+        let mut pcm = &pcm[..pcm.len() - pcm.len() % self.channels];
+        if pcm.len() > self.max {
+            // All but its last `start` would be dropped at once: never grow the queue for it.
+            self.queue.clear();
+            self.over = 0;
+            pcm = &pcm[pcm.len() - self.start..];
+        }
+        self.queue.extend(pcm);
         if self.queue.len() > self.max {
             self.drop_to_start();
         }
@@ -180,6 +184,14 @@ mod tests {
         let mut j = JitterBuffer::new(RATE, 2, 60, 300);
         j.push(&ramp(301, 2, 5));
         assert_eq!(j.queued_frames(), 60, "past the ceiling the oldest audio is dropped");
+        // A push larger than the ceiling keeps only its newest audio, without growing the queue.
+        let cap = j.queue.capacity();
+        let mut big = ramp(5000, 2, 1);
+        big.extend(ramp(60, 2, 7));
+        j.push(&big);
+        assert_eq!(j.queued_frames(), 60);
+        assert!(j.queue.iter().all(|&s| s == 7));
+        assert_eq!(j.queue.capacity(), cap);
 
         // Sitting above start + slack for two seconds drops the excess too.
         let mut j = JitterBuffer::new(RATE, 1, 60, 300);

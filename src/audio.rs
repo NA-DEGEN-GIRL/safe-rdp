@@ -9,9 +9,6 @@
 //! state stored in its own header, so packets decode independently and a lost or skipped
 //! packet never corrupts the ones after it.
 
-// Wired into host.rs / viewer.rs separately; until then parts of this module are unused.
-#![allow(dead_code)]
-
 use crate::bail;
 #[cfg(not(test))]
 use crate::platform::audio::AudioPlayer;
@@ -111,10 +108,6 @@ impl AdpcmEncoder {
         AdpcmEncoder { channels: channels as usize, state: [Channel::default(); MAX_CHANNELS as usize] }
     }
 
-    pub fn channels(&self) -> u8 {
-        self.channels as u8
-    }
-
     /// Appends one self-contained packet holding the whole frames of `pcm` (at most
     /// `MAX_PACKET_FRAMES`) to `out` and returns the number of samples consumed.
     /// Nothing is appended when `pcm` holds no whole frame.
@@ -150,10 +143,6 @@ impl AdpcmEncoder {
 pub struct AdpcmDecoder;
 
 impl AdpcmDecoder {
-    pub fn new() -> AdpcmDecoder {
-        AdpcmDecoder
-    }
-
     /// Decodes one packet and appends its interleaved samples to `out`. Malformed packets
     /// (bad header, length or padding) are rejected without touching `out`.
     pub fn decode(&mut self, data: &[u8], channels: u8, out: &mut Vec<i16>) -> Result<()> {
@@ -200,7 +189,8 @@ fn decode_pcm16(data: &[u8], channels: u8, out: &mut Vec<i16>) -> Result<()> {
     Ok(())
 }
 
-fn valid_format(rate: u32, channels: u8) -> bool {
+/// Sample rates and channel counts the stream carries.
+pub fn valid_format(rate: u32, channels: u8) -> bool {
     (MIN_RATE..=MAX_RATE).contains(&rate) && (1..=MAX_CHANNELS).contains(&channels)
 }
 
@@ -277,10 +267,6 @@ pub struct AudioReceiver {
 }
 
 impl AudioReceiver {
-    pub fn new() -> AudioReceiver {
-        AudioReceiver::default()
-    }
-
     /// Decodes one message's payload into interleaved PCM.
     pub fn decode(&mut self, rate: u32, channels: u8, codec: u8, data: &[u8]) -> Result<&[i16]> {
         if !valid_format(rate, channels) {
@@ -334,10 +320,21 @@ impl AudioReceiver {
         Ok(())
     }
 
-    /// Stops playback (the next message reopens the device).
+    /// Whether the audio device could not be opened when last tried: an error from `play` then
+    /// is about the device rather than the message.
+    #[cfg_attr(not(windows), allow(dead_code))] // only the Windows viewer switches sound off and on
+    pub fn device_failed(&self) -> bool {
+        self.retry_at.is_some()
+    }
+
+    /// Stops playback when the user switches sound off; the next message reopens the device at
+    /// once (the format hold and retry delay only pace what the host sends).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn stop(&mut self) {
         self.player = None;
         self.format = (0, 0);
+        self.retry_at = None;
+        self.opened_at = None;
     }
 }
 
@@ -374,7 +371,7 @@ mod tests {
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         for no_device in [false, true] {
             NO_DEVICE.set(no_device);
-            let mut r = AudioReceiver::new();
+            let mut r = AudioReceiver::default();
             // A host alternating mono and stereo in every 20 ms packet for 10 s: a player every 2 s.
             for i in 0..500 {
                 let ch = 1 + (i % 2) as u8;
@@ -386,12 +383,35 @@ mod tests {
         }
         NO_DEVICE.set(false);
         // A format that settles is followed at once, then kept.
-        let mut r = AudioReceiver::new();
+        let mut r = AudioReceiver::default();
         r.play_at(at(0), 48_000, 2, AUDIO_PCM16, &packet(2)).unwrap();
         for i in 0..100 {
             r.play_at(at(5000 + 20 * i), 44_100, 1, AUDIO_PCM16, &packet(1)).unwrap();
         }
         assert_eq!(OPENED.take(), [(48_000, 2), (44_100, 1)]);
+    }
+
+    #[test]
+    fn receiver_checks_packets_before_playing() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut r = AudioReceiver::default();
+        // Longer than a packet may be, or not whole frames: refused before any player is involved.
+        assert!(r.play_at(at(0), 48_000, 2, AUDIO_PCM16, &vec![0; 4 * (MAX_PACKET_FRAMES + 1)]).is_err());
+        assert!(r.play_at(at(0), 48_000, 2, AUDIO_PCM16, &[0; 6]).is_err());
+        assert!(!r.device_failed());
+        assert!(OPENED.take().is_empty());
+        // A missing device is told apart from a bad message, and reported once per streak.
+        NO_DEVICE.set(true);
+        assert!(r.play_at(at(0), 48_000, 2, AUDIO_PCM16, &[0; 8]).is_err());
+        assert!(r.device_failed());
+        assert!(r.play_at(at(20), 48_000, 2, AUDIO_PCM16, &[0; 8]).is_ok());
+        // Sound switched off and on again: the device is tried again at once.
+        r.stop();
+        assert!(!r.device_failed());
+        NO_DEVICE.set(false);
+        r.play_at(at(40), 48_000, 2, AUDIO_PCM16, &[0; 8]).unwrap();
+        assert_eq!(OPENED.take(), [(48_000, 2), (48_000, 2)]);
     }
 
     struct Rng(u64);
@@ -426,7 +446,7 @@ mod tests {
     /// Encodes in `PACKET_MS` packets and decodes each one separately, like the stream does.
     fn roundtrip(pcm: &[i16], channels: u8, packet_frames: usize) -> (Vec<i16>, usize) {
         let mut enc = AdpcmEncoder::new(channels);
-        let mut dec = AdpcmDecoder::new();
+        let mut dec = AdpcmDecoder;
         let (mut out, mut bytes) = (Vec::new(), 0);
         for chunk in pcm.chunks(packet_frames * channels as usize) {
             let mut packet = Vec::new();
@@ -496,14 +516,14 @@ mod tests {
             assert_eq!(AdpcmEncoder::new(1).encode(&pcm, &mut packet), len);
             assert_eq!(packet.len(), 3 + len.div_ceil(2));
             let mut out = Vec::new();
-            AdpcmDecoder::new().decode(&packet, 1, &mut out).unwrap();
+            AdpcmDecoder.decode(&packet, 1, &mut out).unwrap();
             assert_eq!(out.len(), len);
         }
         // A trailing partial stereo frame is left for the caller.
         let mut packet = Vec::new();
         assert_eq!(AdpcmEncoder::new(2).encode(&[100, -100, 200], &mut packet), 2);
         let mut out = Vec::new();
-        AdpcmDecoder::new().decode(&packet, 2, &mut out).unwrap();
+        AdpcmDecoder.decode(&packet, 2, &mut out).unwrap();
         assert_eq!(out.len(), 2);
         // No whole frame: no packet at all.
         packet.clear();
@@ -513,7 +533,7 @@ mod tests {
         let big = vec![5i16; (MAX_PACKET_FRAMES + 10) * 2];
         assert_eq!(AdpcmEncoder::new(2).encode(&big, &mut packet), MAX_PACKET_FRAMES * 2);
         out.clear();
-        AdpcmDecoder::new().decode(&packet, 2, &mut out).unwrap();
+        AdpcmDecoder.decode(&packet, 2, &mut out).unwrap();
         assert_eq!(out.len(), MAX_PACKET_FRAMES * 2);
     }
 
@@ -531,20 +551,20 @@ mod tests {
             .collect();
         let mut whole = Vec::new();
         for p in &packets {
-            AdpcmDecoder::new().decode(p, 1, &mut whole).unwrap();
+            AdpcmDecoder.decode(p, 1, &mut whole).unwrap();
         }
         // Losing packet 2 leaves every other packet's output unchanged.
         let mut lossy = Vec::new();
         for (i, p) in packets.iter().enumerate().filter(|(i, _)| *i != 2) {
             let start = lossy.len();
-            AdpcmDecoder::new().decode(p, 1, &mut lossy).unwrap();
+            AdpcmDecoder.decode(p, 1, &mut lossy).unwrap();
             assert_eq!(&lossy[start..], &whole[i * 960..(i + 1) * 960]);
         }
     }
 
     #[test]
     fn rejects_hostile_packets() {
-        let mut d = AdpcmDecoder::new();
+        let mut d = AdpcmDecoder;
         let mut out = vec![7i16];
         let bad: &[(&[u8], u8)] = &[
             (&[], 1),
@@ -586,7 +606,7 @@ mod tests {
 
     #[test]
     fn pcm16_payloads() {
-        let mut r = AudioReceiver::new();
+        let mut r = AudioReceiver::default();
         assert_eq!(r.decode(48_000, 2, AUDIO_PCM16, &[1, 0, 0xff, 0xff]).unwrap(), [1, -1]);
         assert!(r.decode(48_000, 2, AUDIO_PCM16, &[1, 0, 0xff]).is_err());
         assert!(r.decode(48_000, 2, 7, &[1, 0, 0xff, 0xff]).is_err());
@@ -597,7 +617,7 @@ mod tests {
     #[test]
     fn sender_frames_packets_and_skips_silence() {
         let mut s = AudioSender::new();
-        let mut r = AudioReceiver::new();
+        let mut r = AudioReceiver::default();
         let tone = interleave(&sine(48_000.0, 440.0, 0.5, 2400, 0.0), &sine(48_000.0, 440.0, 0.5, 2400, 0.0));
         let mut msgs = Vec::new();
         let mut decoded = Vec::new();
@@ -639,5 +659,30 @@ mod tests {
         assert_eq!(fmts, [(44_100, 1, 3 + 441)]);
         s.push(&[1; 6000], 48_000, 6, |_| panic!("6 channels cannot be sent"));
         s.push(&[1; 6000], 1_000, 1, |_| panic!("1 kHz cannot be sent"));
+    }
+
+    #[test]
+    fn sender_restarts_the_encoder_after_silence_and_format_changes() {
+        /// The codec state (header) each message sent for `pcm` starts from.
+        fn headers(s: &mut AudioSender, pcm: &[i16], rate: u32) -> Vec<Vec<u8>> {
+            let mut h = Vec::new();
+            s.push(pcm, rate, 1, |m| {
+                if let ServerMsg::Audio { data, .. } = m {
+                    h.push(data[..HEADER].to_vec());
+                }
+            });
+            h
+        }
+        let loud: Vec<i16> = (0..960).map(|i| if i % 2 == 0 { 30_000 } else { -30_000 }).collect();
+        let mut s = AudioSender::new();
+        assert_eq!(headers(&mut s, &loud, 48_000), [[0u8, 0, 0]]);
+        // Straight after loud audio, quiet audio starts from the loud audio's state...
+        assert_ne!(headers(&mut s, &[1; 960], 48_000), [[0u8, 0, 0]]);
+        // ...but after silence from rest, as if the silence had been sent, and so after a new rate.
+        headers(&mut s, &loud, 48_000);
+        assert!(headers(&mut s, &[0; 960], 48_000).is_empty());
+        assert_eq!(headers(&mut s, &[1; 960], 48_000), [[0u8, 0, 0]]);
+        headers(&mut s, &loud, 48_000);
+        assert_eq!(headers(&mut s, &[1; 882], 44_100), [[0u8, 0, 0]]);
     }
 }
