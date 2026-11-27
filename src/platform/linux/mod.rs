@@ -53,13 +53,16 @@ mod libc {
         pub fn prctl(option: c_int, ...) -> c_int;
         pub fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
         pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
-        pub fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+        /// `handler` None is `SIG_DFL`. Returns the handler before (`SIG_IGN` comes back as address 1).
+        pub fn signal(sig: c_int, handler: Option<extern "C" fn(c_int)>) -> Option<extern "C" fn(c_int)>;
         pub fn _exit(code: c_int) -> !;
     }
 
     pub const SIGHUP: c_int = 1;
     pub const SIGINT: c_int = 2;
+    pub const SIGQUIT: c_int = 3;
     pub const SIGTERM: c_int = 15;
+    pub const SIG_IGN: usize = 1;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -104,7 +107,7 @@ extern "C" fn on_signal(_sig: std::ffi::c_int) {
 pub fn stop_on_signals(stop: &'static AtomicBool) {
     STOP_FLAG.store(stop as *const AtomicBool as *mut AtomicBool, Ordering::SeqCst);
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe { libc::signal(sig, on_signal) };
+        unsafe { libc::signal(sig, Some(on_signal)) };
     }
 }
 
@@ -132,14 +135,38 @@ pub fn request_sas() -> bool {
     false
 }
 
+/// The terminal settings `read_secret` switched echo off from, while it waits.
+static ECHO_TERMIOS: AtomicPtr<libc::Termios> = AtomicPtr::new(std::ptr::null_mut());
+
+/// A signal that ends the process while `read_secret` waits (Ctrl+C, Ctrl+\): echo goes back on
+/// first, or the shell's terminal would stay without it.
+extern "C" fn restore_echo(sig: std::ffi::c_int) {
+    let t = ECHO_TERMIOS.load(Ordering::SeqCst);
+    if !t.is_null() {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
+    }
+    unsafe { libc::_exit(128 + sig) };
+}
+
 /// Reads one line from stdin without echoing it when stdin is a terminal.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     eprint!("{prompt}");
-    let mut line = String::new();
+    // Room for a key line, so that it is not copied while growing; wiped if reading fails.
+    let mut line = String::with_capacity(256);
     unsafe {
         let mut t: libc::Termios = std::mem::zeroed();
         let tty = libc::tcgetattr(0, &mut t) == 0;
+        let mut handlers = Vec::new();
         if tty {
+            ECHO_TERMIOS.store(&mut t, Ordering::SeqCst);
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+                let old = libc::signal(sig, Some(restore_echo));
+                // Left ignored if it was (nohup).
+                if old.is_some_and(|h| h as usize == libc::SIG_IGN) {
+                    libc::signal(sig, old);
+                }
+                handlers.push((sig, old));
+            }
             let mut quiet = t;
             quiet.c_lflag &= !libc::ECHO;
             libc::tcsetattr(0, libc::TCSANOW, &quiet);
@@ -147,9 +174,17 @@ pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
         let r = std::io::stdin().read_line(&mut line);
         if tty {
             libc::tcsetattr(0, libc::TCSANOW, &t);
+            for (sig, old) in handlers {
+                libc::signal(sig, old);
+            }
+            ECHO_TERMIOS.store(std::ptr::null_mut(), Ordering::SeqCst);
             eprintln!();
         }
-        r?;
+        if let Err(e) = r {
+            // Also what a failed read left beyond the length (invalid UTF-8 is cut off again).
+            drop(crate::util::SecureVec(line.into_bytes()));
+            return Err(e.into());
+        }
     }
     Ok(line)
 }

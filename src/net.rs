@@ -198,6 +198,15 @@ fn interfaces_holding(ip: Ipv4Addr) -> Vec<String> {
     found
 }
 
+/// `ip`, with an IPv4 address written as IPv6 (`::ffff:a.b.c.d`, as a dual-stack socket reports
+/// IPv4 peers) turned back into IPv4, so that both spellings compare equal.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 pub struct PeerPolicy {
     pub allow: Vec<IpAddr>,
     pub allow_non_tailscale: bool,
@@ -206,10 +215,7 @@ pub struct PeerPolicy {
 
 impl PeerPolicy {
     pub fn allows(&self, peer: IpAddr) -> bool {
-        let peer = match peer {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(peer),
-            v4 => v4,
-        };
+        let peer = canonical_ip(peer);
         if !self.allow.is_empty() {
             return self.allow.contains(&peer);
         }
@@ -284,5 +290,10 @@ mod tests {
         let p = PeerPolicy { allow: vec!["100.100.1.2".parse().unwrap()], allow_non_tailscale: false, loopback_ok: true };
         assert!(p.allows("::ffff:100.100.1.2".parse().unwrap()));
         assert!(!p.allows("100.100.1.3".parse().unwrap()));
+        // The list holds canonical addresses (`main` writes them so); peers of either spelling match.
+        let p = PeerPolicy { allow: vec![canonical_ip("::ffff:100.100.1.2".parse().unwrap())], allow_non_tailscale: false, loopback_ok: false };
+        assert!(p.allows("100.100.1.2".parse().unwrap()));
+        assert!(p.allows("::ffff:100.100.1.2".parse().unwrap()));
+        assert_eq!(canonical_ip("fd7a:115c:a1e0::1".parse().unwrap()), "fd7a:115c:a1e0::1".parse::<IpAddr>().unwrap());
     }
 }

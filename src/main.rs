@@ -129,8 +129,9 @@ fn dispatch(args: &[String]) -> Result<()> {
     let rest = &args[1..];
     match cmd.as_str() {
         #[cfg(windows)]
-        "gui" => platform::launcher::run(),
+        "gui" => no_args(rest).and_then(|()| platform::launcher::run()),
         "devices" => {
+            no_args(rest)?;
             let st = tailscale::status().map_err(|p| Error::msg(p.to_string()))?;
             print!("{}", tailscale::devices_table(&st));
             Ok(())
@@ -192,8 +193,9 @@ fn dispatch(args: &[String]) -> Result<()> {
                 }
                 platform::service::rekey(expect.as_deref())
             }
-            Some("uninstall") => platform::service::uninstall(),
+            Some("uninstall") => no_args(&rest[1..]).and_then(|()| platform::service::uninstall()),
             Some("status") => {
+                no_args(&rest[1..])?;
                 let status = platform::service::status()?;
                 println!("{status}");
                 if status != "not installed" {
@@ -206,6 +208,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             _ => bail!("usage: safe-rdp service install|rekey|uninstall|status"),
         },
         "monitors" => {
+            no_args(rest)?;
             platform::init_process();
             for (i, m) in capture::monitors().iter().enumerate() {
                 println!("{}: {}x{} at ({}, {}){}", i + 1, m.width, m.height, m.left, m.top, if i == 0 { " primary" } else { "" });
@@ -225,6 +228,14 @@ fn dispatch(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => bail!("unknown command '{other}' (see `safe-rdp help`)"),
+    }
+}
+
+/// Refuses arguments to a command that takes none: `key forget --help` must not delete the key.
+fn no_args(args: &[String]) -> Result<()> {
+    match args.first() {
+        Some(a) => bail!("unknown option '{a}' (see `safe-rdp help`)"),
+        None => Ok(()),
     }
 }
 
@@ -317,12 +328,13 @@ fn parse_host(args: &[String], service: bool) -> Result<HostCli> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--bind" => o.bind = Some(next(&mut it, a)?.parse().map_err(|_| "--bind expects an IP address")?),
+            "--bind" => o.bind = Some(net::canonical_ip(next(&mut it, a)?.parse().map_err(|_| "--bind expects an IP address")?)),
             "--port" => o.port = next(&mut it, a)?.parse().map_err(|_| "--port expects a number")?,
             "--allow" => {
-                for p in next(&mut it, a)?.split(',').filter(|p| !p.is_empty()) {
+                // An empty entry (`--allow "$UNSET"`) must not leave the list empty: that allows everyone.
+                for p in next(&mut it, a)?.split(',') {
                     let ip: IpAddr = p.trim().parse().map_err(|_| format!("--allow: '{p}' is not an IP address"))?;
-                    o.policy.allow.push(ip);
+                    o.policy.allow.push(net::canonical_ip(ip));
                 }
             }
             "--allow-non-tailscale" => o.policy.allow_non_tailscale = true,
@@ -419,8 +431,8 @@ fn connect(args: &[String]) -> Result<()> {
         }
     }
     let target = target.ok_or("usage: safe-rdp connect <host[:port]>")?;
-    let key = load_key(key_file.as_deref())?;
     platform::init_process();
+    let key = load_key(key_file.as_deref())?;
     platform::viewer::run(&target, o, key)
 }
 
@@ -439,7 +451,9 @@ fn probe_cmd(args: &[String]) -> Result<()> {
             continue;
         }
         match a.as_str() {
-            "--seconds" => o.seconds = next(&mut it, a)?.parse().ok().filter(|s: &f64| *s > 0.0).ok_or("--seconds expects a positive number")?,
+            "--seconds" => {
+                o.seconds = next(&mut it, a)?.parse().ok().filter(|s: &f64| *s > 0.0 && *s <= 86_400.0).ok_or("--seconds expects a number above 0, at most 86400")?
+            }
             "--type" => o.type_text = Some(next(&mut it, a)?.to_string()),
             "--move" => o.moves.push(parse_xy(next(&mut it, a)?, a)?),
             "--click" => o.clicks.push(parse_xy(next(&mut it, a)?, a)?),
@@ -467,6 +481,7 @@ fn probe_cmd(args: &[String]) -> Result<()> {
         }
     }
     let target = target.ok_or("usage: safe-rdp probe <host[:port]> [options]")?;
+    platform::init_process();
     let key = load_key(key_file.as_deref())?;
     probe::run(&target, o, key)
 }
@@ -476,6 +491,7 @@ fn keygen(args: &[String]) -> Result<()> {
     if let Some(a) = args.iter().find(|a| *a != "--force") {
         bail!("unknown option '{a}'");
     }
+    platform::init_process();
     let replaced = keystore::user_key_path()?.exists();
     if replaced && !force {
         bail!("a key is already stored; use `safe-rdp key show`, or `keygen --force` to replace it");
@@ -587,6 +603,8 @@ fn service_key_line(recorded: std::result::Result<Option<String>, String>, mine:
 }
 
 fn key_cmd(args: &[String]) -> Result<()> {
+    // Before any key is in memory (on Linux: no core dumps, no ptrace).
+    platform::init_process();
     match args.first().map(String::as_str) {
         Some("import") => {
             if args.len() > 1 {
@@ -618,10 +636,12 @@ fn key_cmd(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("show") => {
+            no_args(&args[1..])?;
             println!("{}", keys::format_key(&keystore::load_user_key()?));
             Ok(())
         }
         Some("forget") => {
+            no_args(&args[1..])?;
             #[cfg(windows)]
             let old = keystore::user_key_fingerprint();
             if keystore::forget_user_key()? {
@@ -673,21 +693,24 @@ fn bench(args: &[String]) -> Result<()> {
         }
     }
     println!("capture:       {name}, open + first frame {first:.1} ms, {frames} frames delivered in 1 s");
-    let mut frame = cap.pixels().to_vec();
+    // Locked and wiped however this ends, like the host's and the viewer's copies.
+    let mut frame = platform::mem::LockedBuf::new(cap.pixels().len());
+    frame.as_mut_slice().copy_from_slice(cap.pixels());
     drop(cap);
-    let mut fb = vec![0u8; w * h * 4];
+    let frame = frame.as_slice();
+    let mut fb = platform::mem::LockedBuf::new(w * h * 4);
     for (q, label) in [(proto::QUALITY_LOSSLESS, "lossless"), (proto::QUALITY_BALANCED, "balanced"), (proto::QUALITY_LOW, "low")] {
         let mut enc = codec::Encoder::new()?;
         enc.set_quality(q);
         let mut dec = codec::Decoder::new()?;
         let t = Instant::now();
-        let rects = enc.encode(&frame, w, h);
+        let rects = enc.encode(frame, w, h);
         let enc_ms = t.elapsed().as_secs_f64() * 1000.0;
         let msgs = codec::pack(1, w, h, &rects);
         let bytes: usize = msgs.iter().map(Vec::len).sum();
         let t = Instant::now();
         for m in &msgs {
-            dec.apply(&m[1..], &mut fb, w, h)?;
+            dec.apply(&m[1..], fb.as_mut_slice(), w, h)?;
         }
         let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
         println!(
@@ -697,15 +720,66 @@ fn bench(args: &[String]) -> Result<()> {
         );
     }
     let mut enc = codec::Encoder::new()?;
-    enc.encode(&frame, w, h);
+    enc.encode(frame, w, h);
     let t = Instant::now();
     for _ in 0..10 {
-        enc.encode(&frame, w, h);
+        enc.encode(frame, w, h);
     }
     println!("unchanged:     diff {:.1} ms/frame", t.elapsed().as_secs_f64() * 100.0);
-    util::wipe(&mut frame);
-    util::wipe(&mut fb);
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_lists_have_no_empty_entries() {
+        // Such as `--allow "$UNSET"`: an empty list would let every peer in.
+        for list in ["", " ", ",", "100.64.0.1,", ",100.64.0.1", "100.64.0.1,,100.64.0.2"] {
+            assert!(parse_host(&args(&["--allow", list]), false).is_err(), "--allow {list:?} was taken");
+        }
+        let cli = parse_host(&args(&["--allow", "100.64.0.1, 100.64.0.2"]), false).unwrap();
+        assert_eq!(cli.opts.policy.allow, [IpAddr::from([100, 64, 0, 1]), IpAddr::from([100, 64, 0, 2])]);
+    }
+
+    #[test]
+    fn ipv4_written_as_ipv6_is_ipv4() {
+        let cli = parse_host(&args(&["--allow", "::ffff:100.64.0.2"]), false).unwrap();
+        assert_eq!(cli.opts.policy.allow, [IpAddr::from([100, 64, 0, 2])]);
+        assert!(cli.opts.policy.allows("100.64.0.2".parse().unwrap()));
+        assert!(cli.opts.policy.allows("::ffff:100.64.0.2".parse().unwrap()));
+        assert!(!cli.opts.policy.allows("100.64.0.3".parse().unwrap()));
+        // Loopback in either spelling, for --bind and --allow alike.
+        assert!(parse_host(&args(&["--allow", "::ffff:127.0.0.1"]), false).is_ok());
+        assert!(parse_host(&args(&["--allow", "::ffff:192.168.0.10"]), false).is_err());
+        let cli = parse_host(&args(&["--bind", "::ffff:127.0.0.1"]), false).unwrap();
+        assert_eq!(cli.opts.bind, Some(IpAddr::from([127, 0, 0, 1])));
+        assert!(cli.opts.policy.loopback_ok);
+    }
+
+    #[test]
+    fn commands_without_options_refuse_them() {
+        assert!(no_args(&[]).is_ok());
+        // `key forget --help` must not delete the key.
+        let e = no_args(&args(&["--help"])).unwrap_err().to_string();
+        assert!(e.contains("unknown option '--help'"), "{e}");
+        // (Not tried through `dispatch`: should the check go missing, that would print or delete
+        // the key stored for whoever runs the tests.)
+    }
+
+    #[test]
+    fn probe_seconds_are_bounded() {
+        // A test of what is parsed: nothing connects, no key is read.
+        for s in ["0", "-1", "nan", "inf", "1e18", "86400.5"] {
+            let e = probe_cmd(&args(&["100.64.0.1", "--seconds", s])).unwrap_err().to_string();
+            assert!(e.contains("--seconds"), "--seconds {s}: {e}");
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

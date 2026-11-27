@@ -10,8 +10,9 @@
 
 use crate::codec::{self, Decoder};
 use crate::files::{Incoming, Outgoing};
+use crate::platform::mem::LockedBuf;
 use crate::proto::*;
-use crate::util::{Error, Result, Secret};
+use crate::util::{Error, Result, Secret, SecureVec};
 use crate::viewer::{Next, OutQueue, ViewerOptions, check_screen_size, connect};
 use crate::{bail, log};
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,8 @@ pub struct ProbeOptions {
     pub sets: Vec<(u8, u32)>,
     pub uploads: Vec<String>,
     pub pull: bool,
+    /// Where `--pull` saves (None: `files::transfer_dir()`; tests use one of their own).
+    pub pull_dir: Option<std::path::PathBuf>,
     pub expect_change: bool,
     pub snapshot: Option<String>,
 }
@@ -41,6 +44,7 @@ impl Default for ProbeOptions {
             sets: Vec::new(),
             uploads: Vec::new(),
             pull: false,
+            pull_dir: None,
             expect_change: false,
             snapshot: None,
         }
@@ -116,11 +120,14 @@ fn checksum(fb: &[u8]) -> u64 {
 
 /// Where pulled files go: the user's own `files::transfer_dir()`, never a shared temp directory.
 /// Files the host sends without `--pull` are refused.
-fn download_dir(pull: bool) -> Result<std::path::PathBuf> {
-    if !pull {
+fn download_dir(o: &ProbeOptions) -> Result<std::path::PathBuf> {
+    if !o.pull {
         bail!("the host sent a file that was not asked for (no --pull)");
     }
-    crate::files::transfer_dir()
+    match &o.pull_dir {
+        Some(d) => Ok(d.clone()),
+        None => crate::files::transfer_dir(),
+    }
 }
 
 /// The `--set` keys with fewer `State` replies in `states` than settings, and how many are
@@ -147,7 +154,9 @@ fn write_ppm(path: &str, fb: &[u8], w: usize, h: usize) -> Result<()> {
     for p in fb.chunks_exact(4) {
         out.extend_from_slice(&[p[2], p[1], p[0]]);
     }
-    std::fs::write(path, out)?;
+    let r = std::fs::write(path, &out);
+    crate::util::wipe(&mut out);
+    r?;
     Ok(())
 }
 
@@ -266,11 +275,11 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     // desynchronise the stream); the main loop polls the channel. A few records at most wait
     // in it: while the main loop is busy, the reader stops reading instead of buffering
     // whatever the host sends.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<SecureVec>>(4);
     let mut reader = conn.reader;
     std::thread::spawn(move || {
         loop {
-            let r = reader.recv().map(|b| b.to_vec());
+            let r = reader.recv().map(|b| SecureVec(b.to_vec()));
             let stop = r.is_err();
             if tx.send(r).is_err() || stop {
                 break;
@@ -288,7 +297,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
 
     let start = Instant::now();
     let (mut fw, mut fh) = (conn.width, conn.height);
-    let mut fb = vec![0u8; fw * fh * 4];
+    let mut fb = LockedBuf::new(fw * fh * 4);
     let mut dec = Decoder::new()?;
     let (mut frames, mut bytes, mut audio_packets) = (0u64, 0u64, 0u64);
     let mut first_frame: Option<f64> = None;
@@ -301,6 +310,9 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     let mut states: Vec<(u8, u32)> = Vec::new();
     let mut download: Option<Incoming> = None;
     let mut pending_uploads = uploads.len();
+    // The host says nothing when it has sent all it pulls: the pull is taken as answered once a
+    // file or notice came after it and nothing more began for a second.
+    let (mut pulled, mut pull_quiet): (usize, Option<Instant>) = (0, None);
 
     for &(key, value) in &o.sets {
         sender.send(ClientMsg::Set { key, value })?;
@@ -315,7 +327,8 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             uploaded = true;
             results_due = results_due.max(Instant::now() + Duration::from_secs(10));
         }
-        if start.elapsed().as_secs_f64() >= o.seconds && uploaded && (pending_uploads == 0 || Instant::now() >= results_due) {
+        let pull_done = !o.pull || (download.is_none() && pull_quiet.is_some_and(|t| Instant::now() >= t));
+        if start.elapsed().as_secs_f64() >= o.seconds && uploaded && ((pending_uploads == 0 && pull_done) || Instant::now() >= results_due) {
             break;
         }
         if let Some(e) = sender.failure() {
@@ -348,7 +361,7 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => bail!("connection closed"),
         };
-        let rec = &owned[..];
+        let rec = &owned.0[..];
         bytes += rec.len() as u64 + 20;
         match ServerMsg::decode(rec)? {
             ServerMsg::Tiles(p) => {
@@ -356,15 +369,17 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 if (hdr.width, hdr.height) != (fw, fh) {
                     check_screen_size(hdr.width, hdr.height)?;
                     (fw, fh) = (hdr.width, hdr.height);
-                    fb = vec![0u8; fw * fh * 4];
+                    // The old copy is wiped and freed before the new one is allocated.
+                    drop(fb);
+                    fb = LockedBuf::new(fw * fh * 4);
                     println!("resized:     {fw}x{fh}");
                 }
-                dec.apply(p, &mut fb, fw, fh)?;
+                dec.apply(p, fb.as_mut_slice(), fw, fh)?;
                 if hdr.last {
                     frames += 1;
                     first_frame.get_or_insert(start.elapsed().as_secs_f64() * 1000.0);
                     sender.send(ClientMsg::Ack(hdr.frame))?;
-                    let sum = checksum(&fb);
+                    let sum = checksum(fb.as_slice());
                     match baseline {
                         None => baseline = Some(sum),
                         Some(b) if input_sent && b != sum => changed_after_input = true,
@@ -377,7 +392,13 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 println!("state:       key {key} = {}", if value == STATE_UNAVAILABLE { "unavailable".into() } else { value.to_string() });
                 states.push((key, value));
             }
-            ServerMsg::Notice(t) => println!("notice:      {}", printable(&t)),
+            ServerMsg::Notice(t) => {
+                println!("notice:      {}", printable(&t));
+                // Such as why nothing (more) is sent.
+                if o.pull && uploaded && download.is_none() {
+                    pull_quiet = Some(Instant::now() + Duration::from_secs(1));
+                }
+            }
             ServerMsg::Audio { .. } => audio_packets += 1,
             ServerMsg::FileResult { id, ok, message } => {
                 let message = printable(&message);
@@ -388,14 +409,34 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
                 pending_uploads = pending_uploads.saturating_sub(1);
             }
             ServerMsg::FileBegin { id, size, name } => {
-                download = Some(Incoming::begin(&download_dir(o.pull)?, id, size, &name)?);
+                if let Some(d) = &download {
+                    bail!("the host began file {id} while file {} was still arriving", d.id);
+                }
+                download = Some(Incoming::begin(&download_dir(&o)?, id, size, &name)?);
             }
             ServerMsg::FileData { id, data } => match download.as_mut() {
-                Some(d) if d.id == id => d.write(data)?,
+                Some(d) if d.id == id => {
+                    d.write(data)?;
+                    // A download that keeps arriving is waited for, however long it takes.
+                    results_due = results_due.max(Instant::now() + Duration::from_secs(10));
+                }
                 _ => bail!("file data without a matching begin"),
             },
             ServerMsg::FileEnd { id, sha256 } => match download.take() {
-                Some(d) if d.id == id => println!("download:    {}", printable(&d.finish(&sha256)?.display().to_string())),
+                Some(d) if d.id == id => {
+                    let name = printable(&d.name);
+                    match d.finish(&sha256) {
+                        Ok(path) => {
+                            println!("download:    {}", printable(&path.display().to_string()));
+                            pulled += 1;
+                        }
+                        Err(e) => {
+                            println!("download:    {name} FAILED {e}");
+                            failures.push(format!("download of {name} failed: {e}"));
+                        }
+                    }
+                    pull_quiet = Some(Instant::now() + Duration::from_secs(1));
+                }
                 _ => bail!("file end without a matching begin"),
             },
             ServerMsg::Cursor(_) | ServerMsg::Clipboard(_) | ServerMsg::Ping | ServerMsg::Hello { .. } => {}
@@ -427,6 +468,13 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
     if pending_uploads > 0 {
         failures.push(format!("{pending_uploads} upload(s) without a result"));
     }
+    // An unfinished download is deleted as it is dropped.
+    if let Some(d) = download.take() {
+        failures.push(format!("download of {} did not finish", printable(&d.name)));
+    }
+    if o.pull && pulled == 0 {
+        failures.push("--pull: no file was received".into());
+    }
     if o.expect_change {
         if changed_after_input {
             println!("input:       screen changed after input");
@@ -435,10 +483,10 @@ pub fn run(target: &str, o: ProbeOptions, psk: Secret<32>) -> Result<()> {
         }
     }
     if let Some(path) = &o.snapshot {
-        write_ppm(path, &fb, fw, fh)?;
+        write_ppm(path, fb.as_slice(), fw, fh)?;
         println!("snapshot:    {path} ({fw}x{fh})");
     }
-    crate::util::wipe(&mut fb);
+    drop(fb);
     if !failures.is_empty() {
         for f in &failures {
             log!("probe: {f}");
@@ -632,10 +680,109 @@ mod tests {
         assert_eq!(e.to_string(), "1 check(s) failed");
     }
 
+    /// How `pull_host` answers a `FilePull`.
+    #[derive(Clone, Copy)]
+    enum Pull {
+        /// A notice, and nothing else.
+        Refuse,
+        /// The file, slowly: it takes longer than the probe's `--seconds`.
+        Slowly,
+        /// A second file begun before the first one ended.
+        Overlapping,
+    }
+
+    /// A host that sends its first frame, pings all the while and answers a `FilePull` with the
+    /// file `src` as `how` says.
+    fn pull_host(l: std::net::TcpListener, src: std::path::PathBuf, how: Pull) {
+        use crate::channel::{RecordReader, RecordWriter, server_handshake};
+        let (mut s, _) = l.accept().unwrap();
+        let keys = server_handshake(&mut s, &KEY).unwrap();
+        let w = Arc::new(Mutex::new(RecordWriter::new(s.try_clone().unwrap(), keys.send)));
+        let send = |w: &Mutex<RecordWriter<std::net::TcpStream>>, m: ServerMsg| {
+            let mut b = Vec::new();
+            m.encode(&mut b);
+            w.lock().unwrap().send(&b)
+        };
+        let mut r = RecordReader::new(s, keys.recv);
+        assert!(matches!(ClientMsg::decode(r.recv().unwrap()).unwrap(), ClientMsg::Hello { .. }));
+        send(&w, ServerMsg::Hello { width: 64, height: 64, flags: F_FILES, monitor: 0, monitors: vec![], name: "linux-host".into() }).unwrap();
+        let rects = codec::Encoder::new().unwrap().encode(&[0; 64 * 64 * 4], 64, 64);
+        for m in codec::pack(1, 64, 64, &rects) {
+            w.lock().unwrap().send(&m).unwrap();
+        }
+        let pinger = {
+            let w = w.clone();
+            std::thread::spawn(move || {
+                while send(&w, ServerMsg::Ping).is_ok() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        while let Ok(rec) = r.recv() {
+            if !matches!(ClientMsg::decode(rec).unwrap(), ClientMsg::FilePull) {
+                continue;
+            }
+            if let Pull::Refuse = how {
+                send(&w, ServerMsg::Notice("file transfer is not allowed".into())).unwrap();
+                continue;
+            }
+            let mut out = Outgoing::open(&src, 7).unwrap();
+            send(&w, ServerMsg::FileBegin { id: 7, size: out.size, name: out.name.clone() }).unwrap();
+            if let Pull::Overlapping = how {
+                send(&w, ServerMsg::FileBegin { id: 8, size: out.size, name: out.name.clone() }).unwrap();
+            }
+            let mut buf = Vec::new();
+            while out.next_chunk(&mut buf).unwrap() {
+                std::thread::sleep(Duration::from_millis(300));
+                if send(&w, ServerMsg::FileData { id: 7, data: &buf }).is_err() {
+                    break;
+                }
+            }
+            let _ = send(&w, ServerMsg::FileEnd { id: 7, sha256: out.finish() });
+        }
+        drop(r);
+        pinger.join().unwrap();
+    }
+
+    #[test]
+    fn pull_waits_for_the_download_and_fails_without_one() {
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let dir = std::env::temp_dir().join(format!("srdp-pull-{}", crate::util::hex_encode(&r)));
+        let (src, into) = (dir.join("src"), dir.join("into"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        let body: Vec<u8> = (0..crate::files::SEND_CHUNK * 3 + 100).map(|i| i as u8).collect();
+        std::fs::write(src.join("copied.bin"), &body).unwrap();
+        let probe = |how| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let file = src.join("copied.bin");
+            let host = std::thread::spawn(move || pull_host(l, file, how));
+            let o = ProbeOptions { seconds: 0.2, pull: true, pull_dir: Some(into.clone()), ..ProbeOptions::default() };
+            let r = run(&addr.to_string(), o, Secret(KEY));
+            host.join().unwrap();
+            r
+        };
+        // Four chunks 300 ms apart: well past --seconds.
+        let slow = probe(Pull::Slowly);
+        let saved = std::fs::read(into.join("copied.bin"));
+        let refused = probe(Pull::Refuse);
+        let overlapping = probe(Pull::Overlapping);
+        let left = std::fs::read_dir(&into).unwrap().count();
+        let _ = std::fs::remove_dir_all(&dir);
+        slow.unwrap();
+        assert!(saved.unwrap() == body, "the pulled file differs");
+        assert_eq!(refused.unwrap_err().to_string(), "1 check(s) failed");
+        let e = overlapping.unwrap_err().to_string();
+        assert!(e.contains("still arriving"), "{e}");
+        assert_eq!(left, 1, "a partial download was left behind");
+    }
+
     #[test]
     fn unrequested_files_are_refused() {
         // With --pull the directory is `files::transfer_dir()` (not created here: it is the
         // user's real Downloads folder).
-        assert!(download_dir(false).is_err());
+        assert!(download_dir(&ProbeOptions::default()).is_err());
     }
 }
