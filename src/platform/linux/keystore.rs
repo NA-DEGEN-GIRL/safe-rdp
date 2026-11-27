@@ -3,7 +3,7 @@
 
 use super::xvfb::O_NOFOLLOW;
 use crate::keys::format_key;
-use crate::util::{Error, Result, Secret, wipe};
+use crate::util::{Error, Result, Secret, SecureVec, wipe};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
@@ -81,7 +81,8 @@ fn load_key(path: &Path) -> Result<Secret<32>> {
     let mut text = String::with_capacity(4096);
     let r = (&f).take(4095).read_to_string(&mut text);
     let k = r.map_err(|e| Error::msg(format!("cannot read key file {}: {e}", path.display()))).and_then(|_| crate::keys::parse_key(&text));
-    unsafe { wipe(text.as_bytes_mut()) };
+    // All of it: text that was not UTF-8 is cut off again, but stays in the buffer.
+    drop(SecureVec(text.into_bytes()));
     k
 }
 

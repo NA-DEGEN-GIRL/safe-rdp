@@ -704,6 +704,8 @@ struct Ui {
     mods: HashSet<u16>,
     /// Hotkey keys whose release must not reach the host either.
     swallowed: HashSet<u16>,
+    /// Keys pressed on the host: their repeats and release go there, whatever is held since.
+    sent: HashSet<u16>,
     /// X keycodes whose keysym is Hangul / Hangul_Hanja on this keyboard layout.
     korean: Vec<(u8, u16)>,
     buttons: u16,
@@ -721,6 +723,7 @@ impl Ui {
             sas,
             mods: HashSet::new(),
             swallowed: HashSet::new(),
+            sent: HashSet::new(),
             korean: Vec::new(),
             buttons: 0,
             last_move: None,
@@ -765,6 +768,7 @@ impl Ui {
     fn release_all(&mut self) {
         self.mods.clear();
         self.swallowed.clear();
+        self.sent.clear();
         self.buttons = 0;
         if !self.view_only {
             self.send(ClientMsg::ReleaseAll);
@@ -791,7 +795,10 @@ impl Ui {
             // Alt was let go, say): its release is held back too.
             return Ok(());
         }
-        if press && ctrl && alt && matches!(evdev, KEY_ENTER | KEY_KPENTER | KEY_END) {
+        // A repeat of a key the host has down is no hotkey and does not stay local: held back,
+        // its release would be too, and the key would stay down on the host.
+        let held = self.sent.contains(&evdev);
+        if press && !held && ctrl && alt && matches!(evdev, KEY_ENTER | KEY_KPENTER | KEY_END) {
             self.swallowed.insert(evdev);
             if evdev == KEY_END {
                 if self.typed_elsewhere() {
@@ -809,14 +816,15 @@ impl Ui {
         if self.view_only {
             return Ok(());
         }
-        if self.typed_elsewhere() {
-            // Its release is held back too, if it comes before the focus is back.
-            if press {
+        if self.typed_elsewhere() && (press || !held) {
+            // Its release is held back too, if it comes before the focus is back (but not that
+            // of a key the host has down).
+            if press && !held {
                 self.swallowed.insert(evdev);
             }
             return Ok(());
         }
-        if press && win && !self.view.fullscreen {
+        if press && !held && win && !self.view.fullscreen {
             // In a window the Super key and what is typed while it is held stay local, as the
             // Windows viewer keeps Win and Win+key there.
             self.swallowed.insert(evdev);
@@ -827,6 +835,11 @@ impl Ui {
             None => keymap::from_evdev(evdev),
         };
         let Some((vk, scan, extended)) = wire else { return Ok(()) };
+        if press {
+            self.sent.insert(evdev);
+        } else {
+            self.sent.remove(&evdev);
+        }
         let mut flags = if press { 0 } else { KEY_UP };
         if extended {
             flags |= KEY_EXTENDED;
@@ -1865,6 +1878,13 @@ mod tests {
         let win = key(KEY_LEFTMETA);
         let sent = type_keys(&mut ui, &[(true, win), (true, win), (true, e), (true, e), (false, e), (false, win), (true, a), (false, a)]);
         assert_eq!(sent, [(true, 0x41), (false, 0x41)]);
+
+        // A held on the host before Super or Ctrl+Alt: its repeats and release still go there.
+        let sent = type_keys(&mut ui, &[(true, a), (true, win), (true, a), (false, a), (false, win)]);
+        assert_eq!(sent, [(true, 0x41), (true, 0x41), (false, 0x41)]);
+        let sent = type_keys(&mut ui, &[(true, enter), (true, ctrl), (true, alt), (true, enter), (false, enter), (false, alt), (false, ctrl)]);
+        assert_eq!(sent, [(true, 0x0d), (true, 0xa2), (true, 0xa4), (true, 0x0d), (false, 0x0d), (false, 0xa4), (false, 0xa2)]);
+        assert!(!ui.view.fullscreen, "a repeat of Enter is no hotkey");
 
         // Ctrl+Alt+Enter held, Ctrl and Alt let go first: the repeats of Enter go nowhere, and
         // full screen is toggled once.

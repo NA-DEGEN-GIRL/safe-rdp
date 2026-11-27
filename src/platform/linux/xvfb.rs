@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
     /// Takes four `unsigned long` arguments after `option`.
     fn prctl(option: c_int, ...) -> c_int;
+    /// The argument after `cmd` is read as an `unsigned long`.
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn waitid(idtype: c_int, id: u32, info: *mut SigInfo, options: c_int) -> c_int;
     fn geteuid() -> u32;
@@ -538,7 +539,7 @@ impl VirtualDisplay {
             unsafe {
                 cmd.pre_exec(move || {
                     for fd in [fd, cookie_fd] {
-                        if fcntl(fd, F_SETFD, 0 as c_int) == -1 {
+                        if fcntl(fd, F_SETFD, 0 as c_ulong) == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
                     }
@@ -749,11 +750,11 @@ mod tests {
             assert_eq!(find_cookie(&entries, 256, b"somehost", 42).map(|c| c.0.clone()), Some(vec![7; 16]));
         }
         // Only Xvfb is handed it.
-        assert_eq!(unsafe { fcntl(f.as_raw_fd(), F_GETFD) } & FD_CLOEXEC, FD_CLOEXEC);
+        assert_eq!(unsafe { fcntl(f.as_raw_fd(), F_GETFD, 0 as c_ulong) } & FD_CLOEXEC, FD_CLOEXEC);
         // Sealed against ever becoming executable, where the kernel can (6.3 on).
         const F_GET_SEALS: c_int = 1034;
         const F_SEAL_EXEC: c_int = 0x20;
-        let sealed = unsafe { fcntl(f.as_raw_fd(), F_GET_SEALS) } & F_SEAL_EXEC != 0;
+        let sealed = unsafe { fcntl(f.as_raw_fd(), F_GET_SEALS, 0 as c_ulong) } & F_SEAL_EXEC != 0;
         let fd = unsafe { memfd_create(c"probe".as_ptr(), MFD_CLOEXEC | MFD_NOEXEC_SEAL) };
         if fd >= 0 {
             drop(unsafe { File::from_raw_fd(fd) });
@@ -1104,7 +1105,7 @@ mod tests {
         }
         extern "C" fn ignore(_: c_int) {}
         const SIGUSR1: c_int = 10;
-        unsafe { super::super::libc::signal(SIGUSR1, Some(ignore)) };
+        unsafe { super::super::libc::signal(SIGUSR1, ignore as *const () as usize) };
         let t = std::thread::spawn(|| {
             let vd = VirtualDisplay::spawn(Some(82), 64, 64, Some("sleep 30"))?;
             Conn::connect(&vd.target())?;

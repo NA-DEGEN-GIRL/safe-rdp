@@ -468,18 +468,19 @@ impl Incoming {
 impl Drop for Incoming {
     fn drop(&mut self) {
         PROMISED.fetch_sub(self.promised, Ordering::SeqCst);
-        // Not finished (or finish failed): remove the partial file.
-        let file = self.file.take();
+        // Not finished (or finish failed): remove the partial file. A finished one has its name
+        // by now, and nothing at the part's path is ours any more.
+        let Some(file) = self.file.take() else { return };
         // Still open (Windows): removed through its handle as it closes, never by its path, which
         // may lead elsewhere by now (a host running as SYSTEM drops uploads to a folder a user
         // controls). A part that cannot be removed even so is swept once it is a day old.
         #[cfg(windows)]
-        if let Some(f) = &file {
-            delete_on_close(f);
-            return;
+        delete_on_close(&file);
+        #[cfg(not(windows))]
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&self.part);
         }
-        drop(file);
-        let _ = std::fs::remove_file(&self.part);
     }
 }
 
@@ -773,6 +774,26 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"first");
         assert!(dir.join("b.txt").is_dir());
         assert_eq!(inc.finish(&crate::crypto::sha256(&[b"new"])).unwrap().file_name().unwrap(), "a (1).txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_transfer_leaves_its_old_path_alone() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
+        let dir = tmpdir("finished");
+        let mut inc = Incoming::begin(&dir, 1, 3, "a.txt").unwrap();
+        inc.write(b"abc").unwrap();
+        // As `finish` leaves it once the part has its name; then something else at the part's
+        // old path, which dropping the transfer must not remove.
+        rename_new(inc.file.as_ref().unwrap(), &inc.part, &dir.join("a.txt")).unwrap();
+        drop(inc.file.take());
+        let part = inc.part.clone();
+        std::fs::write(&part, b"other").unwrap();
+        drop(inc);
+        assert_eq!(std::fs::read(&part).unwrap(), b"other");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"abc");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

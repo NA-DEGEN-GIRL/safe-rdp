@@ -68,7 +68,8 @@ HOST OPTIONS:
                            there as the user signed in on the console)
   --audio                  Allow viewers to listen to this machine's sound
   --privacy                Allow viewers to blank this screen and lock local input while connected
-  --view-only              Ignore keyboard and mouse from viewers
+  --view-only              Ignore keyboard and mouse from viewers; no clipboard changes, files
+                           or privacy screen either
   --virtual <WxH>          (Linux) Run in a new headless X display (Xvfb) of this size
   --session <cmd>          (Linux, with --virtual) Program to run in it (default: a terminal);
                            the host stops when it exits, so do not start it in the background
@@ -77,7 +78,8 @@ HOST OPTIONS:
 VIEWER OPTIONS:
   --fullscreen             Start in full screen (toggle: Ctrl+Alt+Enter)
   --clipboard              Share text clipboard (host must allow it)
-  --view-only              Do not send keyboard or mouse input
+  --view-only              Do not send input, clipboard text or files, nor ask for the privacy
+                           screen (the host's clipboard still arrives)
   --allow-capture          (Windows) Let local screenshot/recording tools capture the viewer
                            window; on Linux (X11) they always can
   --downscale <2|3|4>      Ask the host for 1/N resolution (e.g. 4K host on a laptop or slow link)

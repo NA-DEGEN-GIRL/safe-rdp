@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 unsafe extern "C" {
     /// Takes four `unsigned long` arguments after `option`.
     fn prctl(option: c_int, ...) -> c_int;
+    /// The argument after `cmd` is read as an `unsigned long`.
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn getuid() -> u32;
 }
@@ -39,7 +40,7 @@ const LATENCY: &str = "20ms";
 /// before trusting it: an idle sink's monitor sends nothing, not even silence.
 const START_GRACE: Duration = Duration::from_millis(100);
 /// Pipe to `pw-play`, kept small (about 40 ms at 48 kHz stereo) so it adds little latency.
-const PLAY_PIPE_BYTES: c_int = 8192;
+const PLAY_PIPE_BYTES: c_ulong = 8192;
 /// Jitter buffer: start at 40 ms queued (the pipe and PipeWire add the rest), cap at 300 ms.
 const START_MS: u32 = 40;
 const MAX_MS: u32 = 300;

@@ -996,12 +996,12 @@ const MAX_SENT_PIXELS: usize = 2 * 7680 * 4320;
 const _: () = assert!(MAX_SENT_PIXELS <= crate::viewer::MAX_PIXELS);
 
 /// The requested 1..=4 downscale, reduced so that the scaled picture is at least 1x1, and raised
-/// (past 4 if need be) where it would still be larger than viewers take, as all monitors
-/// together can be.
+/// (past 4 if need be) where it would still be larger than viewers take, or wider or taller than
+/// the wire's 16-bit sizes carry, as all monitors together can be.
 fn effective_downscale(area: Area, d: usize) -> usize {
     let (w, h) = (area.width.max(1) as usize, area.height.max(1) as usize);
     let mut d = d.clamp(1, 4).min(w).min(h);
-    while (w / d) * (h / d) > MAX_SENT_PIXELS {
+    while (w / d) * (h / d) > MAX_SENT_PIXELS || (w / d).max(h / d) > u16::MAX as usize {
         d += 1;
     }
     d
@@ -2175,6 +2175,8 @@ mod tests {
         assert_eq!(effective_downscale(a(15360, 4320), 1), 1);
         assert_eq!(effective_downscale(a(23040, 4320), 1), 2);
         assert_eq!(effective_downscale(a(23040, 4320), 3), 3);
+        // Few enough pixels, but wider than a 16-bit width.
+        assert_eq!(effective_downscale(a(69120, 960), 1), 2);
         // The largest area the wire format carries, past the requested maximum of 4.
         let d = effective_downscale(a(0xffff, 0xffff), 4);
         assert!(d > 4 && (0xffff / d) * (0xffff / d) <= MAX_SENT_PIXELS && (0xffff / (d - 1)).pow(2) > MAX_SENT_PIXELS, "{d}");

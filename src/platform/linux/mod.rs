@@ -53,8 +53,9 @@ mod libc {
         pub fn prctl(option: c_int, ...) -> c_int;
         pub fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
         pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
-        /// `handler` None is `SIG_DFL`. Returns the handler before (`SIG_IGN` comes back as address 1).
-        pub fn signal(sig: c_int, handler: Option<extern "C" fn(c_int)>) -> Option<extern "C" fn(c_int)>;
+        /// Handlers as addresses (`sighandler_t`): what comes back may be `SIG_IGN` or `SIG_ERR`,
+        /// which are not functions.
+        pub fn signal(sig: c_int, handler: usize) -> usize;
         pub fn _exit(code: c_int) -> !;
     }
 
@@ -63,6 +64,7 @@ mod libc {
     pub const SIGQUIT: c_int = 3;
     pub const SIGTERM: c_int = 15;
     pub const SIG_IGN: usize = 1;
+    pub const SIG_ERR: usize = usize::MAX;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -107,7 +109,7 @@ extern "C" fn on_signal(_sig: std::ffi::c_int) {
 pub fn stop_on_signals(stop: &'static AtomicBool) {
     STOP_FLAG.store(stop as *const AtomicBool as *mut AtomicBool, Ordering::SeqCst);
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe { libc::signal(sig, Some(on_signal)) };
+        unsafe { libc::signal(sig, on_signal as *const () as usize) };
     }
 }
 
@@ -148,43 +150,66 @@ extern "C" fn restore_echo(sig: std::ffi::c_int) {
     unsafe { libc::_exit(128 + sig) };
 }
 
+/// Echo switched off on the terminal while `read_secret` waits; dropping it (also when reading
+/// panics) puts the terminal settings and the signal handlers back.
+struct EchoOff {
+    /// Where `restore_echo` finds them, for as long as its handlers are in place.
+    saved: Box<libc::Termios>,
+    handlers: Vec<(std::ffi::c_int, usize)>,
+}
+
+impl EchoOff {
+    /// None when stdin is not a terminal.
+    fn new() -> Option<EchoOff> {
+        unsafe {
+            let mut t: libc::Termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return None;
+            }
+            let saved = Box::new(t);
+            ECHO_TERMIOS.store((&raw const *saved).cast_mut(), Ordering::SeqCst);
+            let mut handlers = Vec::new();
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+                match libc::signal(sig, restore_echo as *const () as usize) {
+                    libc::SIG_ERR => {}
+                    // Left ignored if it was (nohup).
+                    libc::SIG_IGN => _ = libc::signal(sig, libc::SIG_IGN),
+                    old => handlers.push((sig, old)),
+                }
+            }
+            let mut quiet = t;
+            quiet.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(0, libc::TCSANOW, &quiet);
+            Some(EchoOff { saved, handlers })
+        }
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &*self.saved);
+            for &(sig, old) in &self.handlers {
+                libc::signal(sig, old);
+            }
+        }
+        ECHO_TERMIOS.store(std::ptr::null_mut(), Ordering::SeqCst);
+        eprintln!();
+    }
+}
+
 /// Reads one line from stdin without echoing it when stdin is a terminal.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     eprint!("{prompt}");
     // Room for a key line, so that it is not copied while growing; wiped if reading fails.
     let mut line = String::with_capacity(256);
-    unsafe {
-        let mut t: libc::Termios = std::mem::zeroed();
-        let tty = libc::tcgetattr(0, &mut t) == 0;
-        let mut handlers = Vec::new();
-        if tty {
-            ECHO_TERMIOS.store(&mut t, Ordering::SeqCst);
-            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
-                let old = libc::signal(sig, Some(restore_echo));
-                // Left ignored if it was (nohup).
-                if old.is_some_and(|h| h as usize == libc::SIG_IGN) {
-                    libc::signal(sig, old);
-                }
-                handlers.push((sig, old));
-            }
-            let mut quiet = t;
-            quiet.c_lflag &= !libc::ECHO;
-            libc::tcsetattr(0, libc::TCSANOW, &quiet);
-        }
-        let r = std::io::stdin().read_line(&mut line);
-        if tty {
-            libc::tcsetattr(0, libc::TCSANOW, &t);
-            for (sig, old) in handlers {
-                libc::signal(sig, old);
-            }
-            ECHO_TERMIOS.store(std::ptr::null_mut(), Ordering::SeqCst);
-            eprintln!();
-        }
-        if let Err(e) = r {
-            // Also what a failed read left beyond the length (invalid UTF-8 is cut off again).
-            drop(crate::util::SecureVec(line.into_bytes()));
-            return Err(e.into());
-        }
+    let echo_off = EchoOff::new();
+    let r = std::io::stdin().read_line(&mut line);
+    drop(echo_off);
+    if let Err(e) = r {
+        // Also what a failed read left beyond the length (invalid UTF-8 is cut off again).
+        drop(crate::util::SecureVec(line.into_bytes()));
+        return Err(e.into());
     }
     Ok(line)
 }
