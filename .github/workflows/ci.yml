@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release
+      # Includes tests/dll_imports.rs: only KnownDLLs imported at start-up, the rest delay-loaded.
+      - run: cargo test --no-fail-fast
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb x11-xserver-utils
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast
+      # The Xvfb tests; the ones that need a desktop session, PipeWire, Tailscale or another machine are left out.
+      - run: >-
+          cargo test --no-fail-fast platform::linux -- --ignored
+          --skip runs_a_session --skip host_to_viewer_pipeline --skip smoke_monitor_capture --skip capture_speed
+
+  linux-targets:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-unknown-linux-gnu, riscv64gc-unknown-linux-gnu, x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }} && rustup component add clippy
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
