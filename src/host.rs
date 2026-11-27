@@ -307,8 +307,15 @@ struct DrainSlot {
 
 impl DrainSlot {
     fn take(count: &Arc<AtomicUsize>) -> Option<DrainSlot> {
-        count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_DRAINS).then_some(n + 1)).ok()?;
-        Some(DrainSlot { count: count.clone(), until: Instant::now() + DRAIN_FOR })
+        // A loop rather than `fetch_update`, which newer Rust deprecates for a name older Rust lacks.
+        let mut n = count.load(Ordering::SeqCst);
+        while n < MAX_DRAINS {
+            match count.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(DrainSlot { count: count.clone(), until: Instant::now() + DRAIN_FOR }),
+                Err(now) => n = now,
+            }
+        }
+        None
     }
 }
 
