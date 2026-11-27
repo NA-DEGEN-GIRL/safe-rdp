@@ -379,7 +379,7 @@ src/
   송신 실패 뒤의 레코드 카운터, 같은 이름 파일을 대체하는 업로드 등), 각각을 먼저 코드와 대조해 하나(메시지 상자 동안 빌림이
   유지된다는 주장은 Rust의 임시 값 규칙상 성립하지 않음)를 빼고 모두 고쳤으며, 데스크톱이나 관리자 권한 없이 돌릴 수 있는
   부분에는 테스트를 추가함
-- 단위·통합 테스트: Windows 333개(그중 3개는 빌드된 실행 파일의 DLL 가져오기 검사), Linux 243개 + Xvfb·PipeWire·Tailscale이나
+- 단위·통합 테스트: Windows 334개(그중 3개는 빌드된 실행 파일의 DLL 가져오기 검사), Linux 244개 + Xvfb·PipeWire·Tailscale이나
   긴 실행이 필요한 테스트 29개 (`cargo test -- --ignored`)
   - 암호: SHA-256, HMAC(RFC 4231), HKDF(RFC 5869), AES-GCM(NIST), ECDH(NIST CAVS), CNG↔OpenSSL 바이트 고정 벡터
   - 코덱: [MS-XCA] 명세 예제, cabinet.dll 골든 스트림·상호 디코딩, 잘못된 스트림 3만 건 퍼징, 손실 코덱 PSNR·ffmpeg 교차 검증

@@ -405,7 +405,7 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
   pointer-only DXGI frames, forged X11 events, record counters after a failed send, uploads replacing a file of the same name and
   more); each was checked against the code first, and all but one (a claimed borrow held across message boxes, which Rust's
   rules for temporaries rule out) were fixed, with tests wherever the logic can run without a desktop or administrator rights
-- Unit and integration tests: 333 on Windows (3 of them check the built executable's DLL imports), 243 on Linux + 29 that need
+- Unit and integration tests: 334 on Windows (3 of them check the built executable's DLL imports), 244 on Linux + 29 that need
   Xvfb, PipeWire, Tailscale or a long run (`cargo test -- --ignored`)
   - Crypto: SHA-256, HMAC (RFC 4231), HKDF (RFC 5869), AES-GCM (NIST), ECDH (NIST CAVS), fixed CNG↔OpenSSL byte vectors
   - Codec: [MS-XCA] spec examples, cabinet.dll golden streams and cross-decoding, fuzzing with 30,000 malformed streams, lossy codec PSNR and ffmpeg cross-checks
