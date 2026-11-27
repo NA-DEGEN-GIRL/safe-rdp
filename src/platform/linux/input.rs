@@ -5,7 +5,7 @@ use super::x11::{BUTTON_PRESS, BUTTON_RELEASE, Conn, Ext, KEY_PRESS, KEY_RELEASE
 use crate::log;
 use crate::proto::*;
 use crate::screen::Area;
-use crate::util::Result;
+use crate::util::{Error, Result};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -80,12 +80,16 @@ impl Injector {
     fn fake(&mut self, kind: u8, detail: u8, x: i16, y: i16) {
         let Some(xt) = self.xtest() else { return };
         if let Err(e) = xt.conn.fake_input(xt.ext, kind, detail, x, y) {
-            log!("input injection failed: {e}");
-            self.x = None;
-            // The server is gone, and with it every key we held.
-            self.keys.clear();
-            self.buttons.clear();
+            self.lost(e);
         }
+    }
+
+    fn lost(&mut self, e: Error) {
+        log!("input injection failed: {e}");
+        self.x = None;
+        // The server is gone, and with it every key we held.
+        self.keys.clear();
+        self.buttons.clear();
     }
 
     fn click(&mut self, button: u8) {
@@ -118,6 +122,10 @@ impl Injector {
     }
 
     pub fn handle(&mut self, m: &ClientMsg) {
+        // Nothing the server sends here is used (MappingNotify, errors), but it must be read.
+        if let Some(Err(e)) = self.x.as_mut().map(|xt| xt.conn.discard_input()) {
+            self.lost(e);
+        }
         match *m {
             ClientMsg::MouseMove { x, y } => {
                 let a = self.area;

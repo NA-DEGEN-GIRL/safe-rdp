@@ -231,7 +231,8 @@ impl Bridge {
 
     fn on_event(&mut self, ev: Event, on_change: &dyn Fn(String)) -> Result<()> {
         match ev {
-            Event::Other(raw) if raw[0] & 0x7f == self.xfixes.first_event => {
+            // From the server only: any client can send events to our window (bit 0x80 set).
+            Event::Other(raw) if raw[0] == self.xfixes.first_event => {
                 // XFixesSelectionNotify: window, owner, selection, ...
                 let owner = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
                 let selection = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
@@ -262,12 +263,19 @@ impl Bridge {
                     }
                     return Ok(());
                 }
+                if property != self.atoms.property {
+                    // Not where we asked for it (an owner gone wrong, or a forged event).
+                    self.forget();
+                    return Ok(());
+                }
                 let p = self.conn.get_property(self.win, property, ANY_PROPERTY_TYPE, MAX_CLIPBOARD + 4, true)?;
                 if p.kind == self.atoms.incr {
                     // Deleting the property (done above) starts the transfer.
                     self.fetch = Some(Fetch::Incremental(target, Some(Vec::new())));
                 } else if p.bytes_after > 0 || p.value.len() > MAX_CLIPBOARD {
                     log!("local clipboard text is too large to share");
+                    // Not read whole, so not deleted with the read.
+                    self.conn.delete_property(self.win, property)?;
                     self.forget();
                 } else {
                     self.report(decode_text(p.kind, ATOM_STRING, &p.value), on_change);
@@ -279,7 +287,15 @@ impl Bridge {
                 let Some(Fetch::Incremental(target, buf)) = &mut self.fetch else { return Ok(()) };
                 let target = *target;
                 let mut p = self.conn.get_property(self.win, atom, ANY_PROPERTY_TYPE, MAX_CLIPBOARD + 4, true)?;
-                if p.value.is_empty() {
+                if p.bytes_after > 0 {
+                    // A chunk too large to read whole: deleted by hand, so the owner goes on to
+                    // the next (drained, like the rest).
+                    self.conn.delete_property(self.win, atom)?;
+                    if let Some(b) = buf {
+                        wipe(b);
+                        *buf = None;
+                    }
+                } else if p.value.is_empty() {
                     let done = buf.take();
                     self.fetch = None;
                     match done {
@@ -314,6 +330,8 @@ impl Bridge {
 
     fn request(&mut self, target: u32) -> Result<()> {
         self.fetch = Some(Fetch::Converting(target));
+        // Whatever an earlier transfer left there goes first.
+        self.conn.delete_property(self.win, self.atoms.property)?;
         self.conn.convert_selection(self.win, self.atoms.clipboard, target, self.atoms.property, CURRENT_TIME)
     }
 
@@ -491,6 +509,98 @@ mod tests {
         let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
         app.set(text.into());
         assert_eq!(wait_for(&arx), text);
+        drop(app);
+        drop(a);
+    }
+
+    /// Waits for the next conversion asked of `c`'s selection and answers it with `property`,
+    /// after `prepare` (given the requestor and its property) has run.
+    fn answer_next(c: &mut Conn, property: u32, prepare: impl FnOnce(&mut Conn, u32, u32)) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no conversion was asked for");
+            if let Some(Event::SelectionRequest { time, requestor, selection, target, property: asked }) =
+                c.wait_event(Duration::from_millis(50)).unwrap()
+            {
+                prepare(c, requestor, asked);
+                let mut ev = [0u8; 32];
+                ev[0] = 31; // SelectionNotify
+                for (i, v) in [time, requestor, selection, target, property].iter().enumerate() {
+                    ev[4 + 4 * i..8 + 4 * i].copy_from_slice(&v.to_le_bytes());
+                }
+                c.send_event(requestor, 0, &ev).unwrap();
+                c.sync().unwrap();
+                return;
+            }
+        }
+    }
+
+    /// Other local clients can send the bridge any event and answer its conversions with
+    /// anything: none of that stops clipboard sharing, nor leaves text the bridge refused
+    /// behind on its window.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn survives_forged_events_and_bad_answers() {
+        let vd = VirtualDisplay::spawn(Some(95), 200, 200, None).unwrap();
+        let t = vd.target();
+        let (atx, arx) = mpsc::channel();
+        let a = Clipboard::spawn_on(t.clone(), move |s| atx.send(s).unwrap()).unwrap();
+        let mut c = Conn::connect(&t).unwrap();
+        let (clipboard, utf8) = (c.atom("CLIPBOARD").unwrap(), c.atom("UTF8_STRING").unwrap());
+        let (theirs, prop) = (c.atom("SAFE_RDP_SELECTION").unwrap(), c.atom("P").unwrap());
+        let root = c.root();
+        let win = c.create_window(root, 0, 0, 1, 1, 2, 0, &[]).unwrap();
+        let fetch = |c: &mut Conn| {
+            c.convert_selection(win, clipboard, utf8, prop, CURRENT_TIME).unwrap();
+            loop {
+                if let Some(Event::SelectionNotify { property, .. }) = c.wait_event(Duration::from_secs(5)).unwrap() {
+                    return (property != NONE).then(|| c.get_property(win, prop, ANY_PROPERTY_TYPE, 1 << 16, true).unwrap().value);
+                }
+            }
+        };
+
+        // A forged XFixesSelectionNotify (sent, so with bit 0x80) saying someone else took the
+        // clipboard: the bridge keeps offering the remote text.
+        a.set("remote text".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fetch(&mut c).as_deref() != Some(b"remote text".as_slice()) {
+            assert!(Instant::now() < deadline, "the remote text was not offered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bridge = c.get_selection_owner(clipboard).unwrap();
+        let xfixes = c.xfixes().unwrap().unwrap();
+        let mut ev = [0u8; 32];
+        ev[0] = xfixes.first_event | 0x80;
+        for (at, v) in [(4, bridge), (8, win), (12, clipboard)] {
+            ev[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        c.send_event(bridge, 0, &ev).unwrap();
+        c.sync().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(fetch(&mut c).as_deref(), Some(b"remote text".as_slice()), "a forged event took the text away");
+
+        // An owner naming a property the bridge did not ask for (an atom that does not even
+        // exist): the bridge goes on.
+        c.set_selection_owner(win, clipboard, CURRENT_TIME).unwrap();
+        answer_next(&mut c, 0x0fff_ffff, |_, _, _| {});
+        // An owner putting more text than may be shared in one property: refused, and deleted.
+        c.set_selection_owner(win, clipboard, CURRENT_TIME).unwrap();
+        let too_much = vec![b'x'; MAX_CLIPBOARD + 100];
+        answer_next(&mut c, theirs, |c, requestor, asked| {
+            assert_eq!(asked, theirs);
+            c.change_property(requestor, asked, utf8, 8, &too_much).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.get_property(bridge, theirs, ANY_PROPERTY_TYPE, 4, false).unwrap().kind != NONE {
+            assert!(Instant::now() < deadline, "the refused text was left on the bridge's window");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(arx.try_recv().is_err());
+
+        // Still sharing: a local copy reaches the remote side.
+        let app = Clipboard::spawn_on(t.clone(), |_| {}).unwrap();
+        app.set("copied here".into());
+        assert_eq!(wait_for(&arx), "copied here");
         drop(app);
         drop(a);
     }

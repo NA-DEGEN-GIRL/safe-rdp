@@ -27,6 +27,8 @@ pub const KEY_END: u16 = 107;
 pub const KEY_PAUSE: u16 = 119;
 pub const KEY_HANGEUL: u16 = 122;
 pub const KEY_HANJA: u16 = 123;
+pub const KEY_LEFTMETA: u16 = 125;
+pub const KEY_RIGHTMETA: u16 = 126;
 
 /// Offset between evdev codes and X keycodes on evdev/xkb servers.
 pub const X_KEYCODE_OFFSET: u16 = 8;

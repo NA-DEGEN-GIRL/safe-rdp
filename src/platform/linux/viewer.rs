@@ -6,7 +6,9 @@
 //!   Ctrl+Alt+End    send Ctrl+Alt+Del to the host (service mode only)
 
 use super::clipboard::Clipboard;
-use super::keymap::{self, KEY_END, KEY_ENTER, KEY_KPENTER, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, X_KEYCODE_OFFSET};
+use super::keymap::{
+    self, KEY_END, KEY_ENTER, KEY_KPENTER, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, X_KEYCODE_OFFSET,
+};
 use super::mem::LockedBuf;
 use super::x11::{self, Conn, Event, Ext, ShmSegment, Target, Wake, Waker};
 use crate::audio::AudioReceiver;
@@ -68,6 +70,17 @@ fn gains_focus(detail: u8, mode: u8, has_wm: bool) -> bool {
 fn keys_released_elsewhere(detail: u8, mode: u8) -> bool {
     focus_moved_away(detail, mode)
         || (detail != x11::NOTIFY_INFERIOR && detail != x11::NOTIFY_POINTER && mode != x11::NOTIFY_UNGRAB)
+}
+
+/// Whether a window manager runs, as EWMH tells: the root's _NET_SUPPORTING_WM_CHECK names a
+/// window whose own _NET_SUPPORTING_WM_CHECK names itself. One that crashed leaves the root's
+/// property behind, naming a window that is gone.
+fn wm_running(conn: &mut Conn) -> Result<bool> {
+    let check = conn.atom("_NET_SUPPORTING_WM_CHECK")?;
+    let root = conn.root();
+    let named = |p: &x11::Property| <[u8; 4]>::try_from(&p.value[..]).ok().map(u32::from_le_bytes);
+    let Some(child) = named(&conn.get_property(root, check, x11::ATOM_WINDOW, 4, false)?) else { return Ok(false) };
+    Ok(conn.try_get_property(child, check, x11::ATOM_WINDOW, 4, false)?.is_ok_and(|p| named(&p) == Some(child)))
 }
 
 /// Cursor-font glyphs for the mirrored shapes (`None`: inherit the desktop's themed arrow).
@@ -418,8 +431,7 @@ impl View {
         conn.change_property(win, net_wm_name, utf8, 8, title.as_bytes())?;
         conn.change_property(win, x11::ATOM_WM_CLASS, x11::ATOM_STRING, 8, b"safe-rdp\0safe-rdp\0")?;
         conn.change_property(win, atoms.wm_protocols, x11::ATOM_ATOM, 32, &atoms.wm_delete.to_le_bytes())?;
-        let check = conn.atom("_NET_SUPPORTING_WM_CHECK")?;
-        let has_wm = conn.get_property(root, check, x11::ATOM_WINDOW, 4, false)?.value.len() == 4;
+        let has_wm = wm_running(&mut conn)?;
         let gc = conn.create_gc(win, black)?;
         let shm = if conn.setup.format.is_bgrx() { conn.shm().unwrap_or(None) } else { None };
         let mut v = View {
@@ -761,7 +773,7 @@ impl Ui {
 
     fn on_key(&mut self, press: bool, keycode: u8) -> Result<()> {
         let Some(evdev) = (keycode as u16).checked_sub(X_KEYCODE_OFFSET) else { return Ok(()) };
-        if matches!(evdev, KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT | KEY_RIGHTALT) {
+        if matches!(evdev, KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT | KEY_RIGHTALT | KEY_LEFTMETA | KEY_RIGHTMETA) {
             if press {
                 self.mods.insert(evdev);
             } else {
@@ -770,7 +782,13 @@ impl Ui {
         }
         let ctrl = self.mods.contains(&KEY_LEFTCTRL) || self.mods.contains(&KEY_RIGHTCTRL);
         let alt = self.mods.contains(&KEY_LEFTALT) || self.mods.contains(&KEY_RIGHTALT);
+        let win = self.mods.contains(&KEY_LEFTMETA) || self.mods.contains(&KEY_RIGHTMETA);
         if !press && self.swallowed.remove(&evdev) {
+            return Ok(());
+        }
+        if press && self.swallowed.contains(&evdev) {
+            // An auto-repeat of a key held back (a hotkey's Enter or End held on after Ctrl or
+            // Alt was let go, say): its release is held back too.
             return Ok(());
         }
         if press && ctrl && alt && matches!(evdev, KEY_ENTER | KEY_KPENTER | KEY_END) {
@@ -796,6 +814,12 @@ impl Ui {
             if press {
                 self.swallowed.insert(evdev);
             }
+            return Ok(());
+        }
+        if press && win && !self.view.fullscreen {
+            // In a window the Super key and what is typed while it is held stay local, as the
+            // Windows viewer keeps Win and Win+key there.
+            self.swallowed.insert(evdev);
             return Ok(());
         }
         let wire = match self.korean.iter().find(|(k, _)| *k == keycode) {
@@ -1689,7 +1713,9 @@ mod tests {
         let root = wm.root();
         let check = wm.create_window(root, 0, 0, 1, 1, 1, 0, &[]).unwrap();
         let supporting = wm.atom("_NET_SUPPORTING_WM_CHECK").unwrap();
-        wm.change_property(root, supporting, x11::ATOM_WINDOW, 32, &check.to_le_bytes()).unwrap();
+        for w in [root, check] {
+            wm.change_property(w, supporting, x11::ATOM_WINDOW, 32, &check.to_le_bytes()).unwrap();
+        }
         wm.sync().unwrap();
         let view = View::create(Conn::connect(&t).unwrap(), "safe-rdp - pointer focus", 640, 480, true).unwrap();
         assert!(view.has_wm && view.fullscreen && !view.focused);
@@ -1779,5 +1805,78 @@ mod tests {
         wm.sync().unwrap();
         pump_until(&mut ui, |ui| ui.view.focused && !ui.view.want_grab);
         assert!(viewer_holds_keyboard(&mut other));
+    }
+
+    /// A window manager counts only while its check window is there and names itself: one that
+    /// crashed leaves the root's property behind, and the viewer must then go full screen (and
+    /// take the keys) by itself.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn a_window_manager_that_is_gone_does_not_count() {
+        let vd = VirtualDisplay::spawn(Some(96), 400, 300, None).unwrap();
+        let t = vd.target();
+        let mut wm = Conn::connect(&t).unwrap();
+        let root = wm.root();
+        let supporting = wm.atom("_NET_SUPPORTING_WM_CHECK").unwrap();
+        let check = wm.create_window(root, 0, 0, 1, 1, 1, 0, &[]).unwrap();
+        wm.change_property(root, supporting, x11::ATOM_WINDOW, 32, &check.to_le_bytes()).unwrap();
+        wm.sync().unwrap();
+        let mut c = Conn::connect(&t).unwrap();
+        assert!(!wm_running(&mut c).unwrap(), "the check window does not name itself");
+        wm.change_property(check, supporting, x11::ATOM_WINDOW, 32, &check.to_le_bytes()).unwrap();
+        wm.sync().unwrap();
+        assert!(wm_running(&mut c).unwrap());
+        drop(wm);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wm_running(&mut c).unwrap() {
+            assert!(Instant::now() < deadline, "the check window outlived its client");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(c.get_property(root, supporting, x11::ATOM_WINDOW, 4, false).unwrap().value, check.to_le_bytes());
+        let view = View::create(c, "safe-rdp - no wm", 640, 480, true).unwrap();
+        assert!(!view.has_wm && view.fullscreen && view.focused);
+    }
+
+    /// Keys typed into the viewer: in a window Super and what is typed with it stay local; the
+    /// auto-repeats of a hotkey's Enter go nowhere, also once Ctrl and Alt are up, and do not
+    /// toggle full screen again.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn super_in_a_window_and_hotkey_repeats_stay_local() {
+        let vd = VirtualDisplay::spawn(Some(97), 400, 300, None).unwrap();
+        let view = View::create(Conn::connect(&vd.target()).unwrap(), "safe-rdp - keys", 640, 480, false).unwrap();
+        let rx = Arc::new(OutQueue::default());
+        let mut ui = Ui::new(view, rx.clone(), false, false).unwrap();
+        let key = |evdev: u16| (evdev + X_KEYCODE_OFFSET) as u8;
+        let (ctrl, alt, enter, e, a) = (key(KEY_LEFTCTRL), key(KEY_LEFTALT), key(KEY_ENTER), key(18), key(30));
+        let type_keys = |ui: &mut Ui, keys: &[(bool, u8)]| {
+            for &(press, k) in keys {
+                ui.on_key(press, k).unwrap();
+            }
+            drain_messages(&rx)
+                .into_iter()
+                .filter_map(|m| match m {
+                    ClientMsg::Key { vk, flags, .. } => Some((flags & KEY_UP == 0, vk)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Super+E (and its repeats) stays local in a window; A after it goes to the host.
+        let win = key(KEY_LEFTMETA);
+        let sent = type_keys(&mut ui, &[(true, win), (true, win), (true, e), (true, e), (false, e), (false, win), (true, a), (false, a)]);
+        assert_eq!(sent, [(true, 0x41), (false, 0x41)]);
+
+        // Ctrl+Alt+Enter held, Ctrl and Alt let go first: the repeats of Enter go nowhere, and
+        // full screen is toggled once.
+        let sent = type_keys(&mut ui, &[(true, ctrl), (true, alt), (true, enter), (true, enter), (false, ctrl), (false, alt)]);
+        assert_eq!(sent, [(true, 0xa2), (true, 0xa4), (false, 0xa2), (false, 0xa4)]);
+        assert!(ui.view.fullscreen);
+        let sent = type_keys(&mut ui, &[(true, enter), (true, enter), (false, enter), (true, enter), (false, enter)]);
+        assert_eq!(sent, [(true, 0x0d), (false, 0x0d)], "Enter is a key again once let go");
+
+        // In full screen Super goes to the host.
+        let sent = type_keys(&mut ui, &[(true, win), (true, e), (false, e), (false, win)]);
+        assert_eq!(sent, [(true, 0x5b), (true, 0x45), (false, 0x45), (false, 0x5b)]);
     }
 }

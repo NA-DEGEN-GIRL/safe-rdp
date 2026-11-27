@@ -40,16 +40,20 @@ unsafe extern "C" {
 const PR_SET_PDEATHSIG: c_int = 1;
 const F_SETFD: c_int = 2;
 const MFD_CLOEXEC: c_uint = 1;
+/// Linux 6.3 on (<linux/memfd.h>, the same everywhere); older kernels refuse it (EINVAL), and
+/// with vm.memfd_noexec = 2 some newer ones refuse a memfd without it (EACCES).
+const MFD_NOEXEC_SEAL: c_uint = 8;
+const EINVAL: i32 = 22;
 // Open flags differ by architecture (<asm/fcntl.h>): arm64 has its own, under which the
 // asm-generic values x86_64 and riscv64 use mean O_DIRECT and O_LARGEFILE.
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const O_DIRECTORY: c_int = 0o200000;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-const O_NOFOLLOW: c_int = 0o400000;
+pub(super) const O_NOFOLLOW: c_int = 0o400000;
 #[cfg(target_arch = "aarch64")]
 const O_DIRECTORY: c_int = 0o40000;
 #[cfg(target_arch = "aarch64")]
-const O_NOFOLLOW: c_int = 0o100000;
+pub(super) const O_NOFOLLOW: c_int = 0o100000;
 const P_PID: c_int = 1;
 const WNOHANG: c_int = 1;
 const WEXITED: c_int = 4;
@@ -254,26 +258,29 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-/// Whether `dir` can hold our private directory: a directory of this user that nobody else may
-/// enter, as a runtime directory must be.
+/// Whether `dir` can hold our private directory: an absolute path to a directory (not a link)
+/// of this user that nobody else may enter, as a runtime directory must be.
 fn is_private_dir(dir: &Path, euid: u32) -> bool {
-    std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o077 == 0)
+    dir.is_absolute() && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o077 == 0)
 }
 
 /// Where the private directory goes: the per-user runtime directory, else (a host started
 /// outside a login, where `/run/user/<uid>` may come and go with other sessions of the user)
-/// the temporary directory, which `Kept` protects from tmp cleaners.
-fn private_base() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .filter(|d| is_private_dir(d, unsafe { geteuid() }))
-        .unwrap_or_else(std::env::temp_dir)
+/// the temporary directory, which `Kept` protects from tmp cleaners. There no other user may
+/// be able to move our directory away, the same as for the socket directory.
+fn private_base() -> Result<PathBuf> {
+    let euid = unsafe { geteuid() };
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| is_private_dir(d, euid)) {
+        return Ok(d);
+    }
+    let tmp = std::env::temp_dir();
+    check_socket_dir(&tmp, euid)?;
+    Ok(tmp)
 }
 
 /// A new 0700 directory for the session's cookie and the logs.
 fn private_dir(tag: &str) -> Result<PathBuf> {
-    let dir = private_base().join(format!("safe-rdp-{tag}-{}", crate::util::hex_encode(&random_bytes(6)?)));
+    let dir = private_base()?.join(format!("safe-rdp-{tag}-{}", crate::util::hex_encode(&random_bytes(6)?)));
     std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)
 }
@@ -311,7 +318,11 @@ fn write_auth(path: &Path, number: u32, cookie: &[u8]) -> Result<File> {
 /// The cookie as Xvfb and this process read it: an Xauthority file without a name (a memfd),
 /// reached through descriptors only. Not inherited by the programs this process starts.
 fn cookie_file(number: u32, cookie: &[u8]) -> Result<File> {
-    let fd = unsafe { memfd_create(c"safe-rdp-xauthority".as_ptr(), MFD_CLOEXEC) };
+    let name = c"safe-rdp-xauthority";
+    let mut fd = unsafe { memfd_create(name.as_ptr(), MFD_CLOEXEC | MFD_NOEXEC_SEAL) };
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(EINVAL) {
+        fd = unsafe { memfd_create(name.as_ptr(), MFD_CLOEXEC) };
+    }
     if fd < 0 {
         bail!("cannot create the cookie file: {}", std::io::Error::last_os_error());
     }
@@ -326,11 +337,15 @@ fn cookie_file(number: u32, cookie: &[u8]) -> Result<File> {
 }
 
 /// True if display `n` is in use or being set up: its socket, its lock file, or the temporary
-/// lock file an X server creates first exists (in any form, dangling links included).
+/// lock file an X server creates first exists (in any form, dangling links included), or its
+/// abstract socket name is held (by any user, who need not run an X server there: Xvfb would
+/// fail on it). Binding the name for a moment tells; it is free again once closed.
 fn socket_taken(n: u32) -> bool {
-    [x11::local_socket_path(n), format!("/tmp/.X{n}-lock"), format!("/tmp/.tX{n}-lock")]
-        .iter()
-        .any(|p| std::fs::symlink_metadata(p).is_ok())
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    let path = x11::local_socket_path(n);
+    [path.clone(), format!("/tmp/.X{n}-lock"), format!("/tmp/.tX{n}-lock")].iter().any(|p| std::fs::symlink_metadata(p).is_ok())
+        || SocketAddr::from_abstract_name(path.as_bytes()).and_then(|a| UnixListener::bind_addr(&a)).is_err()
 }
 
 /// A new log in the private directory, open for reading too (see `log_tail`).
@@ -735,6 +750,15 @@ mod tests {
         }
         // Only Xvfb is handed it.
         assert_eq!(unsafe { fcntl(f.as_raw_fd(), F_GETFD) } & FD_CLOEXEC, FD_CLOEXEC);
+        // Sealed against ever becoming executable, where the kernel can (6.3 on).
+        const F_GET_SEALS: c_int = 1034;
+        const F_SEAL_EXEC: c_int = 0x20;
+        let sealed = unsafe { fcntl(f.as_raw_fd(), F_GET_SEALS) } & F_SEAL_EXEC != 0;
+        let fd = unsafe { memfd_create(c"probe".as_ptr(), MFD_CLOEXEC | MFD_NOEXEC_SEAL) };
+        if fd >= 0 {
+            drop(unsafe { File::from_raw_fd(fd) });
+        }
+        assert_eq!(sealed, fd >= 0);
     }
 
     #[test]
@@ -754,8 +778,17 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(!is_private_dir(&file, euid), "not a directory");
+        let link = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!is_private_dir(&link, euid), "a link to one");
+        std::fs::remove_file(&link).unwrap();
+        // XDG_RUNTIME_DIR must be absolute; a relative one would depend on where we started.
+        let ups = "../".repeat(std::env::current_dir().unwrap().components().count());
+        let relative = Path::new(&ups).join(dir.strip_prefix("/").unwrap());
+        assert!(same_file(&std::fs::metadata(&relative).unwrap(), &std::fs::metadata(&dir).unwrap()));
+        assert!(!is_private_dir(&relative, euid), "a relative path");
         std::fs::remove_dir_all(&dir).unwrap();
-        let base = private_base();
+        let base = private_base().unwrap();
         assert!(is_private_dir(&base, euid) || base == std::env::temp_dir(), "{}", base.display());
     }
 
@@ -931,6 +964,14 @@ mod tests {
         assert!(socket_taken(n), "dangling link");
         std::fs::remove_file(&link).unwrap();
         assert!(!socket_taken(n));
+        // Another user holding the abstract name keeps Xvfb off it too.
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        let addr = SocketAddr::from_abstract_name(x11::local_socket_path(n).as_bytes()).unwrap();
+        let held = UnixListener::bind_addr(&addr).unwrap();
+        assert!(socket_taken(n), "abstract name held");
+        drop(held);
+        assert!(!socket_taken(n), "the check left the name bound");
     }
 
     /// Top-level windows of at least 200x100 on the display.
