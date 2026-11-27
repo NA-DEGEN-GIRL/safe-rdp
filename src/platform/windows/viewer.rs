@@ -485,6 +485,11 @@ struct Reconnect {
     /// An attempt whose hello carried the instance was closed unanswered (`HELLO_UNANSWERED`):
     /// an older host may be answering now, so the next ones leave it out.
     instance_unanswered: bool,
+    /// The lost session may never have been named: it ended before an answer came to a ping
+    /// sent after its instance (`connect` names a session after the hellos). The host may still
+    /// hold it, nameless, and turn this viewer's reconnects away until it ends there, at its
+    /// I/O timeout: those refusals are tried again.
+    unnamed: bool,
 }
 
 impl Reconnect {
@@ -508,7 +513,8 @@ impl Reconnect {
         if name_again {
             self.instance_unanswered = false;
         }
-        (name_again || core::retryable(e)) && self.since.elapsed() < core::RECONNECT_FOR
+        let own_unnamed = self.unnamed && text.starts_with(core::REFUSED);
+        (name_again || own_unnamed || core::retryable(e)) && self.since.elapsed() < core::RECONNECT_FOR
     }
 }
 
@@ -1321,7 +1327,9 @@ impl Ui {
         if generation != self.generation || self.reconnect.is_some() {
             return After::Nothing;
         }
-        let reconnected = APP.get().unwrap().session().is_some_and(|s| s.reconnected);
+        let session = APP.get().unwrap().session();
+        let reconnected = session.as_ref().is_some_and(|s| s.reconnected);
+        let unnamed = session.is_some_and(|s| s.flags & F_INSTANCE != 0 && s.rtt_ms.load(Ordering::Relaxed) == UNSET);
         self.drop_session();
         log!("connection to {} lost: {reason}", self.host);
         let reason = reason_text(kind, &reason);
@@ -1347,6 +1355,7 @@ impl Ui {
             cause: reason,
             last_error: None,
             instance_unanswered: false,
+            unnamed,
         });
         unsafe { SetTimer(self.hwnd, T_RECONNECT, delay.as_millis() as u32, None) };
         self.bar.set_keep_visible(true);
@@ -3139,6 +3148,7 @@ mod tests {
             cause: String::new(),
             last_error: None,
             instance_unanswered: false,
+            unnamed: false,
         };
         let refused = || Error::msg(format!("{}another viewer is using this host", core::REFUSED));
         let unanswered = Error::msg(core::HELLO_UNANSWERED);
@@ -3157,10 +3167,17 @@ mod tests {
         let mut rc = series(Instant::now());
         rc.instance_unanswered = true;
         assert!(!rc.failed(&refused(), false));
+        // A session lost before the host answered a ping may not have been named there: turned
+        // away with the instance, it tries again until the host has let that session go.
+        let mut rc = series(Instant::now());
+        rc.unnamed = true;
+        assert!(rc.failed(&refused(), true) && rc.failed(&refused(), true) && rc.names(true));
         // And never beyond RECONNECT_FOR.
         if let Some(long_ago) = Instant::now().checked_sub(core::RECONNECT_FOR) {
             let mut rc = series(long_ago);
             rc.instance_unanswered = true;
+            assert!(!rc.failed(&refused(), true));
+            rc.unnamed = true;
             assert!(!rc.failed(&refused(), true));
         }
     }

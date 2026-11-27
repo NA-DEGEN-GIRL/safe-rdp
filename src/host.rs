@@ -12,7 +12,7 @@
 //! Audio capture and privacy mode live on threads of their own and are switched off when the
 //! session ends, however it ends.
 
-use crate::channel::{self, RecordReader, RecordWriter};
+use crate::channel::{self, Deadline, RecordReader, RecordWriter};
 use crate::codec::{self, EncodedRect, Encoder};
 use crate::files::{self, Incoming, Outgoing};
 use crate::net::{self, PeerPolicy};
@@ -31,7 +31,7 @@ use crate::audio::AudioSender;
 #[cfg(windows)]
 use crate::platform::clipboard::FileUser;
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -349,10 +349,26 @@ impl Drop for KickOnDrop {
     }
 }
 
+/// A session in `Host::sessions`, taken off when its thread is done with it (also when it
+/// panics, which ends and finishes it).
+struct Listed<'a>(&'a Host, Arc<SessionCtl>);
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        self.1.kick();
+        self.1.finished.store(true, Ordering::SeqCst);
+        lock(&self.0.sessions).retain(|c| !Arc::ptr_eq(c, &self.1));
+    }
+}
+
 struct Host {
     opts: HostOptions,
     psk: Secret<32>,
     current: Mutex<Option<Arc<SessionCtl>>>,
+    /// Every session let in whose thread has not ended: the current one, and replaced ones
+    /// still letting go of the screen or keys, or whose connections are parting. Added to
+    /// under `current`'s lock.
+    sessions: Mutex<Vec<Arc<SessionCtl>>>,
     pending: Mutex<Pending>,
     quiet: Mutex<Quiet>,
     /// `serve` was told to stop: no new session may start.
@@ -367,6 +383,7 @@ impl Host {
             opts,
             psk,
             current: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
             pending: Mutex::new(Pending::default()),
             quiet: Mutex::new(Quiet::new(Instant::now())),
             stopping: AtomicBool::new(false),
@@ -374,13 +391,32 @@ impl Host {
         }
     }
 
-    /// Stops accepting sessions and ends the current one.
+    /// Stops accepting sessions and ends all of them: the current one, replaced ones still
+    /// ending, and the connections still parting, which close at once.
     fn shutdown(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        let cur = lock(&self.current).clone();
-        if let Some(c) = cur {
-            c.kick();
-            c.wait_finished(Duration::from_secs(10));
+        {
+            // A session is let in (and listed) before this, or not at all.
+            let _cur = lock(&self.current);
+            self.stopping.store(true, Ordering::SeqCst);
+        }
+        let all = lock(&self.sessions).clone();
+        for c in &all {
+            c.kill();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        for c in &all {
+            c.wait_finished(until.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// Waits (at most `limit`, and only while `ctl` is not stopped) until every other session
+    /// has released its screen duplication, injected keys and privacy mode: the one `ctl`
+    /// replaces, and any that one had not waited for yet.
+    fn wait_for_others(&self, ctl: &SessionCtl, limit: Duration) {
+        let t = Instant::now();
+        let busy = || lock(&self.sessions).iter().any(|c| !std::ptr::eq(&**c, ctl) && !c.finished.load(Ordering::SeqCst));
+        while !ctl.stopped() && t.elapsed() < limit && busy() {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -574,43 +610,6 @@ impl LogBudget {
     }
 }
 
-/// The socket of a connection not let in yet with an absolute deadline: each read and write
-/// gets only the time that is left. The socket's own timeouts restart with every byte, so a
-/// peer trickling its handshake or hello could otherwise hold a pending slot for many minutes.
-struct Deadline<'a> {
-    s: &'a TcpStream,
-    until: Instant,
-}
-
-impl Deadline<'_> {
-    fn left(&self) -> std::io::Result<Duration> {
-        match self.until.checked_duration_since(Instant::now()) {
-            Some(d) if !d.is_zero() => Ok(d),
-            _ => Err(ErrorKind::TimedOut.into()),
-        }
-    }
-}
-
-impl Read for Deadline<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.s.set_read_timeout(Some(self.left()?))?;
-        let mut s = self.s;
-        s.read(buf)
-    }
-}
-
-impl Write for Deadline<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.s.set_write_timeout(Some(self.left()?))?;
-        let mut s = self.s;
-        s.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Opens the listening socket on `opts.bind`, or on this machine's Tailscale address once
 /// Tailscale is up. Fails promptly if `stop` is set while it waits.
 pub fn bind(opts: &HostOptions, stop: &AtomicBool) -> Result<TcpListener> {
@@ -798,18 +797,27 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
             refuse(&out, &ctl.sock, "another viewer is using this host");
             return;
         }
+        lock(&host.sessions).push(ctl.clone());
         cur.replace(ctl.clone())
     };
-    // Let in: the next viewer let in replaces this session, which no longer counts as pending.
-    drop(slot);
+    let _listed = Listed(host, ctl.clone());
     if let Some(old) = old {
         log!("replacing the existing session");
         old.kick_with_notice("another viewer connected to this host", &host.drains);
-        // Let it release its screen duplication, injected keys and privacy mode first.
-        old.wait_finished(Duration::from_secs(5));
     }
-    log!("session started: {peer}");
-    let r = run_session(host, out, reader, &hello, &ctl);
+    // Let earlier sessions release the screen, keys and privacy mode first; meanwhile this one
+    // still counts as pending, so that a peer connecting again and again cannot pile them up.
+    host.wait_for_others(&ctl, Duration::from_secs(5));
+    // Let in: the next viewer let in replaces this session, which no longer counts as pending.
+    drop(slot);
+    // Replaced, or the host is stopping, while it waited: it never starts.
+    let started = !ctl.stopped();
+    let r = if started {
+        log!("session started: {peer}");
+        run_session(host, out, reader, &hello, &ctl)
+    } else {
+        Ok(())
+    };
     lock(&ctl.out).take();
     ctl.kick();
     {
@@ -820,6 +828,7 @@ fn serve_session(host: &Arc<Host>, stream: TcpStream, peer: SocketAddr, keys: ch
     }
     ctl.finished.store(true, Ordering::SeqCst);
     match r {
+        _ if !started => log!("no session for {peer}: replaced, or the host stopped, before it started"),
         Err(e) if e.to_string() != channel::CLOSED => log!("session ended: {peer}: {e}"),
         _ => log!("session ended: {peer} disconnected"),
     }
@@ -849,12 +858,23 @@ impl Out {
         }
     }
 
+    /// Sends `rec` with the writer, which a failed send takes away: the viewer may have part of
+    /// a record, and the connection is no use any more. Every later send fails at once instead
+    /// of waiting for it again, and the thread that sees the failure ends the session.
+    fn send_with(&self, w: &mut Option<RecordWriter<TcpStream>>, rec: &[u8]) -> Result<()> {
+        let r = self.writer(w)?.send(rec);
+        if r.is_err() {
+            *w = None;
+        }
+        r
+    }
+
     /// Sends one complete message (type byte included).
     fn send_record(&self, rec: &[u8]) -> Result<()> {
         self.waiting.fetch_add(1, Ordering::SeqCst);
         let mut w = lock(&self.w);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
-        self.writer(&mut w)?.send(rec)
+        self.send_with(&mut w, rec)
     }
 
     fn send(&self, m: &ServerMsg) -> Result<()> {
@@ -871,7 +891,7 @@ impl Out {
         }
         let mut b = Vec::new();
         m.encode(&mut b);
-        self.writer(&mut lock(&self.w))?.send(&b)
+        self.send_with(&mut lock(&self.w), &b)
     }
 
     fn notice(&self, text: String) -> Result<()> {
@@ -1066,8 +1086,8 @@ fn run_session(host: &Arc<Host>, out: Arc<Out>, reader: RecordReader<TcpStream>,
         let o = out.clone();
         let c = ctl.clone();
         Some(Clipboard::spawn(move |text| {
-            if !c.stopped() {
-                let _ = o.send(&ServerMsg::Clipboard(text));
+            if !c.stopped() && o.send(&ServerMsg::Clipboard(text)).is_err() {
+                c.kick();
             }
         })?)
     } else {
@@ -1104,6 +1124,12 @@ fn run_session(host: &Arc<Host>, out: Arc<Out>, reader: RecordReader<TcpStream>,
 fn receive(mut reader: RecordReader<TcpStream>, to_input: mpsc::SyncSender<Result<ClientMsg>>, ctl: &SessionCtl) {
     while !ctl.stopped() {
         let m = reader.recv().and_then(ClientMsg::decode);
+        // Named here, not by the input thread, which takes its first messages only once audio
+        // and privacy mode are on: an automatic reconnect meanwhile would find the session
+        // nameless, as another viewer's, and be turned away.
+        if let Ok(ClientMsg::Instance(id)) = m {
+            ctl.name(id);
+        }
         let end = m.is_err();
         if to_input.send(m).is_err() || end {
             break;
@@ -1181,10 +1207,10 @@ impl Input {
     }
 
     fn serve(&mut self, received: mpsc::Receiver<Result<ClientMsg>>, (audio, privacy): (bool, bool)) -> Result<()> {
-        if audio {
+        if audio && !self.ctl.stopped() {
             self.set_feature(SET_AUDIO, 1)?;
         }
-        if privacy {
+        if privacy && !self.ctl.stopped() {
             self.set_feature(SET_PRIVACY, 1)?;
         }
         // Not blocked on the socket (the receiving thread is), so a stopped session lets go of
@@ -1212,8 +1238,8 @@ impl Input {
             ClientMsg::Ack(id) => self.shared.acked.store(id, Ordering::SeqCst),
             ClientMsg::Refresh => self.shared.refresh.store(true, Ordering::SeqCst),
             ClientMsg::Ping(t) => self.out.send(&ServerMsg::Pong(t))?,
-            ClientMsg::Hello { .. } => {}
-            ClientMsg::Instance(id) => self.ctl.name(id),
+            // The receiving thread names the session (`receive`).
+            ClientMsg::Hello { .. } | ClientMsg::Instance(_) => {}
             ClientMsg::Set { key: key @ (SET_QUALITY | SET_DOWNSCALE | SET_MONITOR), value } => {
                 // Waits while `SETTINGS_QUEUE` changes are pending (the capture thread takes them
                 // within a tick), so a flood slows down its sender instead of growing the queue.
@@ -1477,13 +1503,17 @@ fn pull_files(copied: fn() -> Vec<PathBuf>, ids: &AtomicU32, out: &Out, ctl: &Se
     let user = match FileUser::get() {
         Ok(u) => u,
         Err(e) => {
-            let _ = out.notice(format!("cannot send copied files: {e}"));
+            if out.notice(format!("cannot send copied files: {e}")).is_err() {
+                ctl.kick();
+            }
             return;
         }
     };
     let paths = copied();
     if paths.is_empty() {
-        let _ = out.notice("no files are copied on the host".into());
+        if out.notice("no files are copied on the host".into()).is_err() {
+            ctl.kick();
+        }
         return;
     }
     let first_id = ids.fetch_add(paths.len() as u32, Ordering::SeqCst);
@@ -1503,7 +1533,9 @@ fn send_files(paths: &[PathBuf], first_id: u32, user: &FileUser, out: &Out, ctl:
             }
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             log!("sending {name} failed: {e}");
+            // Fails at once if sending the file did (`Out::send_with`).
             if out.notice(format!("could not send {name}: {e}")).is_err() {
+                ctl.kick();
                 return;
             }
         }
@@ -1523,23 +1555,23 @@ fn send_file(path: &Path, id: u32, user: &FileUser, out: &Out, ctl: &SessionCtl,
     let (name, size) = (file.name.clone(), file.size);
     log!("sending file {name} ({size} bytes)");
     out.send_bulk(&ServerMsg::FileBegin { id, size, name })?;
-    let mut body = || -> Result<()> {
-        while file.next_chunk(buf)? {
-            if ctl.stopped() {
-                bail!("{}", channel::CLOSED);
+    loop {
+        match file.next_chunk(buf) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) => {
+                // Make the viewer discard what it received: this checksum never matches. Only
+                // for a file that could not be read: after a failed send nothing goes out.
+                let _ = out.send_bulk(&ServerMsg::FileEnd { id, sha256: [0; 32] });
+                return Err(e);
             }
-            out.send_bulk(&ServerMsg::FileData { id, data: buf })?;
         }
-        Ok(())
-    };
-    match body() {
-        Ok(()) => out.send_bulk(&ServerMsg::FileEnd { id, sha256: file.finish() }),
-        Err(e) => {
-            // Make the viewer discard what it received: this checksum never matches.
-            let _ = out.send_bulk(&ServerMsg::FileEnd { id, sha256: [0; 32] });
-            Err(e)
+        if ctl.stopped() {
+            bail!("{}", channel::CLOSED);
         }
+        out.send_bulk(&ServerMsg::FileData { id, data: buf })?;
     }
+    out.send_bulk(&ServerMsg::FileEnd { id, sha256: file.finish() })
 }
 
 /// A feature the viewer switches on and off (audio, privacy mode). Holding `T` keeps it on;
@@ -1734,6 +1766,7 @@ fn audio_sender(rx: mpsc::Receiver<AudioPacket>, out: &Out, ctl: &SessionCtl, st
         let mut failed = false;
         sender.push(&p.pcm, p.rate, p.channels, |m| failed = failed || out.send(&m).is_err());
         if failed {
+            ctl.kick();
             return;
         }
     }
@@ -1969,6 +2002,7 @@ fn capture_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn opts() -> HostOptions {
         HostOptions { monitor: MonitorSel::Index(1), ..HostOptions::default() }
@@ -2409,7 +2443,8 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
         match (&mut &*s).read(&mut [0u8; 1]) {
             Err(e) => matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
-            Ok(_) => false,
+            // Closed, or the host sent something: not a handshake waiting for the peer.
+            Ok(_read) => false,
         }
     }
 
@@ -2598,6 +2633,31 @@ mod tests {
         assert_eq!(ctl.instance.load(Ordering::SeqCst), 7);
     }
 
+    #[test]
+    fn a_session_is_named_as_soon_as_its_instance_comes() {
+        let ((hs, hk), (vs, vk)) = session_pair();
+        let ctl = Arc::new(SessionCtl::new(hs.try_clone().unwrap(), 0));
+        let (to_input, received) = mpsc::sync_channel(RECEIVED_QUEUE);
+        let receiver = {
+            let (ctl, reader) = (ctl.clone(), RecordReader::new(hs, hk.recv));
+            std::thread::spawn(move || receive(reader, to_input, &ctl))
+        };
+        // The input thread is still switching audio and privacy mode on: nothing takes the
+        // viewer's messages yet. An automatic reconnect now must find the session named.
+        let mut b = Vec::new();
+        ClientMsg::Instance(5).encode(&mut b);
+        RecordWriter::new(vs, vk.send).send(&b).unwrap();
+        let t = Instant::now();
+        while ctl.instance.load(Ordering::SeqCst) != 5 {
+            assert!(t.elapsed() < Duration::from_secs(5), "the session was not named");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(takes_over(HELLO_RECONNECT, 5, Some(ctl.instance.load(Ordering::SeqCst))));
+        ctl.kick();
+        drop(received);
+        receiver.join().unwrap();
+    }
+
     const PAIR_KEY: [u8; 32] = [4; 32];
 
     /// An authenticated loopback connection: the host's end and the viewer's, with their keys.
@@ -2772,6 +2832,35 @@ mod tests {
     }
 
     #[test]
+    fn after_a_failed_send_nothing_waits_for_the_connection_again() {
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let path = std::env::temp_dir().join(format!("srdp-pull-{}", crate::util::hex_encode(&r)));
+        std::fs::write(&path, b"copied on the host").unwrap();
+        let ((hs, hk), (vs, _)) = session_pair();
+        let timeout = Duration::from_secs(2);
+        hs.set_write_timeout(Some(timeout)).unwrap();
+        let ctl = SessionCtl::new(hs.try_clone().unwrap(), 1);
+        let out = Out::new(RecordWriter::new(hs.try_clone().unwrap(), hk.send));
+        // The viewer reads nothing: the connection fills up and a send times out, maybe with
+        // part of its record out. The writer goes with it.
+        let mut frame = vec![7u8; 1 << 20];
+        frame[0] = S_TILES;
+        assert!((0..1024).any(|_| out.send_record(&frame).is_err()), "the connection never filled up");
+        assert!(lock(&out.w).is_none());
+        // Every later send fails at once, a file's end and the notice about it included, and
+        // the thread sending the file ends the session.
+        let t = Instant::now();
+        assert!(out.send(&ServerMsg::Ping).is_err() && out.send_bulk(&ServerMsg::Ping).is_err());
+        send_files(std::slice::from_ref(&path), 1, &FileUser::get().unwrap(), &out, &ctl);
+        assert!(ctl.stopped());
+        assert!(!out.farewell(&hs, "another viewer connected to this host"));
+        assert!(t.elapsed() < timeout / 2, "waited {:?}", t.elapsed());
+        std::fs::remove_file(&path).unwrap();
+        drop(vs);
+    }
+
+    #[test]
     fn an_automatic_reconnect_does_not_replace_another_viewers_session() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
@@ -2835,6 +2924,82 @@ mod tests {
     }
 
     #[test]
+    fn a_newcomer_waits_for_earlier_sessions_as_a_pending_one() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let host = Arc::new(Host::new(HostOptions { copied_files: Vec::new, ..HostOptions::default() }, Secret(PAIR_KEY)));
+        // The live session, whose thread will take its time to let go of the screen.
+        let ((other, _), _other_viewer) = session_pair();
+        let old = Arc::new(SessionCtl::new(other, 7));
+        *lock(&host.current) = Some(old.clone());
+        lock(&host.sessions).push(old.clone());
+        let served = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let (s, peer) = l.accept().unwrap();
+                serve_accepted(&host, s, peer);
+            })
+        };
+        let mut s = TcpStream::connect(addr).unwrap();
+        let keys = channel::client_handshake(&mut s, &PAIR_KEY).unwrap();
+        RecordWriter::new(s.try_clone().unwrap(), keys.send).send(&hello_bytes(0, 0)).unwrap();
+        // The newcomer replaces it, and waits for it as one of the pending connections.
+        let t = Instant::now();
+        while !old.stopped() {
+            assert!(t.elapsed() < Duration::from_secs(5), "the live session was not replaced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!served.is_finished());
+        assert_eq!(lock(&host.pending).total, 1);
+        // Replaced in turn meanwhile (or the host stopping): it stops waiting at once, never
+        // starts, and gives its place back.
+        let newcomer = lock(&host.current).clone().unwrap();
+        assert!(!Arc::ptr_eq(&newcomer, &old));
+        let t = Instant::now();
+        newcomer.kick();
+        served.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1), "stopped waiting after {:?}", t.elapsed());
+        assert!(newcomer.finished.load(Ordering::SeqCst));
+        let p = lock(&host.pending);
+        assert!(p.total == 0 && p.per_addr.is_empty());
+        // The one it waited for is still listed, for the next newcomer and for `shutdown`.
+        assert!(lock(&host.sessions).iter().all(|c| Arc::ptr_eq(c, &old)));
+        // Its viewer got no hello.
+        assert!(RecordReader::new(s, keys.recv).recv().is_err());
+    }
+
+    #[test]
+    fn stopping_ends_replaced_sessions_and_parting_connections_too() {
+        let host = Host::new(HostOptions { copied_files: Vec::new, ..HostOptions::default() }, Secret(PAIR_KEY));
+        let drains = Arc::new(AtomicUsize::new(0));
+        // Replaced (so not the current session any more) and still ending, its connection
+        // parting; its thread finishes a moment later.
+        let ((hs, _), (vs, _)) = session_pair();
+        let replaced = Arc::new(SessionCtl::new(hs, 1));
+        assert!(replaced.part(DrainSlot::take(&drains).unwrap()));
+        replaced.stop.store(true, Ordering::SeqCst);
+        lock(&host.sessions).push(replaced.clone());
+        let ending = {
+            let replaced = replaced.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                replaced.finished.store(true, Ordering::SeqCst);
+            })
+        };
+        let t = Instant::now();
+        host.shutdown();
+        assert!(replaced.finished.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(host.stopping.load(Ordering::SeqCst));
+        assert!(matches!(*lock(&replaced.link), Link::Closed));
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+        // Its viewer finds the connection closed.
+        vs.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(matches!((&vs).read(&mut [0u8; 1]), Ok(0)));
+        ending.join().unwrap();
+    }
+
+    #[test]
     fn the_hello_is_due_by_the_deadline_and_no_longer_than_any_hello() {
         let longest = hello_bytes(HELLO_RECONNECT, u64::MAX);
         assert_eq!(longest.len(), MAX_HELLO);
@@ -2891,6 +3056,7 @@ mod tests {
 mod session_tests {
     use super::*;
     use crate::codec::Decoder;
+    use std::io::Write;
     use crate::viewer::{Connection, ViewerOptions, connect};
     use std::sync::OnceLock;
 
