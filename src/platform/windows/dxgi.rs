@@ -463,6 +463,28 @@ fn duplicate(output: &Com, device: &Com) -> Result<Com> {
     }
 }
 
+/// What to do with an acquired frame.
+#[derive(Debug, PartialEq)]
+enum FrameUse {
+    /// Copy the image (all of it until the first one is in).
+    Copy,
+    /// Nothing new to show.
+    Skip,
+    Broken,
+}
+
+/// `image`: the frame came with a desktop image; `presented`: the image changed since the last
+/// frame (a nonzero LastPresentTime; zero means only the pointer moved or changed shape, and
+/// such a frame may come without an image); `have_first`: an image was copied before.
+fn frame_use(image: bool, presented: bool, have_first: bool) -> FrameUse {
+    match (image, presented) {
+        (false, true) => FrameUse::Broken,
+        (false, false) => FrameUse::Skip,
+        (true, _) if presented || !have_first => FrameUse::Copy,
+        (true, _) => FrameUse::Skip,
+    }
+}
+
 /// One duplicated output and where its upright image goes in the capture buffer.
 struct Output {
     device: Com,
@@ -498,13 +520,11 @@ impl Output {
             }
             hr(r, "AcquireNextFrame")?;
             let resource = Com(res);
-            // Pointer-only updates carry no new image.
-            let changed = if resource.0.is_null() {
-                Err("AcquireNextFrame returned no image".into())
-            } else if info.last_present_time != 0 || self.texture.is_none() {
-                self.update(&resource, &info, dst, stride)
-            } else {
-                Ok(false)
+            // The frame is held until released, whatever it carries.
+            let changed = match frame_use(!resource.0.is_null(), info.last_present_time != 0, self.texture.is_some()) {
+                FrameUse::Copy => self.update(&resource, &info, dst, stride),
+                FrameUse::Skip => Ok(false),
+                FrameUse::Broken => Err("AcquireNextFrame returned no image".into()),
             };
             drop(resource);
             release_frame(self.dupl.0);
@@ -691,7 +711,15 @@ impl DxgiCapture {
         // format and size are usable before the caller commits to DXGI.
         let stride = area.width as usize * 4;
         for o in &mut cap.outputs {
-            cap.primed |= o.poll(FIRST_FRAME_MS, cap.pixels.as_mut_slice(), stride)?;
+            // A frame for a moving pointer may come first: wait on for the image while there is time.
+            let deadline = Instant::now() + Duration::from_millis(FIRST_FRAME_MS as u64);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
+                cap.primed |= o.poll(left, cap.pixels.as_mut_slice(), stride)?;
+                if o.texture.is_some() || left == 0 {
+                    break;
+                }
+            }
         }
         Ok(cap)
     }
@@ -806,6 +834,22 @@ mod tests {
         assert_eq!(Rotation::Rotate90.map_region(7, 5, r), Region { x0: 0, y0: 1, x1: 3, y1: 4 });
         // ROTATE270: left = top, top = Height - right, right = bottom, bottom = Height - left.
         assert_eq!(Rotation::Rotate270.map_region(7, 5, r), Region { x0: 2, y0: 3, x1: 5, y1: 6 });
+    }
+
+    #[test]
+    fn pointer_only_frames_are_no_error() {
+        // Only the pointer changed, with or without an image: nothing to copy, before the first
+        // image too (opening waits on for it).
+        assert_eq!(frame_use(false, false, false), FrameUse::Skip);
+        assert_eq!(frame_use(false, false, true), FrameUse::Skip);
+        assert_eq!(frame_use(true, false, true), FrameUse::Skip);
+        // An image that came along is copied while there is none yet.
+        assert_eq!(frame_use(true, false, false), FrameUse::Copy);
+        assert_eq!(frame_use(true, true, false), FrameUse::Copy);
+        assert_eq!(frame_use(true, true, true), FrameUse::Copy);
+        // A new picture without the image is not something DXGI does.
+        assert_eq!(frame_use(false, true, true), FrameUse::Broken);
+        assert_eq!(frame_use(false, true, false), FrameUse::Broken);
     }
 
     #[test]

@@ -972,9 +972,21 @@ fn monitor_code(sel: MonitorSel) -> u8 {
     }
 }
 
-/// The requested 1..=4 downscale, reduced so that the scaled picture is at least 1x1.
+/// The largest picture every viewer takes: `viewer::MAX_PIXELS`, and the X11 viewer's own limit
+/// (two 8K screens side by side) is a little lower.
+const MAX_SENT_PIXELS: usize = 2 * 7680 * 4320;
+const _: () = assert!(MAX_SENT_PIXELS <= crate::viewer::MAX_PIXELS);
+
+/// The requested 1..=4 downscale, reduced so that the scaled picture is at least 1x1, and raised
+/// (past 4 if need be) where it would still be larger than viewers take, as all monitors
+/// together can be.
 fn effective_downscale(area: Area, d: usize) -> usize {
-    d.clamp(1, 4).min(area.width.max(1) as usize).min(area.height.max(1) as usize)
+    let (w, h) = (area.width.max(1) as usize, area.height.max(1) as usize);
+    let mut d = d.clamp(1, 4).min(w).min(h);
+    while (w / d) * (h / d) > MAX_SENT_PIXELS {
+        d += 1;
+    }
+    d
 }
 
 /// Capabilities announced in the hello.
@@ -2126,6 +2138,18 @@ mod tests {
         assert_eq!(effective_downscale(a(1920, 1080), 9), 4);
         assert_eq!(effective_downscale(a(3, 1080), 4), 3);
         assert_eq!(effective_downscale(a(0, 0), 4), 1);
+    }
+
+    #[test]
+    fn downscale_keeps_the_picture_within_what_viewers_take() {
+        let a = |w, h| Area { left: 0, top: 0, width: w, height: h };
+        // Two 8K monitors side by side still go at full size; a third needs half.
+        assert_eq!(effective_downscale(a(15360, 4320), 1), 1);
+        assert_eq!(effective_downscale(a(23040, 4320), 1), 2);
+        assert_eq!(effective_downscale(a(23040, 4320), 3), 3);
+        // The largest area the wire format carries, past the requested maximum of 4.
+        let d = effective_downscale(a(0xffff, 0xffff), 4);
+        assert!(d > 4 && (0xffff / d) * (0xffff / d) <= MAX_SENT_PIXELS && (0xffff / (d - 1)).pow(2) > MAX_SENT_PIXELS, "{d}");
     }
 
     #[test]

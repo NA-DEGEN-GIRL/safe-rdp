@@ -22,18 +22,19 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    SetSecurityInfo,
 };
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetSecurityDescriptorOwner, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetFileSecurityW, UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAdministratorsSid,
-    WinLocalSystemSid,
+    PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetKernelObjectSecurity, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
@@ -42,6 +43,8 @@ const ENTROPY: &[u8] = b"safe-rdp/1 psk";
 const ADMIN_ONLY_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 /// The same for a file.
 const KEY_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+/// The program folder: SYSTEM and Administrators may change it, Users read and run what is there.
+const PROGRAM_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const KEY_FILE: &str = "service.key";
 /// What the service and its agent keep in the service directory.
 const SERVICE_FILES: [&str; 4] = [KEY_FILE, "service.log", "host.log", "incoming"];
@@ -170,12 +173,16 @@ impl Drop for Sd {
     }
 }
 
-/// Applies the SYSTEM+Administrators-only DACL to a file or directory.
-pub fn restrict_to_admins(path: &Path) -> Result<()> {
-    let sd = Sd::parse(ADMIN_ONLY_SDDL)?;
-    let p = wide_path(path);
-    if unsafe { SetFileSecurityW(p.as_ptr(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sd.0) } == 0 {
-        return Err(Error::last_os(&format!("setting permissions on {}", path.display())));
+/// Gives the program folder `dir` (in Program Files, where only administrators can add or
+/// rename anything) and what is in it an ACL that lets SYSTEM and Administrators change them
+/// and everybody else only read and run them. Applied by name and passed on to what is inside,
+/// so an executable copied while the folder admitted administrators alone gets it too.
+pub fn secure_program_dir(dir: &Path) -> Result<()> {
+    let sd = Sd::parse(PROGRAM_SDDL)?;
+    let (w, what) = (wide_path(dir), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION);
+    let r = unsafe { SetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, what, null_mut(), null_mut(), sd.dacl(), null()) };
+    if r != 0 {
+        bail!("cannot set permissions on {}: {}", dir.display(), std::io::Error::from_raw_os_error(r as i32));
     }
     Ok(())
 }
@@ -298,6 +305,38 @@ fn entry_facts(path: &Path) -> Result<Facts> {
     facts(&f)
 }
 
+/// Opens `path` itself, as `open_entry` does, to change its ACL as well. Without
+/// FILE_SHARE_DELETE: while it is open, its name cannot be given to anything else.
+fn open_to_secure(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| Error::msg(format!("cannot open {}: {e}", path.display())))
+}
+
+/// Gives the open `f` the DACL of `sd`, protected if `sd` says so. Nothing below it changes.
+fn set_dacl(f: &File, sd: &Sd, path: &Path) -> Result<()> {
+    let what = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    if unsafe { SetKernelObjectSecurity(f.as_raw_handle() as HANDLE, what, sd.0) } == 0 {
+        return Err(Error::last_os(&format!("setting permissions on {}", path.display())));
+    }
+    Ok(())
+}
+
+/// Leaves the open `f` only what it inherits from its parent. Windows passes that on to what
+/// is below it too, as far as that inherits.
+fn inherit_only(f: &File, empty: &Sd, path: &Path) -> Result<()> {
+    let what = DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION;
+    let h = f.as_raw_handle() as HANDLE;
+    let r = unsafe { SetSecurityInfo(h, SE_FILE_OBJECT, what, null_mut(), null_mut(), empty.dacl(), null()) };
+    if r != 0 {
+        bail!("cannot reset permissions on {}: {}", path.display(), std::io::Error::from_raw_os_error(r as i32));
+    }
+    Ok(())
+}
+
 /// Checks that `dir` is a plain directory owned by SYSTEM or Administrators that only they can
 /// change (others may at most read, e.g. an admin's account Explorer added).
 fn check_dir(dir: &Path) -> Result<()> {
@@ -375,25 +414,26 @@ fn purge_foreign(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Gives every entry below `dir` the ACL it inherits from `dir` and nothing else, dropping
-/// explicit grants (such as the one Explorer's "Continue" adds). Run after `purge_foreign`, so
-/// no link is left through which this could reach another file.
-fn reset_to_inherited(dir: &Path) -> Result<()> {
-    let empty = Sd::parse("D:")?;
+/// Gives every entry below `dir` (which only SYSTEM and Administrators can change already) the
+/// ACL it inherits from `dir` and nothing else, dropping explicit grants (such as the one
+/// Explorer's "Continue" adds). Run after `purge_foreign`, so no link is left through which
+/// this could reach another file. Each entry is checked and changed through one handle that
+/// refers to the entry itself, never to what a link there points to; a directory is closed to
+/// everybody else before its own entries are looked at, and set to inherit only after them, so
+/// what Windows passes on from it reaches nothing that was not checked.
+fn reset_to_inherited(dir: &Path, admins: &Sd, empty: &Sd) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let fx = entry_facts(&path)?;
+        let f = open_to_secure(&path)?;
+        let fx = facts(&f)?;
         if !fx.ours() {
             bail!("{} appeared while the folder was being secured; try again", path.display());
         }
-        let (w, what) = (wide_path(&path), DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION);
-        let r = unsafe { SetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, what, null_mut(), null_mut(), empty.dacl(), null()) };
-        if r != 0 {
-            bail!("cannot reset permissions on {}: {}", path.display(), std::io::Error::from_raw_os_error(r as i32));
-        }
         if fx.dir {
-            reset_to_inherited(&path)?;
+            set_dacl(&f, admins, &path)?;
+            reset_to_inherited(&path, admins, empty)?;
         }
+        inherit_only(&f, empty, &path)?;
     }
     Ok(())
 }
@@ -414,7 +454,7 @@ fn secure_dir(dir: &Path) -> Result<()> {
         }
     }
     // Held without FILE_SHARE_DELETE: while it is open the directory cannot be swapped for a link.
-    let pin = open_entry(dir, FILE_SHARE_READ | FILE_SHARE_WRITE).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    let pin = open_to_secure(dir)?;
     let fx = facts(&pin)?;
     if !fx.dir || fx.reparse {
         bail!("{} is not a plain directory; remove it and try again", dir.display());
@@ -425,12 +465,12 @@ fn secure_dir(dir: &Path) -> Result<()> {
             dir.display()
         );
     }
-    // The directory alone first (SetFileSecurityW does not propagate): from here on nobody else
-    // can add entries. Only after the links are gone does anything inside get touched, so the
-    // new ACL can never be pushed onto a file elsewhere through a hard link.
-    restrict_to_admins(dir)?;
+    // The directory alone first, through the handle just checked (this does not propagate): from
+    // here on nobody else can add entries. Only after the links are gone does anything inside
+    // get touched, so the new ACL can never be pushed onto a file elsewhere through a hard link.
+    set_dacl(&pin, &sd, dir)?;
     purge_foreign(dir)?;
-    reset_to_inherited(dir)?;
+    reset_to_inherited(dir, &sd, &Sd::parse("D:")?)?;
     drop(pin);
     Ok(())
 }
@@ -666,6 +706,71 @@ mod tests {
         // Removing the second name makes the file plain again.
         std::fs::remove_file(t.0.join("hard")).unwrap();
         assert!(admin_owned(entry_facts(&file).unwrap()).ours());
+    }
+
+    /// The DACL of `path` itself, as SDDL.
+    fn dacl_sddl(path: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let f = open_entry(path, SHARE_ALL).unwrap();
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        let h = f.as_raw_handle() as HANDLE;
+        let r = unsafe { GetSecurityInfo(h, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, null_mut(), null_mut(), null_mut(), null_mut(), &mut sd) };
+        assert_eq!(r, 0);
+        let sd = Sd(sd);
+        let mut s = null_mut();
+        assert_ne!(unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd.0, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut s, null_mut()) }, 0);
+        let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, (0..).take_while(|&i| *s.add(i) != 0).count()) });
+        unsafe { LocalFree(s as HLOCAL) };
+        out
+    }
+
+    #[test]
+    fn securing_changes_a_link_never_what_it_points_to() {
+        let t = TempDir::new("handle");
+        let (root, outside) = (t.0.join("root"), t.0.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        if !junction(&root.join("incoming"), &outside) {
+            eprintln!("cannot create a junction; skipped");
+            return;
+        }
+        let before = (dacl_sddl(&outside), dacl_sddl(&outside.join("keep.txt")));
+        // A junction where a directory was: the handle refers to the junction itself.
+        let j = root.join("incoming");
+        let f = open_to_secure(&j).unwrap();
+        assert!(facts(&f).unwrap().reparse);
+        let everybody = Sd::parse("D:P(A;OICI;FA;;;WD)").unwrap();
+        set_dacl(&f, &everybody, &j).unwrap();
+        inherit_only(&f, &Sd::parse("D:").unwrap(), &j).unwrap();
+        drop(f);
+        assert_eq!((dacl_sddl(&outside), dacl_sddl(&outside.join("keep.txt"))), before);
+        // And resetting what is inside refuses it before changing anything.
+        let (admins, empty) = (Sd::parse(ADMIN_ONLY_SDDL).unwrap(), Sd::parse("D:").unwrap());
+        let e = reset_to_inherited(&root, &admins, &empty).unwrap_err().to_string();
+        assert!(e.contains("appeared while"), "{e}");
+        assert_eq!((dacl_sddl(&outside), dacl_sddl(&outside.join("keep.txt"))), before);
+    }
+
+    #[test]
+    fn inheriting_through_a_handle_takes_the_parents_entries() {
+        let t = TempDir::new("inherit");
+        let (parent, child) = (t.0.join("p"), t.0.join("p").join("c"));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("f"), b"f").unwrap();
+        let f = open_to_secure(&parent).unwrap();
+        set_dacl(&f, &Sd::parse("D:P(A;OICI;FA;;;WD)").unwrap(), &parent).unwrap();
+        drop(f);
+        // Not passed on: the child keeps what it had.
+        assert!(dacl_sddl(&parent).starts_with("D:P"), "{}", dacl_sddl(&parent));
+        assert!(!dacl_sddl(&child).contains(";;;WD)"), "{}", dacl_sddl(&child));
+        let f = open_to_secure(&child).unwrap();
+        set_dacl(&f, &Sd::parse("D:P(A;OICI;FA;;;WD)(A;OICI;0x1200a9;;;BU)").unwrap(), &child).unwrap();
+        inherit_only(&f, &Sd::parse("D:").unwrap(), &child).unwrap();
+        drop(f);
+        // Only what the parent passes on is left, inherited, and it reaches the file inside too.
+        assert_eq!(dacl_sddl(&child), "D:AI(A;OICIID;FA;;;WD)");
+        assert_eq!(dacl_sddl(&child.join("f")), "D:AI(A;ID;FA;;;WD)");
     }
 
     #[test]
