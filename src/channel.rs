@@ -22,7 +22,9 @@
 use crate::bail;
 use crate::crypto::{self, Aead, EcdhKey, NONCE_LEN, PUBKEY_LEN, TAG_LEN};
 use crate::util::{Error, Result, Secret, SecureVec, wipe};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 pub const MAGIC: &[u8; 4] = b"SRDP";
 pub const VERSION: u8 = 2;
@@ -35,12 +37,50 @@ pub const MAX_RECORD: usize = 32 << 20;
 pub const CLOSED: &str = "connection closed by peer";
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
-    use std::io::ErrorKind::*;
+    use ErrorKind::*;
     r.read_exact(buf).map_err(|e| match e.kind() {
         UnexpectedEof | ConnectionReset | ConnectionAborted => Error::msg(CLOSED),
         TimedOut | WouldBlock => Error::msg("connection timed out"),
         _ => e.into(),
     })
+}
+
+/// A socket with an absolute deadline: each read and write gets only the time that is left.
+/// The socket's own timeouts restart with every byte, so a peer trickling its handshake or
+/// first record could otherwise hold the other end (a host's pending slot, a viewer's
+/// connection attempt) for many minutes.
+pub struct Deadline<'a> {
+    pub s: &'a TcpStream,
+    pub until: Instant,
+}
+
+impl Deadline<'_> {
+    fn left(&self) -> std::io::Result<Duration> {
+        match self.until.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => Ok(d),
+            _ => Err(ErrorKind::TimedOut.into()),
+        }
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.s.set_read_timeout(Some(self.left()?))?;
+        let mut s = self.s;
+        s.read(buf)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.s.set_write_timeout(Some(self.left()?))?;
+        let mut s = self.s;
+        s.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct SessionKeys {
@@ -150,15 +190,27 @@ pub struct RecordWriter<W: Write> {
     aead: Aead,
     seq: u64,
     buf: Vec<u8>,
+    /// A write failed: the peer may have part of a record, and nothing after it would authenticate.
+    failed: bool,
 }
 
 impl<W: Write> RecordWriter<W> {
     pub fn new(w: W, aead: Aead) -> Self {
-        RecordWriter { w, aead, seq: 0, buf: Vec::new() }
+        RecordWriter { w, aead, seq: 0, buf: Vec::new(), failed: false }
     }
 
+    /// The same record stream, written through `w` from here on (see `RecordReader::with_reader`).
+    pub fn with_writer<S: Write>(self, w: S) -> RecordWriter<S> {
+        RecordWriter { w, aead: self.aead, seq: self.seq, buf: self.buf, failed: self.failed }
+    }
+
+    /// Encrypts and sends one record. Once a write has failed every later send fails at once:
+    /// what follows a record cut off would only make the peer fail authentication, as tampering.
     pub fn send(&mut self, msg: &[u8]) -> Result<()> {
         let total = msg.len() + TAG_LEN;
+        if self.failed {
+            bail!("an earlier send on this connection failed");
+        }
         if msg.is_empty() || total > MAX_RECORD {
             bail!("record size {} out of range", msg.len());
         }
@@ -172,8 +224,11 @@ impl<W: Write> RecordWriter<W> {
         let tag = self.aead.seal(&nonce(self.seq), &len, &mut self.buf[4..])?;
         self.seq += 1;
         self.buf.extend_from_slice(&tag);
+        // The sequence number stays used either way: a nonce is never sealed with twice.
+        self.failed = true;
         self.w.write_all(&self.buf)?;
         self.w.flush()?;
+        self.failed = false;
         // Large frame buffers would otherwise linger; keep a modest allocation around.
         if self.buf.capacity() > 4 << 20 {
             self.buf = Vec::new();
@@ -333,5 +388,49 @@ mod tests {
         assert_eq!(r.recv().unwrap(), b"hello");
         let mut r = r.with_reader(&wire[4 + 5 + TAG_LEN..]);
         assert_eq!(r.recv().unwrap(), &[7; 64]);
+    }
+
+    /// Takes `room` bytes, then fails every write (a connection that timed out or broke).
+    struct Breaks {
+        wire: Vec<u8>,
+        room: usize,
+    }
+
+    impl Write for Breaks {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.room);
+            if n == 0 {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.room -= n;
+            self.wire.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nothing_is_sent_after_a_record_cut_off() {
+        let key = [3u8; 32];
+        let mut w = RecordWriter::new(Breaks { wire: Vec::new(), room: 4 + 5 + TAG_LEN + 10 }, Aead::new(&key).unwrap());
+        w.send(b"first").unwrap();
+        assert!(w.send(&[1; 64]).is_err());
+        // The connection works again (a timeout that passed), but the peer has part of a record.
+        w.w.room = usize::MAX;
+        assert!(w.send(b"later").unwrap_err().to_string().contains("earlier send"));
+        let mut r = RecordReader::new(&w.w.wire[..], Aead::new(&key).unwrap());
+        assert_eq!(r.recv().unwrap(), b"first");
+        assert_eq!(w.w.wire.len(), 4 + 5 + TAG_LEN + 10);
+        // A stream moved to another writer keeps going where it was.
+        let mut wire = Vec::new();
+        let mut w = RecordWriter::new(&mut wire, Aead::new(&key).unwrap());
+        w.send(b"one").unwrap();
+        let mut more = Vec::new();
+        w.with_writer(&mut more).send(b"two").unwrap();
+        let both = [wire, more].concat();
+        let mut r = RecordReader::new(&both[..], Aead::new(&key).unwrap());
+        assert_eq!((r.recv().unwrap().to_vec(), r.recv().unwrap().to_vec()), (b"one".to_vec(), b"two".to_vec()));
     }
 }

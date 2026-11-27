@@ -6,7 +6,7 @@
 // Until the X11 viewer is implemented only the Windows viewer uses this module.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use crate::channel::{self, RecordReader, RecordWriter};
+use crate::channel::{self, Deadline, RecordReader, RecordWriter};
 use crate::codec::{Decoder, Rect};
 use crate::platform::mem::LockedBuf;
 use crate::proto::*;
@@ -82,6 +82,20 @@ pub const REFUSED: &str = "refused by the host: ";
 /// taken the place of the host that announced it): the next attempt should leave the instance out.
 pub const HELLO_UNANSWERED: &str = "the host closed the connection without answering the hello";
 
+/// How long the handshake and the host's first message may take in all, however slowly the
+/// host sends: its own deadline for the handshake and the hello, and as long again for the time
+/// it may wait for the session it replaces to let go of the screen.
+const FIRST_ANSWER: Duration = Duration::from_secs(20);
+/// Each read and write of a session may wait this long.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest first message from a host: its hello (with 255 monitors and a 255-byte name) or
+/// the notice that turns this viewer away.
+const MAX_FIRST: usize = {
+    let hello = 1 + 2 + 2 + 4 + 1 + 1 + 255 * 12 + 1 + 255;
+    let notice = 1 + 4096;
+    if hello > notice { hello } else { notice }
+};
+
 /// Largest remote screen accepted (64 Mpx, 256 MiB as BGRA), bounding what a host can make a
 /// viewer allocate and scan.
 pub const MAX_PIXELS: usize = 64 << 20;
@@ -139,15 +153,18 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
     }
     log!("connecting to {addr}...");
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let keys = channel::client_handshake(&mut &stream, &psk.0)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    greet(stream, addr, opts, psk, Instant::now() + FIRST_ANSWER)
+}
 
-    let mut reader = RecordReader::new(stream.try_clone()?, keys.recv);
-    let mut writer = RecordWriter::new(stream.try_clone()?, keys.send);
+/// Authenticates a connection and exchanges the hellos, by `until` however slowly the host
+/// sends. A first message longer than any the host may send is refused before anything is
+/// allocated for it.
+fn greet(stream: TcpStream, addr: SocketAddr, opts: &ViewerOptions, psk: &Secret<32>, until: Instant) -> Result<Connection> {
+    stream.set_nodelay(true)?;
+    let keys = channel::client_handshake(&mut Deadline { s: &stream, until }, &psk.0)?;
+
+    let mut reader = RecordReader::new(Deadline { s: &stream, until }, keys.recv);
+    let mut writer = RecordWriter::new(Deadline { s: &stream, until }, keys.send);
     let mut hello = Vec::new();
     let mut flags = 0;
     if opts.audio {
@@ -162,7 +179,7 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
     let instance = if opts.instance_in_hello { opts.instance } else { 0 };
     ClientMsg::Hello { downscale: opts.downscale, quality: opts.quality, monitor: opts.monitor, flags, instance }.encode(&mut hello);
     writer.send(&hello)?;
-    let first = reader.recv().map_err(|e| match e.to_string().as_str() {
+    let first = reader.recv_max(MAX_FIRST).map_err(|e| match e.to_string().as_str() {
         channel::CLOSED if instance != 0 => Error::msg(HELLO_UNANSWERED),
         _ => e,
     })?;
@@ -175,6 +192,16 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
         _ => bail!("unexpected first message from host"),
     };
     check_screen_size(width, height)?;
+    // Each of the session's reads and writes may wait `IO_TIMEOUT`, not what is left of the
+    // deadline: set on every handle (Windows keeps timeouts per handle, Linux per socket).
+    let session = |s: TcpStream| -> Result<TcpStream> {
+        s.set_read_timeout(Some(IO_TIMEOUT))?;
+        s.set_write_timeout(Some(IO_TIMEOUT))?;
+        Ok(s)
+    };
+    let reader = reader.with_reader(session(stream.try_clone()?)?);
+    let mut writer = writer.with_writer(session(stream.try_clone()?)?);
+    let stream = session(stream)?;
     if opts.instance != 0 && instance == 0 && flags & F_INSTANCE != 0 {
         let mut named = Vec::new();
         ClientMsg::Instance(opts.instance).encode(&mut named);
@@ -1043,6 +1070,59 @@ mod tests {
         // And a five-byte hello closed unanswered is an ordinary close.
         let (_, r) = exchange(F_FILES, |_| false, first());
         assert_eq!(r.unwrap_err().to_string(), channel::CLOSED);
+    }
+
+    /// A host for one connection that takes the viewer's hello, then announces a first record
+    /// as long as any may be, or (`trickle`) sends its hello a byte every 100 ms.
+    fn slow_host(trickle: bool) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let keys = channel::server_handshake(&mut s, &KEY).unwrap();
+            RecordReader::new(s.try_clone().unwrap(), keys.recv).recv().unwrap();
+            if !trickle {
+                s.write_all(&(channel::MAX_RECORD as u32).to_le_bytes()).unwrap();
+                // Until the viewer hangs up.
+                let _ = s.read(&mut [0u8; 1]);
+                return;
+            }
+            let (mut b, mut rec) = (Vec::new(), Vec::new());
+            ServerMsg::Hello { width: 64, height: 48, flags: 0, monitor: 0, monitors: vec![], name: "slow".into() }.encode(&mut b);
+            RecordWriter::new(&mut rec, keys.send).send(&b).unwrap();
+            for byte in rec {
+                if s.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        (addr, host)
+    }
+
+    #[test]
+    fn the_hosts_first_answer_is_due_by_a_deadline_and_no_longer_than_any() {
+        assert_eq!(MAX_FIRST, 1 + 4096);
+        // A first record announced as long as any record may be: refused as soon as its length
+        // is in, the 32 MiB neither waited for nor allocated.
+        let (addr, host) = slow_host(false);
+        let t = Instant::now();
+        let e = connect(&addr.to_string(), &ViewerOptions::default(), &Secret(KEY)).err().expect("a 32 MiB answer was waited for");
+        let e = e.to_string();
+        assert!(e.starts_with("invalid record length") && t.elapsed() < Duration::from_secs(2), "{e} after {:?}", t.elapsed());
+        host.join().unwrap();
+        // A hello trickled a byte at a time, never quiet for a read's timeout: cut off at the
+        // deadline, so a reconnect attempt cannot hang on it.
+        let (addr, host) = slow_host(true);
+        let stream = TcpStream::connect(addr).unwrap();
+        let t = Instant::now();
+        let r = greet(stream, addr, &ViewerOptions::default(), &Secret(KEY), t + Duration::from_millis(800));
+        let took = t.elapsed();
+        let e = r.err().expect("a trickled answer was taken").to_string();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(took >= Duration::from_millis(700) && took < Duration::from_secs(3), "{took:?}");
+        host.join().unwrap();
     }
 
     #[test]
