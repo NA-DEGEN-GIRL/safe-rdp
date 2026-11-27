@@ -1432,7 +1432,9 @@ fn as_user<T>(user: Option<&FileUser>, f: impl FnOnce() -> T) -> Result<T> {
 
 /// Refuses an upload of `size` bytes that would take `dir` beyond `max_bytes` or `max_files`,
 /// counting `arriving` bytes of the uploads still in progress (their parts are entries already).
+/// Parts a crash left behind are swept first: they would fill the folder for good otherwise.
 fn own_dir_room(dir: &Path, arriving: u64, size: u64, max_bytes: u64, max_files: usize) -> Result<()> {
+    files::remove_stale_parts(dir);
     let (bytes, entries) = files::dir_usage(dir)?;
     if entries >= max_files || bytes.saturating_add(arriving).saturating_add(size) > max_bytes {
         bail!(
@@ -1500,7 +1502,14 @@ fn send_files(paths: &[PathBuf], first_id: u32, user: &FileUser, out: &Out, ctl:
 
 fn send_file(path: &Path, id: u32, user: &FileUser, out: &Out, ctl: &SessionCtl, buf: &mut Vec<u8>) -> Result<()> {
     // Opened as the user; reading through the open handle needs no further rights.
-    let mut file = user.act(|| Outgoing::open(path, id))??;
+    let mut file = user.act(|| -> Result<Outgoing> {
+        let file = Outgoing::open(path, id)?;
+        #[cfg(windows)]
+        if !clipboard::opened_locally(file.file()) {
+            bail!("{} is not on a local drive", path.display());
+        }
+        Ok(file)
+    })??;
     let (name, size) = (file.name.clone(), file.size);
     log!("sending file {name} ({size} bytes)");
     out.send_bulk(&ServerMsg::FileBegin { id, size, name })?;
@@ -2160,6 +2169,14 @@ mod tests {
         std::fs::create_dir(dir.join("c")).unwrap();
         assert!(own_dir_room(&dir, 0, 0, 100, 3).is_err());
         own_dir_room(&dir, 0, 0, 100, 4).unwrap();
+        // A part a crash left behind days ago does not count: it is swept first.
+        let stale = dir.join(".srdp-00112233445566ff.part");
+        let mut f = std::fs::File::create(&stale).unwrap();
+        f.write_all(&[0u8; 60]).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600)).unwrap();
+        drop(f);
+        own_dir_room(&dir, 0, 50, 100, 4).unwrap();
+        assert!(!stale.exists());
         assert!(own_dir_room(&dir.join("missing"), 0, 0, 100, 4).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

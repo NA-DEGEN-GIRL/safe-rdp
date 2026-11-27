@@ -65,29 +65,105 @@ pub fn transfer_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// First of `name`, `stem (1).ext`, `stem (2).ext`, ... that does not exist in `dir`; the stem
-/// is shortened where needed to keep the name within `MAX_FILE_NAME` bytes.
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
-    }
+/// The names a file `name` may get in `dir`, in order: `name`, `stem (1).ext`, `stem (2).ext`,
+/// ...; the stem is shortened where needed to keep the name within `MAX_FILE_NAME` bytes.
+fn candidates<'a>(dir: &'a Path, name: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 && name.len() - i <= 32 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
-    (1..)
-        .map(|n| {
-            let suffix = format!(" ({n}){ext}");
-            let keep = stem.floor_char_boundary(MAX_FILE_NAME.saturating_sub(suffix.len()));
-            dir.join(format!("{}{suffix}", &stem[..keep]))
-        })
-        .find(|p| !p.exists())
-        .unwrap()
+    let numbered = (1..).map(move |n| {
+        let suffix = format!(" ({n}){ext}");
+        let keep = stem.floor_char_boundary(MAX_FILE_NAME.saturating_sub(suffix.len()));
+        dir.join(format!("{}{suffix}", &stem[..keep]))
+    });
+    std::iter::once(dir.join(name)).chain(numbered)
+}
+
+/// Renames a finished part that lost the race for a name at most this often before giving up.
+const RENAME_TRIES: u32 = 16;
+
+/// Whether a failed `rename_new` found its name taken, by something that appeared after the
+/// name looked free (Windows: also a file still being deleted, which the check cannot see).
+fn name_taken(e: &std::io::Error) -> bool {
+    /// ERROR_ACCESS_DENIED.
+    const ACCESS_DENIED: i32 = 5;
+    e.kind() == std::io::ErrorKind::AlreadyExists || (cfg!(windows) && e.raw_os_error() == Some(ACCESS_DENIED))
+}
+
+/// Gives the open part `f` the name of `dest` unless something of that name exists in its folder
+/// (an `AlreadyExists` error then): atomically, so a file saved under that name meanwhile (another
+/// transfer of the same name) is never replaced. Through the handle, which renames the file the
+/// transfer wrote, within the folder it is in whatever its path leads to by now.
+#[cfg(windows)]
+fn rename_new(f: &File, _part: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(file: HANDLE, io: *mut IO_STATUS_BLOCK, info: *const c_void, len: u32, class: i32) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    /// FILE_INFORMATION_CLASS FileRenameInformation.
+    const FILE_RENAME_INFORMATION: i32 = 10;
+    // Just the name, no RootDirectory: a rename within the same folder. (SetFileInformationByHandle
+    // would take the name relative to the current directory.)
+    let name: Vec<u16> = dest.file_name().unwrap_or_default().encode_wide().collect();
+    // FILE_RENAME_INFORMATION (the layout of FILE_RENAME_INFO) with the name in place of FileName;
+    // u64s keep it aligned.
+    let len = size_of::<FILE_RENAME_INFO>() + 2 * name.len();
+    let mut buf = vec![0u64; len.div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // Zeroed: ReplaceIfExists is false, RootDirectory null.
+    unsafe {
+        (*info).FileNameLength = (2 * name.len()) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast::<u16>(), name.len());
+    }
+    let mut io: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let (h, info) = (f.as_raw_handle() as HANDLE, buf.as_ptr() as *const c_void);
+    let status = unsafe { NtSetInformationFile(h, &mut io, info, len as u32, FILE_RENAME_INFORMATION) };
+    if status < 0 {
+        // STATUS_OBJECT_NAME_COLLISION becomes ERROR_ALREADY_EXISTS.
+        return Err(std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+    }
+    Ok(())
+}
+
+/// Linux: `renameat2(RENAME_NOREPLACE)`, by path (the part's handle cannot be renamed). Called
+/// through `syscall`: glibc has a wrapper only since 2.28, musl since 1.2.5. Kernels before 3.15
+/// and filesystems without it fall back to a plain rename, which the name was just found free for.
+#[cfg(not(windows))]
+fn rename_new(_f: &File, part: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::{CString, c_long, c_ulong};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn syscall(num: c_long, ...) -> c_long;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const SYS_RENAMEAT2: c_long = 316;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    const SYS_RENAMEAT2: c_long = 276;
+    const AT_FDCWD: c_long = -100;
+    const RENAME_NOREPLACE: c_ulong = 1;
+    const EINVAL: i32 = 22;
+    const ENOSYS: i32 = 38;
+    let (from, to) = (CString::new(part.as_os_str().as_bytes())?, CString::new(dest.as_os_str().as_bytes())?);
+    if unsafe { syscall(SYS_RENAMEAT2, AT_FDCWD, from.as_ptr(), AT_FDCWD, to.as_ptr(), RENAME_NOREPLACE) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(EINVAL | ENOSYS) => std::fs::rename(part, dest),
+        _ => Err(e),
+    }
 }
 
 /// Deletes partial files in `dir` that no transfer has written to for `STALE_PART`.
-fn remove_stale_parts(dir: &Path) {
+pub fn remove_stale_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
@@ -359,19 +435,33 @@ impl Incoming {
         if !crate::crypto::ct_eq(&hash, sha256) {
             bail!("{}: checksum mismatch", self.name);
         }
-        let mut file = self.file.take().unwrap();
+        // The part stays open until it has its name: anything failing before leaves it to `Drop`.
+        let file = self.file.as_mut().unwrap();
         file.flush()?;
         file.sync_all()?;
-        drop(file);
         // The checksum covers the bytes as they arrived, not the file: one that was cut short or
-        // removed (and the rename then fails) since is not published.
-        let meta = std::fs::symlink_metadata(&self.part)?;
+        // removed (and the rename then fails) since is not published. Windows renames the file
+        // the handle holds, elsewhere whatever is at the part's path.
+        let meta = if cfg!(windows) { file.metadata()? } else { std::fs::symlink_metadata(&self.part)? };
         if !meta.is_file() || meta.len() != self.size {
             bail!("{}: the partial file was changed by another program", self.name);
         }
-        let dest = unique_path(&self.dir, &self.name);
-        std::fs::rename(&self.part, &dest)?;
-        Ok(dest)
+        let mut lost = 0;
+        for dest in candidates(&self.dir, &self.name) {
+            // Anything of the name is taken, a link to nothing as well (renaming would replace it).
+            if std::fs::symlink_metadata(&dest).is_ok() {
+                continue;
+            }
+            match rename_new(file, &self.part, &dest) {
+                Ok(()) => {
+                    drop(self.file.take());
+                    return Ok(dest);
+                }
+                Err(e) if name_taken(&e) && lost < RENAME_TRIES => lost += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("the names to try never run out")
     }
 }
 
@@ -438,7 +528,25 @@ pub struct Outgoing {
 
 impl Outgoing {
     pub fn open(path: &Path, id: u32) -> Result<Outgoing> {
-        let meta = std::fs::metadata(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        // Opened before it is looked at, and looked at through the handle: what is checked is
+        // what gets sent, whatever was put at the path. A FIFO there does not block the open
+        // (and is then refused); regular files ignore the flag.
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            /// The same on x86_64, aarch64 and riscv64.
+            const O_NONBLOCK: i32 = 0o4000;
+            options.custom_flags(O_NONBLOCK);
+        }
+        let file = match options.open(path) {
+            Ok(f) => f,
+            // Windows does not open folders as files.
+            Err(_) if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) => bail!("{} is not a regular file", path.display()),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
         if !meta.is_file() {
             bail!("{} is not a regular file", path.display());
         }
@@ -449,7 +557,13 @@ impl Outgoing {
         if !valid_file_name(&name) {
             bail!("unsupported file name: {}", path.display());
         }
-        Ok(Outgoing { id, name, size: meta.len(), file: File::open(path)?, sent: 0, hash: Sha256::new() })
+        Ok(Outgoing { id, name, size: meta.len(), file, sent: 0, hash: Sha256::new() })
+    }
+
+    /// The open file, for checks made through its handle.
+    #[cfg(windows)]
+    pub fn file(&self) -> &File {
+        &self.file
     }
 
     #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows UI
@@ -640,6 +754,96 @@ mod tests {
             }
             Err(_) => assert!(names(&dir).is_empty()),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_taken_meanwhile_is_never_replaced() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
+        let dir = tmpdir("taken");
+        // Saved after `finish` found the name free, just before the rename.
+        let mut inc = Incoming::begin(&dir, 1, 3, "a.txt").unwrap();
+        inc.write(b"new").unwrap();
+        std::fs::write(dir.join("a.txt"), b"first").unwrap();
+        std::fs::create_dir(dir.join("b.txt")).unwrap();
+        for dest in [dir.join("a.txt"), dir.join("b.txt")] {
+            let e = rename_new(inc.file.as_ref().unwrap(), &inc.part, &dest).unwrap_err();
+            assert!(name_taken(&e), "{e}");
+        }
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"first");
+        assert!(dir.join("b.txt").is_dir());
+        assert_eq!(inc.finish(&crate::crypto::sha256(&[b"new"])).unwrap().file_name().unwrap(), "a (1).txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_to_nothing_is_not_replaced() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
+        let dir = tmpdir("dangling");
+        let link = dir.join("x.txt");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(dir.join("missing"), &link).is_ok();
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(dir.join("missing"), &link).is_ok();
+        // Windows makes links only with Developer Mode on or as an administrator.
+        if !made {
+            crate::log!("link test skipped: symbolic links cannot be created here");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(receive(&dir, 1, "x.txt", b"data").file_name().unwrap(), "x (1).txt");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(names(&dir), ["x (1).txt", "x.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_names_finishing_at_once_all_arrive() {
+        if !room_for_tests(Reserve::Ordinary) {
+            return;
+        }
+        const N: u8 = 6;
+        let dir = tmpdir("race");
+        let ready = std::sync::Barrier::new(N as usize);
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let (dir, ready) = (&dir, &ready);
+                s.spawn(move || {
+                    let mut inc = Incoming::begin(dir, i as u32, 1, "same.bin").unwrap();
+                    inc.write(&[i]).unwrap();
+                    ready.wait();
+                    inc.finish(&crate::crypto::sha256(&[&[i]])).unwrap();
+                });
+            }
+        });
+        let mut got: Vec<u8> = names(&dir).iter().map(|n| std::fs::read(dir.join(n)).unwrap()[0]).collect();
+        got.sort();
+        assert_eq!(got, (0..N).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_fifo_is_refused_without_waiting() {
+        use std::ffi::{c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn mkfifo(path: *const c_char, mode: u32) -> c_int;
+        }
+        let dir = tmpdir("fifo");
+        let fifo = dir.join("pipe.bin");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Nobody writes to it: an open that waited for a writer would never return.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || tx.send(Outgoing::open(&p, 1).map(|_| ()).map_err(|e| e.to_string())));
+        let e = rx.recv_timeout(Duration::from_secs(10)).expect("opening a FIFO blocked").unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -391,6 +391,25 @@ fn local_drive(d: u8) -> bool {
     matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_CDROM | DRIVE_RAMDISK)
 }
 
+/// Whether the open file `f` is on a local drive, by the path its handle resolves to: a folder
+/// on the way to a file `copied_files` found local may lead to a network share by now.
+pub fn opened_locally(f: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 260];
+    loop {
+        // Characters without the NUL, or if `buf` is too small the size needed with it.
+        let n = unsafe { GetFinalPathNameByHandleW(f.as_raw_handle() as HANDLE, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+        if n == 0 || n > 32768 {
+            return false;
+        }
+        if n < buf.len() {
+            return drive_letter(Path::new(&OsString::from_wide(&buf[..n])), true).is_some_and(local_drive);
+        }
+        buf.resize(n, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +499,17 @@ mod tests {
         }
         let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         assert!(drive_letter(&temp, true).is_some_and(local_drive));
+        // An open file is looked up by its handle, beyond MAX_PATH too.
+        let mut r = [0u8; 8];
+        crate::crypto::random(&mut r).unwrap();
+        let top = temp.join(format!("srdp-local-{}", crate::util::hex_encode(&r)));
+        let deep = top.join("d".repeat(120)).join("e".repeat(120)).join("f".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        for p in [top.join("a.txt"), deep.join("b.txt")] {
+            std::fs::write(&p, b"x").unwrap();
+            assert!(opened_locally(&std::fs::File::open(&p).unwrap()), "{}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]
