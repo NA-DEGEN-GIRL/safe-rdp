@@ -52,10 +52,11 @@ pub fn resolve(sel: MonitorSel) -> Option<Area> {
     (a.width > 0 && a.height > 0 && a.width <= 0xffff && a.height <= 0xffff).then_some(a)
 }
 
-/// GDI fallback: copies one screen area into a page-locked DIB section.
+/// GDI fallback: copies one screen area into a page-locked DIB section. The screen's DC is
+/// taken for each capture only: one kept would belong to the desktop it came from, not to the
+/// one the capture thread follows.
 pub struct GdiCapture {
     pub area: Area,
-    screen: HDC,
     mem: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
@@ -83,20 +84,21 @@ impl GdiCapture {
             };
             let mut bits = null_mut();
             let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if mem.is_null() || bmp.is_null() || bits.is_null() {
+            let e = (mem.is_null() || bmp.is_null() || bits.is_null()).then(|| Error::last_os("CreateDIBSection"));
+            ReleaseDC(null_mut(), screen);
+            if let Some(e) = e {
                 if !bmp.is_null() {
                     DeleteObject(bmp);
                 }
                 if !mem.is_null() {
                     DeleteDC(mem);
                 }
-                ReleaseDC(null_mut(), screen);
-                return Err(Error::last_os("CreateDIBSection"));
+                return Err(e);
             }
             let old = SelectObject(mem, bmp);
             let len = area.width as usize * area.height as usize * 4;
             lock_pages(bits as *const u8, len);
-            Ok(GdiCapture { area, screen, mem, bmp, old, bits: bits as *mut u8, len })
+            Ok(GdiCapture { area, mem, bmp, old, bits: bits as *mut u8, len })
         }
     }
 
@@ -104,8 +106,15 @@ impl GdiCapture {
     pub fn capture(&mut self) -> Result<&[u8]> {
         let a = self.area;
         unsafe {
-            if BitBlt(self.mem, 0, 0, a.width, a.height, self.screen, a.left, a.top, SRCCOPY | CAPTUREBLT) == 0 {
-                return Err(Error::last_os("BitBlt"));
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                return Err(Error::last_os("GetDC"));
+            }
+            let failed = BitBlt(self.mem, 0, 0, a.width, a.height, screen, a.left, a.top, SRCCOPY | CAPTUREBLT) == 0;
+            let e = failed.then(|| Error::last_os("BitBlt"));
+            ReleaseDC(null_mut(), screen);
+            if let Some(e) = e {
+                return Err(e);
             }
             GdiFlush();
             Ok(std::slice::from_raw_parts(self.bits, self.len))
@@ -120,7 +129,6 @@ impl Drop for GdiCapture {
             SelectObject(self.mem, self.old);
             DeleteObject(self.bmp);
             DeleteDC(self.mem);
-            ReleaseDC(null_mut(), self.screen);
         }
     }
 }

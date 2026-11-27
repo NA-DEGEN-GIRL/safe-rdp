@@ -396,24 +396,36 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
             exit_with(EXIT_NOT_STOPPED, NOT_STOPPED);
         }
     }
+    // Run from Program Files so that only administrators can replace the SYSTEM binary. Copied
+    // before the key or its fingerprint change: when this fails (the copy there is still open,
+    // say), the service keeps its key and its fingerprint.
+    let pf = std::env::var_os("ProgramFiles").ok_or("%ProgramFiles% is not set")?;
+    let dir = std::path::Path::new(&pf).join("safe-rdp");
+    std::fs::create_dir_all(&dir)?;
+    let exe = dir.join("safe-rdp.exe");
+    let me = std::env::current_exe()?;
+    if !same_file(&me, &exe)
+        && let Err(e) = std::fs::copy(&me, &exe)
+    {
+        // Back to how it was, as far as that goes.
+        let note = match open_service(&scm) {
+            None => "",
+            Some(svc) if unsafe { StartServiceW(svc.0, 0, null()) } != 0 => "; the service runs again with the key it had",
+            Some(_) => "; the service keeps the key it had, but is stopped",
+        };
+        bail!("cannot copy to {}: {e}; nothing was replaced{note}", exe.display());
+    }
+    if let Err(e) = keystore::secure_program_dir(&dir) {
+        log!("warning: {e}");
+    }
+    let exe_str = exe.to_string_lossy().to_string();
+
     // The old fingerprint goes before the key it names: a recorded one is never wrong, at worst
     // missing.
     delete_fingerprint(HKEY_LOCAL_MACHINE, PARAMETERS_KEY)?;
 
     let key_path = keystore::save_service_key(&key)?;
     log!("service key stored in {} (SYSTEM/Administrators only)", key_path.display());
-
-    // Run from Program Files so that only administrators can replace the SYSTEM binary.
-    let pf = std::env::var_os("ProgramFiles").ok_or("%ProgramFiles% is not set")?;
-    let dir = std::path::Path::new(&pf).join("safe-rdp");
-    std::fs::create_dir_all(&dir)?;
-    let exe = dir.join("safe-rdp.exe");
-    let me = std::env::current_exe()?;
-    if !same_file(&me, &exe) {
-        std::fs::copy(&me, &exe).map_err(|e| format!("cannot copy to {}: {e}", exe.display()))?;
-    }
-    keystore::restrict_to_admins(&dir).ok();
-    let exe_str = exe.to_string_lossy().to_string();
 
     let mut parts = vec![exe_str.clone(), "service".to_string(), "run".to_string()];
     parts.extend(host_args.iter().cloned());
@@ -712,7 +724,12 @@ impl Agent {
             return true;
         }
         log!("agent did not stop within {ms} ms; terminating it");
-        unsafe { TerminateProcess(self.process, 1) };
+        // TerminateProcess only starts that: until the process has ended its executable stays
+        // in use, and `service install` could not replace it.
+        unsafe {
+            TerminateProcess(self.process, 1);
+            WaitForSingleObject(self.process, 2000);
+        }
         false
     }
 }
