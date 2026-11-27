@@ -1,0 +1,11 @@
+[package]
+name = "safe-rdp-android"
+version = "0.1.0"
+edition = "2024"
+description = "safe-rdp viewer for Android: the native part of the app"
+license = "MIT"
+publish = false
+
+[lib]
+name = "saferdp"
+crate-type = ["cdylib"]

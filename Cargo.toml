@@ -6,6 +6,12 @@ description = "Minimal, hardened remote desktop for Windows and Linux over Tails
 license = "MIT"
 repository = "https://github.com/NA-DEGEN-GIRL/safe-rdp"
 
+[workspace]
+members = [".", "android/native"]
+# `cargo build`/`test` here mean the desktop program; the Android library is built by
+# android/build.ps1 (or build.sh) for its targets.
+default-members = ["."]
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61.2"
 features = [

@@ -109,6 +109,39 @@ loongarch) stop with a compile error until their system constants have been chec
 
 Linux hosts have no privacy screen, no Ctrl+Alt+Del and no "Get copied files" (uploads work).
 
+## Android (viewer)
+
+An Android 13+ app (arm64; x86_64 for emulators) to view and control a host from a phone or tablet over Tailscale. The
+session runs on the same Rust code as the desktop viewers (`android/native`, a library built from the shared modules); a thin
+Java shell on the platform's APIs alone hosts the views, so the APK contains no third-party code. It is built without Gradle:
+
+```powershell
+android\build.ps1            # debug APK for arm64-v8a and x86_64: android\build\debug\safe-rdp.apk
+android\build.ps1 -Release   # R8-optimised, signed with the keystore in $env:SAFERDP_KEYSTORE
+```
+
+(`android/build.sh` on Linux and macOS-like shells; needs the Android SDK with platform 36, the NDK, a JDK and the Rust targets
+`aarch64-linux-android`, `x86_64-linux-android`.)
+
+- **Tailscale**: the official Tailscale app must be connected. Hosts are added by MagicDNS name or Tailscale address.
+- **Keys** live in the Android Keystore as HMAC keys that cannot be exported (in the TEE or StrongBox where the phone has one).
+  The protocol only ever uses the pre-shared key as an HMAC key, so the handshake asks the Keystore for those HMACs and the key
+  never returns to the app's memory. Import it with **Import from clipboard** (the clipboard is cleared afterwards; the key never
+  passes through a keyboard app) or **Scan QR code** after `safe-rdp key qr` on the other machine (the code is cleared from the
+  terminal and its scrollback when you press Enter). Optionally a key needs the screen unlock or a fingerprint before connecting
+  (for 5 minutes, so reconnects do not ask again).
+- **Crypto** comes from the platform's provider (Conscrypt), since the NDK has none; on-device self-test (menu → Self-test)
+  checks it against the same NIST and cross-backend vectors as CNG and OpenSSL.
+- **Screen**: OpenGL ES 3 with only changed regions uploaded; pinch to zoom, two fingers to scroll. Touch works as a trackpad
+  (tap = click, long press then drag = drag, two-finger tap = right click) or as direct touch. A mouse and a hardware keyboard
+  work as on a PC. Screenshots, recordings, casting and the recent-apps preview show black unless allowed in the menu.
+- **Keyboard**: the app's own PC keyboard (Esc, Tab, Ctrl/Alt/Win that stick, F-keys, arrows, 한/영, 한자) sends keys by
+  position, so the host's layout and input method decide the characters, Hangul included. The system keyboard is never used:
+  nothing typed goes through a keyboard app. Text from a keyboard app (swipe, voice) does not reach the host; use the clipboard.
+- **Lifecycle**: leaving the app pauses the session (the host stops sending frames); it ends after 30 s away, at once when the
+  screen turns off. Lost connections reconnect as in the Windows viewer.
+- Not yet: file transfer.
+
 ## Features
 
 | Feature | Description |
@@ -362,6 +395,12 @@ src/
                   viewer + toolbar (connection bar), launcher (GUI)
     linux/        x11 (X11 protocol spoken directly over the socket), capture (MIT-SHM), input (XTEST), clipboard, keymap,
                   viewer, xvfb (virtual display), audio (PipeWire), keystore
+  crypto/jca.rs   Android backend (the platform's Java crypto provider through JNI)
+  qr.rs           QR encoder (`key qr`) and camera-frame decoder (the app)
+android/
+  native/         the app's library: JNI (declared by hand), session, OpenGL ES renderer, touch gestures, AAudio
+  app/            Java shell (framework APIs only), manifest, resources
+  build.ps1/.sh   aapt2 + javac + d8/R8 + zipalign + apksigner, no Gradle
 ```
 
 Flow control: while two or more frames are unacknowledged, the host does not produce the next frame and
@@ -415,6 +454,10 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
   - Linux probe and X11 viewer → Windows host (DXGI): all three quality modes, scaling, monitor switching, view-only policy rejections,
     uploads (SHA-256 match, Mark of the Web verified), and an attack that drags out the handshake one byte at a time being cut off at the deadline
   - Linux virtual display host: when the session program ends, the host stops and no Xvfb process or cookie is left behind
+- Android app on an emulator (Android 15, x86_64) → Linux virtual display host: crypto self-test (NIST and cross-backend
+  vectors through Conscrypt), handshake with a Keystore key, drawing, typing from a hardware keyboard, the app's keyboard,
+  rotation, pausing in the background, reconnecting after a host restart; 41 unit tests of the app's gesture, view and key logic
+  run on the desktop. A real phone (TEE/StrongBox keys, camera QR scan, sound) is not tried yet
 - **Not tried for real yet**: service mode (needs administrator rights), turning the privacy screen on with a real monitor,
   listening to the sound, multiple monitors and HDR displays, a host on a real GNOME/Xorg desktop.
 

@@ -5,11 +5,11 @@
 // Until the X11 viewer is implemented only the Windows viewer uses this module.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use crate::channel::{self, Deadline, RecordReader, RecordWriter};
+use crate::channel::{self, Deadline, Psk, RecordReader, RecordWriter};
 use crate::codec::{Decoder, Rect};
 use crate::platform::mem::LockedBuf;
 use crate::proto::*;
-use crate::util::{Error, Result, Secret};
+use crate::util::{Error, Result};
 use crate::{bail, log};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -145,7 +145,7 @@ pub fn resolve(target: &str) -> Result<SocketAddr> {
         .ok_or_else(|| Error::msg(format!("{target} has no addresses")))
 }
 
-pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<Connection> {
+pub fn connect<P: Psk + ?Sized>(target: &str, opts: &ViewerOptions, psk: &P) -> Result<Connection> {
     let addr = resolve(target)?;
     if !crate::net::is_tailscale(addr.ip()) && !addr.ip().is_loopback() {
         log!("warning: {addr} is not a Tailscale address; traffic is still end-to-end encrypted");
@@ -158,9 +158,9 @@ pub fn connect(target: &str, opts: &ViewerOptions, psk: &Secret<32>) -> Result<C
 /// Authenticates a connection and exchanges the hellos, by `until` however slowly the host
 /// sends. A first message longer than any the host may send is refused before anything is
 /// allocated for it.
-fn greet(stream: TcpStream, addr: SocketAddr, opts: &ViewerOptions, psk: &Secret<32>, until: Instant) -> Result<Connection> {
+fn greet<P: Psk + ?Sized>(stream: TcpStream, addr: SocketAddr, opts: &ViewerOptions, psk: &P, until: Instant) -> Result<Connection> {
     stream.set_nodelay(true)?;
-    let keys = channel::client_handshake(&mut Deadline { s: &stream, until }, &psk.0)?;
+    let keys = channel::client_handshake(&mut Deadline { s: &stream, until }, psk)?;
 
     let mut reader = RecordReader::new(Deadline { s: &stream, until }, keys.recv);
     let mut writer = RecordWriter::new(Deadline { s: &stream, until }, keys.send);
@@ -653,6 +653,7 @@ pub fn percent(done: u64, total: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::Secret;
     use std::sync::Arc;
 
     #[test]

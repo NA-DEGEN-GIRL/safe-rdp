@@ -1,8 +1,10 @@
 //! Cryptographic primitives.
 //!
 //! Every primitive comes from the operating system's vetted implementation: Windows CNG
-//! (bcrypt.dll, FIPS-validated) or the system OpenSSL libcrypto on Linux (loaded at run time).
-//! Only HKDF, a few HMAC calls, is composed here. Both backends expose the same API:
+//! (bcrypt.dll, FIPS-validated), the system OpenSSL libcrypto on Linux (loaded at run time), or
+//! on Android the platform's Java crypto provider (Conscrypt, BoringSSL inside), reached through
+//! JNI since the NDK offers no crypto library. Only HKDF, a few HMAC calls, is composed here.
+//! The backends expose the same API:
 //!
 //! * `random`, `sha256`, `hmac_sha256`, `Sha256` (incremental)
 //! * `EcdhKey` (P-256; `agree` returns the big-endian X coordinate, as in SEC 1)
@@ -19,6 +21,12 @@ pub use cng::*;
 mod openssl;
 #[cfg(target_os = "linux")]
 pub use openssl::*;
+
+/// Built only into the Android app (`android/native`), whose JNI layer it calls.
+#[cfg(target_os = "android")]
+mod jca;
+#[cfg(target_os = "android")]
+pub use jca::*;
 
 /// Uncompressed P-256 public point without the 0x04 prefix: X || Y, big-endian.
 pub const PUBKEY_LEN: usize = 64;
@@ -325,7 +333,13 @@ mod tests {
         use std::time::{Duration, Instant};
 
         const PSK: [u8; 32] = [0x5a; 32];
-        const BACKEND: &str = if cfg!(windows) { "CNG" } else { "OpenSSL" };
+        const BACKEND: &str = if cfg!(windows) {
+            "CNG"
+        } else if cfg!(target_os = "android") {
+            "JCA"
+        } else {
+            "OpenSSL"
+        };
         const PAYLOAD_LEN: usize = 100_000;
         const TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -12,6 +12,9 @@ mod net;
 mod platform;
 mod probe;
 mod proto;
+/// The key as a QR code for the Android app (`key qr`); the app uses the decoder.
+#[allow(dead_code)]
+mod qr;
 mod screen;
 mod tailscale;
 mod util;
@@ -33,6 +36,7 @@ USAGE:
   safe-rdp keygen [--force]          Create a new key, store it for this user, print it once
   safe-rdp key import                Store a key (paste it at the prompt) for this user
   safe-rdp key show                  Print the stored key (to set up the other machine)
+  safe-rdp key qr                    Show the stored key as a QR code for the Android app
   safe-rdp key forget                Delete the stored key
 
   safe-rdp host [HOST OPTIONS]       Share this screen (runs in the current session)
@@ -645,6 +649,10 @@ fn key_cmd(args: &[String]) -> Result<()> {
             println!("{}", keys::format_key(&keystore::load_user_key()?));
             Ok(())
         }
+        Some("qr") => {
+            no_args(&args[1..])?;
+            show_key_qr(&keystore::load_user_key()?)
+        }
         Some("forget") => {
             no_args(&args[1..])?;
             #[cfg(windows)]
@@ -659,8 +667,34 @@ fn key_cmd(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        _ => bail!("usage: safe-rdp key import|show|forget"),
+        _ => bail!("usage: safe-rdp key import|show|qr|forget"),
     }
+}
+
+/// Shows the key as a QR code for the Android app to scan, until Enter is pressed; then clears
+/// the screen and the terminal's scrollback.
+fn show_key_qr(k: &Secret<32>) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdout().is_terminal() {
+        bail!("`key qr` draws on a terminal only (the code is the key: it must not go to a file or a pipe)");
+    }
+    #[cfg(windows)]
+    platform::enable_terminal_colors();
+    let mut text = keys::format_key(k);
+    let code = qr::encode(text.as_bytes(), qr::Ecc::M);
+    unsafe { util::wipe(text.as_bytes_mut()) };
+    let mut drawing = code?.to_terminal();
+    let mut out = std::io::stdout();
+    write!(out, "\n{drawing}\nScan it in the safe-rdp app (Keys > Scan QR code), then press Enter to clear the screen.")?;
+    out.flush()?;
+    unsafe { util::wipe(drawing.as_bytes_mut()) };
+    let mut line = String::new();
+    let r = std::io::stdin().read_line(&mut line);
+    // Clear the screen, the scrollback (where terminals support it) and go home.
+    write!(out, "\x1b[2J\x1b[3J\x1b[H")?;
+    out.flush()?;
+    r?;
+    Ok(())
 }
 
 fn bench(args: &[String]) -> Result<()> {

@@ -82,6 +82,9 @@ pub fn log_line(msg: &str) {
     let [y, mo, d, h, mi, s] = crate::platform::local_time();
     let line = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} {msg}\n");
     let _ = std::io::stderr().write_all(line.as_bytes());
+    // An app's stderr goes nowhere: the app keeps the lines to show them.
+    #[cfg(target_os = "android")]
+    crate::platform::log(&line);
     if let Some(f) = LOG_FILE.get() {
         f.lock().unwrap_or_else(PoisonError::into_inner).write(line.as_bytes());
     }

@@ -1376,7 +1376,7 @@ impl Ui {
         rc.in_flight = Some(id);
         rc.due = None;
         let spawned = std::thread::Builder::new().name("reconnect".into()).spawn(move || {
-            let result = core::connect(&target, &opts, &psk);
+            let result = core::connect(&target, &opts, &*psk);
             APP.get().unwrap().post(Event::Attempt { id, result });
         });
         if spawned.is_err() {

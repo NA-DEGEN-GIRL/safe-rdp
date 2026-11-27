@@ -116,10 +116,30 @@ fn parse_hello(h: &[u8; HELLO_LEN]) -> Result<[u8; PUBKEY_LEN]> {
     Ok(pk)
 }
 
-fn derive(psk: &[u8; 32], eph: &EcdhKey, peer_pub: &[u8; PUBKEY_LEN], ch: &[u8], sh: &[u8]) -> Result<Derived> {
+/// The pre-shared key as the handshake uses it: only ever as the HKDF-Extract salt, that is as
+/// an HMAC-SHA256 key. So a key that never leaves a hardware key store (Android Keystore) serves
+/// as well as the key's bytes.
+pub trait Psk {
+    /// HKDF-Extract(salt = the key, `ikm`).
+    fn extract(&self, ikm: &[u8]) -> Result<Secret<32>>;
+}
+
+impl Psk for [u8; 32] {
+    fn extract(&self, ikm: &[u8]) -> Result<Secret<32>> {
+        Ok(crypto::hkdf_extract(self, ikm))
+    }
+}
+
+impl Psk for Secret<32> {
+    fn extract(&self, ikm: &[u8]) -> Result<Secret<32>> {
+        self.0.extract(ikm)
+    }
+}
+
+fn derive<P: Psk + ?Sized>(psk: &P, eph: &EcdhKey, peer_pub: &[u8; PUBKEY_LEN], ch: &[u8], sh: &[u8]) -> Result<Derived> {
     let shared = eph.agree(peer_pub)?;
     let th = crypto::sha256(&[TRANSCRIPT_LABEL, ch, sh]);
-    let prk = crypto::hkdf_extract(psk, &shared.0);
+    let prk = psk.extract(&shared.0)?;
     let mut okm = Secret::<128>::zero();
     crypto::hkdf_expand(&prk.0, &[KEYS_LABEL, &th], &mut okm.0);
     let take = |i: usize| {
@@ -130,7 +150,7 @@ fn derive(psk: &[u8; 32], eph: &EcdhKey, peer_pub: &[u8; PUBKEY_LEN], ch: &[u8],
     Ok(Derived { c2s: take(0), s2c: take(1), server_confirm: take(2), client_confirm: take(3) })
 }
 
-pub fn client_handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32]) -> Result<SessionKeys> {
+pub fn client_handshake<S: Read + Write, P: Psk + ?Sized>(s: &mut S, psk: &P) -> Result<SessionKeys> {
     let eph = EcdhKey::generate()?;
     let mut nonce = [0u8; 32];
     crypto::random(&mut nonce)?;

@@ -103,6 +103,38 @@ Ctrl+Shift+Esc, Alt+Shift+Tab, Ctrl+Win+화살표도 로컬에서 동작합니�
 
 Linux 호스트에는 화면 가리기, Ctrl+Alt+Del, "복사한 파일 받기"가 없습니다(업로드는 됨).
 
+## Android (뷰어)
+
+휴대폰·태블릿에서 Tailscale로 호스트를 보고 조작하는 Android 13 이상용 앱입니다(arm64, 에뮬레이터용 x86_64). 세션은 데스크톱
+뷰어와 같은 Rust 코드로 돌고(`android/native`, 공유 모듈로 만든 라이브러리), 화면만 맡는 얇은 Java 껍데기는 플랫폼 API만 써서
+APK에 서드파티 코드가 없습니다. Gradle 없이 빌드합니다:
+
+```powershell
+android\build.ps1            # arm64-v8a와 x86_64 디버그 APK: android\build\debug\safe-rdp.apk
+android\build.ps1 -Release   # R8 최적화, $env:SAFERDP_KEYSTORE의 키로 서명
+```
+
+(Linux 등에서는 `android/build.sh`. Android SDK(platform 36), NDK, JDK, Rust 타깃 `aarch64-linux-android`,
+`x86_64-linux-android`가 필요합니다.)
+
+- **Tailscale**: 공식 Tailscale 앱이 연결되어 있어야 합니다. 호스트는 MagicDNS 이름이나 Tailscale 주소로 추가합니다.
+- **키**는 Android Keystore에 내보낼 수 없는 HMAC 키로 보관됩니다(폰에 있으면 TEE나 StrongBox 안). 프로토콜은 사전 공유 키를
+  HMAC 키로만 쓰므로 핸드셰이크는 Keystore에 HMAC만 요청하고, 키는 앱 메모리로 돌아오지 않습니다. **클립보드에서 가져오기**(가져온
+  뒤 클립보드를 비우고, 키가 키보드 앱을 거치지 않음)나, 다른 컴퓨터에서 `safe-rdp key qr` 후 **QR 코드 스캔**으로 가져옵니다(Enter를
+  누르면 터미널 화면과 스크롤백에서 지워짐). 선택에 따라 연결 전 화면 잠금 해제나 지문을 요구할 수 있습니다(5분간 유효해 재연결 때는
+  다시 묻지 않음).
+- **암호**는 NDK에 암호 API가 없어 플랫폼 제공자(Conscrypt)를 씁니다. 기기 자체 검사(메뉴 → 자체 검사)가 CNG·OpenSSL과 같은 NIST
+  벡터와 교차 고정 벡터로 확인합니다.
+- **화면**: OpenGL ES 3, 바뀐 영역만 올림. 두 손가락 벌리기로 확대, 두 손가락 끌기로 스크롤. 터치는 터치패드(탭 = 클릭, 길게 누른 뒤
+  끌기 = 드래그, 두 손가락 탭 = 오른쪽 클릭)나 직접 터치로 동작합니다. 마우스와 하드웨어 키보드는 PC처럼 동작합니다. 스크린샷·녹화·
+  화면 전송·최근 앱 미리 보기에는 메뉴에서 허용하지 않는 한 검게 나옵니다.
+- **키보드**: 앱 자체 PC 키보드(Esc, Tab, 붙어 있는 Ctrl/Alt/Win, F키, 방향키, 한/영, 한자)가 키 위치로 보내므로 호스트의 배열과
+  IME가 문자를 정합니다(한글 포함). 시스템 키보드는 쓰지 않아 입력이 키보드 앱을 거치지 않습니다. 키보드 앱의 텍스트(스와이프,
+  음성)는 호스트에 가지 않으니 클립보드를 쓰세요.
+- **수명 주기**: 앱을 벗어나면 세션이 일시 정지되고(호스트가 프레임 전송을 멈춤), 30초가 지나면 끝나며, 화면이 꺼지면 바로 끝납니다.
+  끊긴 연결은 Windows 뷰어처럼 다시 연결합니다.
+- 아직 없음: 파일 전송.
+
 ## 기능
 
 | 기능 | 설명 |
@@ -338,6 +370,12 @@ src/
                   viewer + toolbar(연결 바), launcher(GUI)
     linux/        x11(소켓으로 직접 X11 프로토콜), capture(MIT-SHM), input(XTEST), clipboard, keymap,
                   viewer, xvfb(가상 화면), audio(PipeWire), keystore
+  crypto/jca.rs   Android 백엔드 (JNI로 플랫폼 Java 암호 제공자)
+  qr.rs           QR 인코더(`key qr`)와 카메라 프레임 디코더(앱)
+android/
+  native/         앱의 라이브러리: JNI(직접 선언), 세션, OpenGL ES 렌더러, 터치 제스처, AAudio
+  app/            Java 껍데기(프레임워크 API만), 매니페스트, 리소스
+  build.ps1/.sh   aapt2 + javac + d8/R8 + zipalign + apksigner, Gradle 없음
 ```
 
 흐름 제어: 호스트는 확인(ack)되지 않은 프레임이 2개 이상이면 다음 프레임을 만들지 않고
@@ -389,6 +427,9 @@ src/
   - Linux probe·X11 뷰어 → Windows 호스트(DXGI): 화질 3종, 배율, 모니터 전환, view-only 정책 거부,
     업로드(SHA-256 일치, Mark of the Web 확인), 핸드셰이크를 1바이트씩 끄는 공격이 마감에 끊기는 것 확인
   - Linux 가상 화면 호스트: 세션 프로그램이 끝나면 호스트가 멈추고 Xvfb·쿠키가 남지 않는 것 확인
+- Android 앱, 에뮬레이터(Android 15, x86_64) → Linux 가상 화면 호스트: 암호 자체 검사(Conscrypt로 NIST·교차 고정 벡터),
+  Keystore 키로 핸드셰이크, 화면 표시, 하드웨어 키보드와 앱 키보드 입력, 회전, 백그라운드 일시 정지, 호스트 재시작 뒤 재연결 확인.
+  앱의 제스처·화면 배치·키 표 로직 단위 테스트 41개는 데스크톱에서 실행. 실제 폰(TEE/StrongBox 키, 카메라 QR 스캔, 소리)은 아직
 - **아직 실제로 해 보지 않은 것**: 서비스 모드(관리자 권한 필요), 실제 모니터에 화면 가리기 켜기,
   소리를 실제로 들어 보는 청취 테스트, 여러 모니터·HDR 디스플레이, 실제 GNOME/Xorg 데스크톱 호스트.
 

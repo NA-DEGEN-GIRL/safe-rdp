@@ -34,6 +34,20 @@ jobs:
           cargo test --no-fail-fast platform::linux -- --ignored
           --skip runs_a_session --skip host_to_viewer_pipeline --skip smoke_monitor_capture --skip capture_speed
 
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-linux-android x86_64-linux-android && rustup component add clippy
+      - run: cargo clippy -p safe-rdp-android --target aarch64-linux-android -- -D warnings
+      - run: cargo clippy -p safe-rdp-android --target x86_64-linux-android -- -D warnings
+      # The gesture, view, key-table and QR logic (and the shared modules built into the app).
+      - run: cargo test -p safe-rdp-android
+      - run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0" > /dev/null'
+      - run: sh android/build.sh
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+
   linux-targets:
     runs-on: ubuntu-latest
     strategy:

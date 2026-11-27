@@ -74,6 +74,18 @@ unsafe extern "system" fn restore_echo(_event: u32) -> i32 {
     0
 }
 
+/// Lets the console interpret ANSI colour and erase sequences (older consoles do not by default).
+pub fn enable_terminal_colors() {
+    use windows_sys::Win32::System::Console::*;
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(h, &mut mode) != 0 {
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
 /// Reads one line from stdin without echoing it when stdin is a console.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     use windows_sys::Win32::System::Console::*;
