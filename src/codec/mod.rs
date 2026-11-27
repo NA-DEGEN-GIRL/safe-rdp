@@ -117,7 +117,7 @@ fn sub_filter(src: &[u8], stride: usize, r: Rect, out: &mut Vec<u8>) {
     for row in r.y..r.y + r.h {
         let line = &src[(row * stride + r.x) * 4..(row * stride + r.x + r.w) * 4];
         let (mut lb, mut lg, mut lr) = (0u8, 0u8, 0u8);
-        for px in line.chunks_exact(4) {
+        for px in line.as_chunks::<4>().0 {
             out.push(px[0].wrapping_sub(lb));
             out.push(px[1].wrapping_sub(lg));
             out.push(px[2].wrapping_sub(lr));
@@ -128,10 +128,10 @@ fn sub_filter(src: &[u8], stride: usize, r: Rect, out: &mut Vec<u8>) {
 
 /// Undoes `sub_filter` into rectangle `r` of `fb` (`filtered` holds exactly `r.w * r.h * 3` bytes).
 fn unfilter(filtered: &[u8], fb: &mut [u8], fbw: usize, r: Rect) {
-    let mut src = filtered.chunks_exact(3);
+    let mut src = filtered.as_chunks::<3>().0.iter();
     for row in r.y..r.y + r.h {
         let (mut lb, mut lg, mut lr) = (0u8, 0u8, 0u8);
-        for (px, s) in fb[(row * fbw + r.x) * 4..(row * fbw + r.x + r.w) * 4].chunks_exact_mut(4).zip(&mut src) {
+        for (px, s) in fb[(row * fbw + r.x) * 4..(row * fbw + r.x + r.w) * 4].as_chunks_mut::<4>().0.iter_mut().zip(&mut src) {
             lb = lb.wrapping_add(s[0]);
             lg = lg.wrapping_add(s[1]);
             lr = lr.wrapping_add(s[2]);
@@ -145,7 +145,7 @@ fn solid_color(src: &[u8], stride: usize, r: Rect) -> Option<[u8; 3]> {
     let first = [src[o], src[o + 1], src[o + 2]];
     for row in r.y..r.y + r.h {
         let line = &src[(row * stride + r.x) * 4..(row * stride + r.x + r.w) * 4];
-        if !line.chunks_exact(4).all(|p| p[..3] == first) {
+        if !line.as_chunks::<4>().0.iter().all(|p| p[..3] == first) {
             return None;
         }
     }
@@ -170,7 +170,7 @@ fn is_busy(src: &[u8], stride: usize, r: Rect) -> bool {
     for row in r.y..r.y + r.h {
         let line = &src[(row * stride + r.x) * 4..(row * stride + r.x + r.w) * 4];
         let mut left = 0;
-        for px in line.chunks_exact(4) {
+        for px in line.as_chunks::<4>().0 {
             let c = u32::from_le_bytes([px[0], px[1], px[2], 1]);
             if c == left {
                 continue;
@@ -464,14 +464,14 @@ pub fn downscale(src: &[u8], w: usize, h: usize, d: usize, dst: &mut [u8]) {
         for sy in y * d..y * d + d {
             let row = &src[sy * w * 4..(sy * w + dw * d) * 4];
             for (x, a) in acc.iter_mut().enumerate() {
-                for px in row[x * d * 4..(x + 1) * d * 4].chunks_exact(4) {
+                for px in row[x * d * 4..(x + 1) * d * 4].as_chunks::<4>().0 {
                     a[0] += px[0] as u32;
                     a[1] += px[1] as u32;
                     a[2] += px[2] as u32;
                 }
             }
         }
-        for (px, a) in out_row.chunks_exact_mut(4).zip(&acc) {
+        for (px, a) in out_row.as_chunks_mut::<4>().0.iter_mut().zip(&acc) {
             px.copy_from_slice(&[((a[0] + n / 2) / n) as u8, ((a[1] + n / 2) / n) as u8, ((a[2] + n / 2) / n) as u8, 255]);
         }
     }
@@ -588,7 +588,7 @@ impl Decoder {
                         bail!("bad solid tile");
                     }
                     for row in y..y + h {
-                        for px in fb[(row * fbw + x) * 4..(row * fbw + x + w) * 4].chunks_exact_mut(4) {
+                        for px in fb[(row * fbw + x) * 4..(row * fbw + x + w) * 4].as_chunks_mut::<4>().0 {
                             px.copy_from_slice(&[data[0], data[1], data[2], 255]);
                         }
                     }
@@ -630,7 +630,7 @@ mod tests {
     fn frame(w: usize, h: usize, seed: u32) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];
         let mut s = seed;
-        for (i, px) in v.chunks_exact_mut(4).enumerate() {
+        for (i, px) in v.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = (i % w, i / w);
             // Mix of flat areas, gradients and noise, like a real desktop.
             let c = if y < h / 3 {
@@ -649,7 +649,7 @@ mod tests {
     /// Text-like BGRA content: dark glyph strokes with a few anti-aliasing greys on white.
     fn text(w: usize, h: usize, seed: u32) -> Vec<u8> {
         let mut v = vec![255u8; w * h * 4];
-        for (i, px) in v.chunks_exact_mut(4).enumerate() {
+        for (i, px) in v.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = (i % w, i / w);
             let (line, col) = (y % 16, x % 7);
             let glyph = (x / 7 * 31 + y / 16 * 17 + seed as usize) % 5;
@@ -732,7 +732,7 @@ mod tests {
             })
             .collect();
         let mut expect = f.clone();
-        expect.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+        expect.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[3] = 255);
         let rects = enc.encode(&f, w, h);
         let msgs = pack(1, w, h, &rects);
         assert!(msgs.len() > 1, "incompressible frame should span several chunks");
@@ -853,7 +853,7 @@ mod tests {
         assert!(!is_busy(&vec![7u8; 64 * 64 * 4], 64, full));
         // Smooth anti-aliasing with many greys on a flat background still counts as text.
         let mut aa = vec![255u8; 64 * 64 * 4];
-        for (i, px) in aa.chunks_exact_mut(4).enumerate().filter(|(i, _)| i % 64 % 8 == 0) {
+        for (i, px) in aa.as_chunks_mut::<4>().0.iter_mut().enumerate().filter(|(i, _)| i % 64 % 8 == 0) {
             let g = (i * 7 % 200) as u8;
             px.copy_from_slice(&[g, g, g.wrapping_add(1), 255]);
         }

@@ -111,7 +111,7 @@ fn key_msgs(text: &str) -> Result<Vec<ClientMsg>> {
 
 fn checksum(fb: &[u8]) -> u64 {
     // FNV-1a over the colour bytes; enough to notice that the picture changed.
-    fb.chunks_exact(4).fold(0xcbf29ce484222325u64, |h, p| {
+    fb.as_chunks::<4>().0.iter().fold(0xcbf29ce484222325u64, |h, p| {
         let h = (h ^ p[0] as u64).wrapping_mul(0x100000001b3);
         let h = (h ^ p[1] as u64).wrapping_mul(0x100000001b3);
         (h ^ p[2] as u64).wrapping_mul(0x100000001b3)
@@ -151,7 +151,7 @@ fn unanswered(sets: &[(u8, u32)], states: &[(u8, u32)], (quality, audio, privacy
 fn write_ppm(path: &str, fb: &[u8], w: usize, h: usize) -> Result<()> {
     let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
     out.reserve(w * h * 3);
-    for p in fb.chunks_exact(4) {
+    for p in fb.as_chunks::<4>().0 {
         out.extend_from_slice(&[p[2], p[1], p[0]]);
     }
     let r = std::fs::write(path, &out);

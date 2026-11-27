@@ -30,7 +30,7 @@ mod portable {
 
     impl Compressor {
         pub fn new() -> Result<Self> {
-            Ok(Compressor(Box::new(xpress::Encoder::new())))
+            Ok(Compressor(Box::default()))
         }
 
         /// Compresses `src` into `dst`; returns false if the output would not be smaller.
@@ -205,7 +205,7 @@ mod tests {
         let mut out = Vec::with_capacity(px.len());
         for row in px.chunks_exact(w * 3) {
             let mut last = [0u8; 3];
-            for p in row.chunks_exact(3) {
+            for p in row.as_chunks::<3>().0 {
                 out.extend((0..3).map(|i| p[i].wrapping_sub(last[i])));
                 last.copy_from_slice(p);
             }
@@ -383,10 +383,10 @@ mod tests {
                         _ => m.truncate(at.max(1)),
                     }
                 }
-                if xpress::decompress(&m, &mut out).is_ok() {
-                    if let Some(reference) = cabinet_decompress(&m, data.len()) {
-                        assert!(out == reference, "mutation {i}: decoders disagree");
-                    }
+                if xpress::decompress(&m, &mut out).is_ok()
+                    && let Some(reference) = cabinet_decompress(&m, data.len())
+                {
+                    assert!(out == reference, "mutation {i}: decoders disagree");
                 }
             }
         }

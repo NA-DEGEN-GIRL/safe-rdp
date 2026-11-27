@@ -1793,7 +1793,7 @@ fn dim_framebuffer() {
 }
 
 fn dim(px: &mut [u8]) {
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         for c in &mut p[..3] {
             *c = (*c as u16 * 3 / 8) as u8;
         }

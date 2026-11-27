@@ -219,10 +219,10 @@ mod tests {
         let win = c.create_window(root, 0, 0, w, h, 1, x11::CW_EVENT_MASK, &[mask]).unwrap();
         c.map_window(win).unwrap();
         loop {
-            if let Some(Event::Map { window }) = c.wait_event(Duration::from_secs(5)).unwrap() {
-                if window == win {
-                    break;
-                }
+            if let Some(Event::Map { window }) = c.wait_event(Duration::from_secs(5)).unwrap()
+                && window == win
+            {
+                break;
             }
         }
         c.set_input_focus(win).unwrap();

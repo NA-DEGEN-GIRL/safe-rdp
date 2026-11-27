@@ -351,7 +351,7 @@ mod tests {
     fn assert_solid(c: &Capturer, bgr: [u8; 3]) {
         let px = c.pixels();
         assert_eq!(px.len(), c.area().width as usize * c.area().height as usize * 4);
-        assert!(px.chunks_exact(4).all(|p| p[..3] == bgr), "first pixel {:?}", &px[..4]);
+        assert!(px.as_chunks::<4>().0.iter().all(|p| p[..3] == bgr), "first pixel {:?}", &px[..4]);
     }
 
     #[test]

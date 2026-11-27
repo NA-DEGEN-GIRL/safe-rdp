@@ -26,6 +26,7 @@ use windows_sys::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreate
 use windows_sys::Win32::System::Threading::{AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, WaitForSingleObject};
 use windows_sys::core::GUID;
 
+#[allow(clippy::upper_case_acronyms)] // the Win32 name
 type HRESULT = i32;
 
 const IID_IMMDEVICEENUMERATOR: GUID = GUID::from_u128(0xa95664d2_9614_4f35_a746_de8db63617e6);
@@ -573,7 +574,7 @@ impl AudioCapture {
     /// `on_pcm(samples, rate, channels)` receives interleaved 16-bit PCM (1 or 2 channels) from
     /// a capture thread, about every 10-20 ms while something plays. Fails when the default
     /// output device cannot be recorded; later device changes and failures are retried.
-    pub fn start(on_pcm: Box<dyn FnMut(&[i16], u32, u8) + Send>) -> Result<AudioCapture> {
+    pub fn start(on_pcm: OnPcm) -> Result<AudioCapture> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);
         let s = stop.clone();

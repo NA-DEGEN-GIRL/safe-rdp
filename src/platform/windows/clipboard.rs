@@ -123,10 +123,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         match msg {
             WM_CLIPBOARDUPDATE if !state.is_null() => {
                 let s = &mut *state;
-                if GetClipboardSequenceNumber() != s.ignore_seq {
-                    if let Some(t) = read_text(hwnd) {
-                        (s.on_change)(t);
-                    }
+                if GetClipboardSequenceNumber() != s.ignore_seq
+                    && let Some(t) = read_text(hwnd)
+                {
+                    (s.on_change)(t);
                 }
                 0
             }

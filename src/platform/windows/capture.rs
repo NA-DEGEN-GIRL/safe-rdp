@@ -186,11 +186,11 @@ impl Capturer {
     /// After a fallback to GDI, tries DXGI again (a secure desktop, full-screen app or driver
     /// reset may have passed). Returns true if the source changed.
     pub fn try_upgrade(&mut self, sel: MonitorSel) -> bool {
-        if let Capturer::Gdi(g) = self {
-            if let Ok(d) = dxgi(sel, g.area) {
-                *self = Capturer::Dxgi(d);
-                return true;
-            }
+        if let Capturer::Gdi(g) = self
+            && let Ok(d) = dxgi(sel, g.area)
+        {
+            *self = Capturer::Dxgi(d);
+            return true;
         }
         false
     }

@@ -174,10 +174,10 @@ struct Sound {
 
 impl Sound {
     fn play(&mut self, rate: u32, channels: u8, codec: u8, data: &[u8]) {
-        if let Err(e) = self.rx.play(rate, channels, codec, data) {
-            if !std::mem::replace(&mut self.warned, true) {
-                log!("cannot play the host's sound: {e}");
-            }
+        if let Err(e) = self.rx.play(rate, channels, codec, data)
+            && !std::mem::replace(&mut self.warned, true)
+        {
+            log!("cannot play the host's sound: {e}");
         }
     }
 }
@@ -307,7 +307,7 @@ fn scale_region(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], dw: usize, dh:
     for y in y0..y1 {
         let (sy0, sy1) = span(y, sh, dh);
         let out = &mut dst[(y * dw + x0) * 4..(y * dw + x1) * 4];
-        for (o, &(sx0, sx1)) in out.chunks_exact_mut(4).zip(&cols) {
+        for (o, &(sx0, sx1)) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
             if sy1 - sy0 == 1 && sx1 - sx0 == 1 {
                 let p = (sy0 * sw + sx0) * 4;
                 o.copy_from_slice(&[src[p], src[p + 1], src[p + 2], 255]);
@@ -315,7 +315,7 @@ fn scale_region(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], dw: usize, dh:
             }
             let mut acc = [0u32; 3];
             for sy in sy0..sy1 {
-                for px in src[(sy * sw + sx0) * 4..(sy * sw + sx1) * 4].chunks_exact(4) {
+                for px in src[(sy * sw + sx0) * 4..(sy * sw + sx1) * 4].as_chunks::<4>().0 {
                     acc[0] += px[0] as u32;
                     acc[1] += px[1] as u32;
                     acc[2] += px[2] as u32;
@@ -483,10 +483,10 @@ impl View {
         if resized {
             self.wait_put()?;
             let len = dest.2 * dest.3 * 4;
-            if let Some(Canvas::Shm(old)) = self.canvas.take() {
-                if let Some(ext) = self.shm {
-                    old.detach(&mut self.conn, ext);
-                }
+            if let Some(Canvas::Shm(old)) = self.canvas.take()
+                && let Some(ext) = self.shm
+            {
+                old.detach(&mut self.conn, ext);
             }
             self.canvas = Some(match self.shm.map(|ext| ShmSegment::new(&mut self.conn, ext, len.max(4))) {
                 Some(Ok(seg)) => Canvas::Shm(seg),
@@ -524,10 +524,10 @@ impl View {
     fn rescale(&mut self, fb: &Framebuffer, r: (usize, usize, usize, usize)) -> Result<()> {
         self.wait_put()?;
         let (dw, dh) = (self.dest.2, self.dest.3);
-        if let Some(c) = &mut self.canvas {
-            if fb.px.len() == fb.w * fb.h * 4 {
-                scale_region(fb.px.as_slice(), fb.w, fb.h, c.pixels(), dw, dh, r);
-            }
+        if let Some(c) = &mut self.canvas
+            && fb.px.len() == fb.w * fb.h * 4
+        {
+            scale_region(fb.px.as_slice(), fb.w, fb.h, c.pixels(), dw, dh, r);
         }
         Ok(())
     }
@@ -568,7 +568,7 @@ impl View {
                         if fmt.is_bgrx() {
                             out[..w * 4].copy_from_slice(src);
                         } else {
-                            fmt.from_bgra_row(src, out);
+                            fmt.pack_bgra_row(src, out);
                         }
                     }
                     let data = &self.strip.as_slice()[..n * stride];
@@ -924,10 +924,10 @@ impl Ui {
                     None => r,
                     Some(e) => (e.0.min(r.0), e.1.min(r.1), e.2.max(r.2), e.3.max(r.3)),
                 });
-                if count == 0 {
-                    if let Some(r) = self.expose.take() {
-                        self.view.expose(r)?;
-                    }
+                if count == 0
+                    && let Some(r) = self.expose.take()
+                {
+                    self.view.expose(r)?;
                 }
             }
             Event::Configure { window, width, height } if window == self.view.win => {
@@ -1130,7 +1130,7 @@ mod tests {
 
         // 2x shrink averages 2x2 blocks.
         let mut src = vec![0u8; 4 * 2 * 4];
-        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let v = if i % 4 < 2 { [0, 100, 200, 0] } else { [10, 20, 30, 0] };
             px.copy_from_slice(&v);
         }
@@ -1347,7 +1347,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             cap.next_frame(0).unwrap();
-            let busy = cap.pixels().chunks_exact(4).filter(|p| p[..3] != [0x60, 0x40, 0x20]).count();
+            let busy = cap.pixels().as_chunks::<4>().0.iter().filter(|p| p[..3] != [0x60, 0x40, 0x20]).count();
             if busy > 10_000 {
                 break;
             }
@@ -1376,7 +1376,7 @@ mod tests {
         let mut shown = vec![0u8; w * h * 4];
         ui.view.conn.get_image(win, 0, 0, w as u16, h as u16, &mut shown).unwrap();
         let src = cap.pixels();
-        let diff = shown.chunks_exact(4).zip(src.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+        let diff = shown.as_chunks::<4>().0.iter().zip(src.as_chunks::<4>().0).filter(|(a, b)| a[..3] != b[..3]).count();
         assert_eq!(diff, 0, "viewer differs from the captured screen in {diff} pixels");
 
         if let Ok(path) = std::env::var("SRDP_SCREENSHOT") {
@@ -1398,7 +1398,7 @@ mod tests {
         // A 640x480 remote screen: left half red, right half blue, white 2x2 dot at (320, 240).
         let (rw, rh) = (640, 480);
         let mut frame = vec![0u8; rw * rh * 4];
-        for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+        for (i, px) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.copy_from_slice(if i % rw < rw / 2 { &[0, 0, 255, 255] } else { &[255, 0, 0, 255] });
         }
 

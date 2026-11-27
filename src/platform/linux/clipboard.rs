@@ -695,7 +695,7 @@ mod tests {
         let p = fetch(&mut c, targets);
         assert_eq!(p.kind, ATOM_ATOM);
         let utf8 = c.atom("UTF8_STRING").unwrap();
-        assert!(p.value.chunks_exact(4).any(|v| u32::from_le_bytes(v.try_into().unwrap()) == utf8));
+        assert!(p.value.as_chunks::<4>().0.iter().any(|v| u32::from_le_bytes(*v) == utf8));
         assert_eq!(fetch(&mut c, utf8).value, "Grüße 안녕".as_bytes());
         drop(a);
         drop(b);

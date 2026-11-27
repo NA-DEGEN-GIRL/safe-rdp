@@ -245,12 +245,12 @@ impl DecodeTable {
             bail!("corrupt XPRESS stream (Huffman table)");
         }
         let (mut code, mut index) = (0u32, 0u32);
-        for l in 1..=MAX_CODE_LEN {
+        for (l, &c) in count.iter().enumerate().skip(1) {
             self.first[l] = code;
-            self.limit[l] = code + count[l];
+            self.limit[l] = code + c;
             self.base[l] = index;
-            code = (code + count[l]) << 1;
-            index += count[l];
+            code = (code + c) << 1;
+            index += c;
         }
         let mut next = self.base;
         for sym in 0..SYMBOLS {
@@ -504,7 +504,7 @@ impl Encoder {
         let base = dst.len();
         dst.resize(base + size, 0);
         let (table, stream) = dst[base..].split_at_mut(TABLE_BYTES);
-        for (t, l) in table.iter_mut().zip(self.lens.chunks_exact(2)) {
+        for (t, l) in table.iter_mut().zip(self.lens.as_chunks::<2>().0) {
             *t = l[0] | l[1] << 4;
         }
         let mut w = BitWriter::new(stream);
@@ -655,8 +655,8 @@ fn huffman_lengths(freq: &[u32; SYMBOLS], lens: &mut [u8; SYMBOLS]) {
         }
     }
     // A complete code needs two symbols; add unused ones (weight 0) if necessary.
-    for s in 0..2 {
-        if n < 2 && freq[s] == 0 {
+    for (s, &f) in freq.iter().enumerate().take(2) {
+        if n < 2 && f == 0 {
             keys[n] = s as u32;
             n += 1;
         }
@@ -814,7 +814,7 @@ pub(in crate::codec) mod tests {
     fn golden_input() -> Vec<u8> {
         let mut v: Vec<u8> = b"MS-XCA golden vector; ".iter().cycle().take(440).copied().collect();
         v.extend(std::iter::repeat_n(b' ', 140_000));
-        v.extend((0..200u32).map(|i| (i * i >> 3) as u8));
+        v.extend((0..200u32).map(|i| ((i * i) >> 3) as u8));
         v
     }
 

@@ -910,7 +910,7 @@ mod tests {
         }
         let link = dir.with_extension("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
-        let err = check_socket_dir(&link, euid).err().expect("followed a link");
+        let err = check_socket_dir(&link, euid).expect_err("followed a link");
         assert!(err.to_string().contains("refusing"), "{err}");
         std::fs::remove_file(&link).unwrap();
         assert!(check_socket_dir(&dir.join("missing"), euid).is_err());
@@ -951,8 +951,9 @@ mod tests {
 
     #[test]
     fn lock_files_mark_a_display_taken() {
-        // A number far outside the X range, so no real display is affected.
-        let n = 3_000_000_000 + std::process::id();
+        // A number far outside the X range, so no real display is affected (and not the one
+        // x11's tests bind at the same time).
+        let n = 3_100_000_000 + std::process::id();
         assert!(!socket_taken(n));
         for path in [format!("/tmp/.tX{n}-lock"), format!("/tmp/.X{n}-lock")] {
             std::fs::write(&path, b"").unwrap();
@@ -980,7 +981,7 @@ mod tests {
         let seq = c.send(crate::platform::linux::x11::Req::new(15, 0).u32(root)).unwrap(); // QueryTree
         let r = c.reply(seq).unwrap();
         let n = u16::from_le_bytes([r[16], r[17]]) as usize;
-        let children: Vec<u32> = r[32..32 + 4 * n].chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let children: Vec<u32> = r[32..32 + 4 * n].as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
         children.into_iter().filter(|&w| c.get_geometry(w).is_ok_and(|g| g.width >= 200 && g.height >= 100)).count()
     }
 

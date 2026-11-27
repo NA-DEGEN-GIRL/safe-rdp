@@ -156,7 +156,7 @@ impl AudioCapture {
     /// `on_pcm(samples, rate, channels)` receives interleaved 16-bit PCM (48 kHz stereo) from
     /// a capture thread in 20 ms chunks. Fails when `pw-record` cannot start or exits within
     /// `START_GRACE`; later exits (PipeWire restarts) are retried.
-    pub fn start(on_pcm: Box<dyn FnMut(&[i16], u32, u8) + Send>) -> Result<AudioCapture> {
+    pub fn start(on_pcm: OnPcm) -> Result<AudioCapture> {
         let binary = find_binary("pw-record").ok_or("pw-record not found (install pipewire-bin)")?;
         if pipewire_socket().is_none() {
             return Err("PipeWire is not running for this user".into());

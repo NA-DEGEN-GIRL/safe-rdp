@@ -279,14 +279,14 @@ impl Shield {
 
     fn tick(&mut self, n: u32) {
         self.refresh();
-        if self.cfg.hooks && n % self.cfg.rehook_ticks.max(1) == 0 {
+        if self.cfg.hooks && n.is_multiple_of(self.cfg.rehook_ticks.max(1)) {
             // The new hooks are in place before the old ones are removed.
             match Hooks::install() {
                 Ok(h) => self.hooks = Some(h),
                 Err(e) => self.report(e),
             }
         }
-        if n % DRIFT_TICKS == 0 {
+        if n.is_multiple_of(DRIFT_TICKS) {
             DRIFT.fetch_add(1, Ordering::Relaxed);
             for o in &self.overlays {
                 unsafe { InvalidateRect(o.hwnd, null(), 0) };

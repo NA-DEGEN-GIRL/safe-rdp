@@ -748,10 +748,8 @@ mod tests {
         inc.write(&data).unwrap();
         assert_eq!(std::fs::remove_file(&inc.part).is_err(), cfg!(windows));
         match inc.finish(&sum) {
-            Ok(path) => {
-                assert!(cfg!(windows));
-                assert_eq!(std::fs::read(path).unwrap(), data);
-            }
+            Ok(path) if cfg!(windows) => assert_eq!(std::fs::read(path).unwrap(), data),
+            Ok(_) => panic!("finished with the part removed"),
             Err(_) => assert!(names(&dir).is_empty()),
         }
         let _ = std::fs::remove_dir_all(&dir);

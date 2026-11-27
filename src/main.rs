@@ -361,10 +361,10 @@ fn parse_host(args: &[String], service: bool) -> Result<HostCli> {
     if let Some(ip) = o.bind {
         o.policy.loopback_ok = ip.is_loopback();
     }
-    if let Some(ip) = o.policy.allow.iter().find(|ip| !net::is_tailscale(**ip) && !ip.is_loopback()) {
-        if !o.policy.allow_non_tailscale {
-            bail!("--allow {ip} is outside Tailscale; add --allow-non-tailscale if you really mean it");
-        }
+    if let Some(ip) = o.policy.allow.iter().find(|ip| !net::is_tailscale(**ip) && !ip.is_loopback())
+        && !o.policy.allow_non_tailscale
+    {
+        bail!("--allow {ip} is outside Tailscale; add --allow-non-tailscale if you really mean it");
     }
     cli.opts = o;
     cli.key_file = key_file;

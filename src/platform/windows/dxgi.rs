@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::core::GUID;
 
+#[allow(clippy::upper_case_acronyms)] // the Win32 name
 type HRESULT = i32;
 
 #[link(name = "d3d11", kind = "raw-dylib")]
@@ -307,7 +308,7 @@ fn blit(src: &[u8], pitch: usize, tw: u32, th: u32, rot: Rotation, r: Region, ds
                 let (dx, dy) = rot.map(tw, th, tx, y);
                 let mut o = ((oy + dy as usize) * stride + (ox + dx as usize) * 4) as isize;
                 let row = y as usize * pitch;
-                for p in src[row + tx as usize * 4..row + tx1 as usize * 4].chunks_exact(4) {
+                for p in src[row + tx as usize * 4..row + tx1 as usize * 4].as_chunks::<4>().0 {
                     let at = o as usize;
                     dst[at..at + 4].copy_from_slice(p);
                     o += step;
@@ -602,10 +603,10 @@ impl Output {
 
     /// The staging texture for `tw` x `th` images, created on first use.
     fn staging(&mut self, tw: u32, th: u32, format: u32) -> Result<*mut c_void> {
-        if let Some((s, w, h)) = &self.staging {
-            if (*w, *h) == (tw, th) {
-                return Ok(s.0);
-            }
+        if let Some((s, w, h)) = &self.staging
+            && (*w, *h) == (tw, th)
+        {
+            return Ok(s.0);
         }
         self.staging = None;
         let sd = D3d11Texture2dDesc {

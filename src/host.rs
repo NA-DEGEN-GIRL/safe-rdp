@@ -1898,12 +1898,12 @@ fn capture_loop(
                 }
                 Some(_) if last_upgrade_try.elapsed() > Duration::from_secs(10) => {
                     last_upgrade_try = Instant::now();
-                    if let Some(c) = capturer.as_mut() {
-                        if c.try_upgrade(sel) {
-                            log!("switched to {} capture", c.backend());
-                            encoder.request_full();
-                            (cap_ready, force, encoded) = (false, true, false);
-                        }
+                    if let Some(c) = capturer.as_mut()
+                        && c.try_upgrade(sel)
+                    {
+                        log!("switched to {} capture", c.backend());
+                        encoder.request_full();
+                        (cap_ready, force, encoded) = (false, true, false);
                     }
                 }
                 Some(_) => {}
@@ -2265,7 +2265,7 @@ mod tests {
         while n < MAX_PENDING {
             p.admit(ip(last)).unwrap();
             n += 1;
-            if n % MAX_PENDING_PER_ADDR == 0 {
+            if n.is_multiple_of(MAX_PENDING_PER_ADDR) {
                 last += 1;
             }
         }
@@ -2342,7 +2342,7 @@ mod tests {
         for a in ["2001:db8::1", "2001:db8::1", "2001:db8::2", "2001:db8::3"] {
             p.leave(v6(a), false);
         }
-        assert!(p.per_net.get(&v6("2001:db8::")).is_none() && !p.per_addr.contains_key(&v6("2001:db8::1")));
+        assert!(!p.per_net.contains_key(&v6("2001:db8::")) && !p.per_addr.contains_key(&v6("2001:db8::1")));
         // The log throttle counts them the same way.
         let mut q = Quiet::new(Instant::now());
         let shown = (0..10u16).filter(|&i| q.allow(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]))).count();

@@ -331,13 +331,13 @@ impl PixelFormat {
     }
 
     /// Converts a ZPixmap image (`row_bytes(w)` per row) into BGRA, `w*h*4` bytes.
-    pub fn to_bgra(&self, src: &[u8], w: usize, h: usize, dst: &mut [u8]) {
+    pub fn to_bgra(self, src: &[u8], w: usize, h: usize, dst: &mut [u8]) {
         let (stride, step) = (self.row_bytes(w), self.bpp as usize / 8);
         let ch = self.masks.map(Channel::new);
         for y in 0..h {
             let row = &src[y * stride..y * stride + w * step];
             let out = &mut dst[y * w * 4..(y + 1) * w * 4];
-            for (px, o) in row.chunks_exact(step).zip(out.chunks_exact_mut(4)) {
+            for (px, o) in row.chunks_exact(step).zip(out.as_chunks_mut::<4>().0) {
                 let v = self.read_pixel(px);
                 o.copy_from_slice(&[ch[2].get(v), ch[1].get(v), ch[0].get(v), 255]);
             }
@@ -345,10 +345,10 @@ impl PixelFormat {
     }
 
     /// Converts `w` BGRA pixels into one ZPixmap row of this format.
-    pub fn from_bgra_row(&self, src: &[u8], dst: &mut [u8]) {
+    pub fn pack_bgra_row(&self, src: &[u8], dst: &mut [u8]) {
         let step = self.bpp as usize / 8;
         let ch = self.masks.map(Channel::new);
-        for (px, o) in src.chunks_exact(4).zip(dst.chunks_exact_mut(step)) {
+        for (px, o) in src.as_chunks::<4>().0.iter().zip(dst.chunks_exact_mut(step)) {
             let v = ch[0].put(px[2]) | ch[1].put(px[1]) | ch[2].put(px[0]);
             self.write_pixel(v, o);
         }
@@ -516,7 +516,7 @@ impl Req {
     /// Final wire bytes for a request whose total size (with `body` bytes appended after
     /// these, padded) is `len` units: plain 16-bit length or the BIG-REQUESTS form.
     fn finish(mut self, body: usize, big: bool) -> Result<Vec<u8>> {
-        debug_assert!(self.0.len() % 4 == 0, "request header must be 4-byte aligned");
+        debug_assert!(self.0.len().is_multiple_of(4), "request header must be 4-byte aligned");
         let units = (self.0.len() + body.div_ceil(4) * 4) / 4;
         if units <= 0xffff {
             self.0[2..4].copy_from_slice(&(units as u16).to_le_bytes());
@@ -1594,7 +1594,7 @@ impl Conn {
         let seq = self.send(Req::new(GET_KEYBOARD_MAPPING, 0).u8(first).u8(count).pad(2))?;
         let r = self.reply(seq)?;
         let per = r[1] as usize;
-        let syms = r.get(32..).unwrap_or_default().chunks_exact(4).map(|c| le32(c, 0)).collect();
+        let syms = r.get(32..).unwrap_or_default().as_chunks::<4>().0.iter().map(|c| le32(c, 0)).collect();
         Ok((per, syms))
     }
 
@@ -1725,7 +1725,9 @@ impl Conn {
             let n = le32(&r, 8) as usize;
             let list = r.get(32..).unwrap_or_default();
             return Ok(list
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .take(n.min(64))
                 .enumerate()
                 .map(|(i, m)| {
@@ -1966,7 +1968,7 @@ mod tests {
         let abs = SocketAddr::from_abstract_name(format!("safe-rdp-test-peer-{me}").as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&abs).unwrap();
         // This process listens, so any other pid is turned away before anything is sent.
-        let err = connect_checked(&abs, me + 1, "the test socket").err().expect("accepted another process");
+        let err = connect_checked(&abs, me + 1, "the test socket").expect_err("accepted another process");
         assert!(err.to_string().contains("another process"), "{err}");
         let (mut peer, _) = listener.accept().unwrap();
         let mut b = [0u8; 8];
@@ -2015,10 +2017,10 @@ mod tests {
         let abs = SocketAddr::from_abstract_name(local_socket_path(n).as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&abs).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let err = connect_local(n, Some(me + 1), &[euid]).err().expect("accepted a server other than the pinned one");
+        let err = connect_local(n, Some(me + 1), &[euid]).expect_err("accepted a server other than the pinned one");
         assert!(err.to_string().contains("another process"), "{err}");
         if euid != 0 {
-            let err = connect_local(n, None, &[euid + 1]).err().expect("accepted another user's server");
+            let err = connect_local(n, None, &[euid + 1]).expect_err("accepted another user's server");
             assert!(err.to_string().contains("another user"), "{err}");
         }
         assert!(connect_local(n, Some(RETIRED), &[euid]).is_err());
@@ -2163,7 +2165,7 @@ mod tests {
         ] {
             let bgra: Vec<u8> = px.iter().flat_map(|&(r, g, b)| [b, g, r, 255]).collect();
             let mut wire = vec![0u8; fmt.row_bytes(4)];
-            fmt.from_bgra_row(&bgra, &mut wire);
+            fmt.pack_bgra_row(&bgra, &mut wire);
             let mut back = vec![0u8; 16];
             fmt.to_bgra(&wire, 4, 1, &mut back);
             assert_eq!(back, bgra, "{fmt:?}");
@@ -2175,7 +2177,7 @@ mod tests {
         f565.to_bgra(&[0xff, 0xff, 0x00, 0x00], 2, 1, &mut back);
         assert_eq!(back, [255, 255, 255, 255, 0, 0, 0, 255]);
         let mut wire = [0u8; 2];
-        f565.from_bgra_row(&[0, 0, 255, 255], &mut wire);
+        f565.pack_bgra_row(&[0, 0, 255, 255], &mut wire);
         assert_eq!(u16::from_le_bytes(wire), 0xf800);
     }
 

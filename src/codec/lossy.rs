@@ -608,7 +608,7 @@ pub(crate) mod tests {
         let mut s = seed.wrapping_mul(0x9e37_79b9) | 1;
         let k = seed as f32 * 0.37;
         let mut v = vec![0u8; w * h * 4];
-        for (i, px) in v.chunks_exact_mut(4).enumerate() {
+        for (i, px) in v.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = ((i % w) as f32, (i / w) as f32);
             let shade = 0.45 + 0.3 * (x * 0.013 + k).sin() * (y * 0.009 - k).cos();
             let (dx, dy) = (x - w as f32 * 0.6, y - h as f32 * 0.4);
@@ -631,7 +631,7 @@ pub(crate) mod tests {
         let mut se = 0f64;
         for y in r.y..r.y + r.h {
             let o = (y * stride + r.x) * 4;
-            for (p, q) in a[o..o + r.w * 4].chunks_exact(4).zip(b[o..o + r.w * 4].chunks_exact(4)) {
+            for (p, q) in a[o..o + r.w * 4].as_chunks::<4>().0.iter().zip(b[o..o + r.w * 4].as_chunks::<4>().0) {
                 se += (0..3).map(|c| (p[c] as f64 - q[c] as f64).powi(2)).sum::<f64>();
             }
         }
@@ -814,7 +814,7 @@ pub(crate) mod tests {
             assert!(db >= min_db, "q{q}: {db:.2} dB < {min_db}");
             assert!(len > last && len < raw / 2);
             last = len;
-            assert!(fb.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(fb.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         }
     }
 
@@ -985,7 +985,7 @@ pub(crate) mod tests {
         encode(&src, w, r, 80, &mut data);
         let mut fb = vec![0u8; w * h * 4];
         decode(&data, &mut fb, w, r).unwrap();
-        let rgb = |p: &[u8]| p.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect::<Vec<u8>>();
+        let rgb = |p: &[u8]| p.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect::<Vec<u8>>();
         let dir = std::env::var_os("SRDP_JFIF_DIR").map_or_else(std::env::temp_dir, Into::into);
         std::fs::write(dir.join("lossy-check.jpg"), jfif(&data, w, h)).unwrap();
         std::fs::write(dir.join("lossy-check.src.rgb"), rgb(&src)).unwrap();

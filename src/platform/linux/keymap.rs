@@ -231,10 +231,11 @@ pub fn to_evdev(vk: u16, scan: u16, extended: bool) -> Option<u16> {
         VK_HANJA if scan == 0 || matches!((scan, extended), (0x71, _) | (0x1d, true)) => return Some(KEY_HANJA),
         _ => {}
     }
-    if scan != 0 && scan <= 0xff {
-        if let Some(k) = scan_to_evdev(scan, extended) {
-            return Some(k);
-        }
+    if scan != 0
+        && scan <= 0xff
+        && let Some(k) = scan_to_evdev(scan, extended)
+    {
+        return Some(k);
     }
     vk_to_evdev(vk)
 }
