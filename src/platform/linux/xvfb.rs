@@ -1058,12 +1058,11 @@ mod tests {
     fn starts_despite_signals() {
         use std::os::unix::thread::{JoinHandleExt, RawPthread};
         unsafe extern "C" {
-            fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
             fn pthread_kill(thread: RawPthread, sig: c_int) -> c_int;
         }
         extern "C" fn ignore(_: c_int) {}
         const SIGUSR1: c_int = 10;
-        unsafe { signal(SIGUSR1, ignore) };
+        unsafe { super::super::libc::signal(SIGUSR1, Some(ignore)) };
         let t = std::thread::spawn(|| {
             let vd = VirtualDisplay::spawn(Some(82), 64, 64, Some("sleep 30"))?;
             Conn::connect(&vd.target())?;

@@ -63,24 +63,43 @@ pub fn stop_on_signals(stop: &'static std::sync::atomic::AtomicBool) {
     }
 }
 
+/// The console mode `read_secret` switched echo off from.
+static ECHO_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Ctrl+C or a closed console while `read_secret` waits: echo goes back on before the next
+/// handler (the default one) ends the process, or the console would stay without it.
+unsafe extern "system" fn restore_echo(_event: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+    unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), ECHO_MODE.load(std::sync::atomic::Ordering::SeqCst)) };
+    0
+}
+
 /// Reads one line from stdin without echoing it when stdin is a console.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     use windows_sys::Win32::System::Console::*;
     eprint!("{prompt}");
-    let mut line = String::new();
+    // Room for a key line, so that it is not copied while growing; wiped if reading fails.
+    let mut line = String::with_capacity(256);
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode = 0;
         let console = GetConsoleMode(h, &mut mode) != 0;
         if console {
+            ECHO_MODE.store(mode, std::sync::atomic::Ordering::SeqCst);
+            SetConsoleCtrlHandler(Some(restore_echo), 1);
             SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT);
         }
         let r = std::io::stdin().read_line(&mut line);
         if console {
             SetConsoleMode(h, mode);
+            SetConsoleCtrlHandler(Some(restore_echo), 0);
             eprintln!();
         }
-        r?;
+        if let Err(e) = r {
+            // Also what a failed read left beyond the length (invalid UTF-8 is cut off again).
+            drop(crate::util::SecureVec(line.into_bytes()));
+            return Err(e.into());
+        }
     }
     Ok(line)
 }
