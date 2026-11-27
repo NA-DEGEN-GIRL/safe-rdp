@@ -604,7 +604,7 @@ pub fn should_reconnect(kind: EndKind, lifetime: Duration, was_reconnect: bool, 
     match kind {
         EndKind::Fatal => false,
         EndKind::Network => true,
-        EndKind::Closed => !since_notice.is_some_and(|d| d < NOTICE_GRACE) && !(was_reconnect && lifetime < QUICK_CLOSE),
+        EndKind::Closed => since_notice.is_none_or(|d| d >= NOTICE_GRACE) && !(was_reconnect && lifetime < QUICK_CLOSE),
     }
 }
 

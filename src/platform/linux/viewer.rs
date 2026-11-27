@@ -886,13 +886,11 @@ impl Ui {
             }
             Event::Key { press, keycode, .. } => self.on_key(press, keycode)?,
             Event::Button { press, button, x, y } => self.on_button(press, button, x, y),
-            Event::Motion { x, y } => {
-                if !self.view_only && !matches!(next, Some(Event::Motion { .. })) {
-                    let p = self.remote_point(x, y);
-                    if self.last_move != Some(p) {
-                        self.last_move = Some(p);
-                        self.send(ClientMsg::MouseMove { x: p.0, y: p.1 });
-                    }
+            Event::Motion { x, y } if !self.view_only && !matches!(next, Some(Event::Motion { .. })) => {
+                let p = self.remote_point(x, y);
+                if self.last_move != Some(p) {
+                    self.last_move = Some(p);
+                    self.send(ClientMsg::MouseMove { x: p.0, y: p.1 });
                 }
             }
             Event::Focus { focus_in: false, detail, mode } => {
@@ -935,10 +933,11 @@ impl Ui {
                 self.view.try_grab()?;
             }
             Event::Map { window } if window == self.view.win => self.view.try_grab()?,
-            Event::ClientMessage { kind, format: 32, data, .. } if kind == self.view.atoms.wm_protocols => {
-                if u32::from_le_bytes(data[..4].try_into().unwrap()) == self.view.atoms.wm_delete {
-                    self.closed = Some("closed".into());
-                }
+            Event::ClientMessage { kind, format: 32, data, .. }
+                if kind == self.view.atoms.wm_protocols
+                    && u32::from_le_bytes(data[..4].try_into().unwrap()) == self.view.atoms.wm_delete =>
+            {
+                self.closed = Some("closed".into());
             }
             Event::Mapping { request: 1, .. } => self.load_keymap()?,
             _ => {}
