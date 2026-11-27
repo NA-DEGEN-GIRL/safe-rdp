@@ -30,6 +30,7 @@ const GET_GEOMETRY: u8 = 14;
 const INTERN_ATOM: u8 = 16;
 const GET_ATOM_NAME: u8 = 17;
 const CHANGE_PROPERTY: u8 = 18;
+const DELETE_PROPERTY: u8 = 19;
 const GET_PROPERTY: u8 = 20;
 const SET_SELECTION_OWNER: u8 = 22;
 const GET_SELECTION_OWNER: u8 = 23;
@@ -130,6 +131,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound for a reply read into the internal buffer (images are read straight into the
 /// caller's buffer instead).
 const MAX_REPLY: usize = 64 << 20;
+/// Most events kept for a connection that waits for replies but does not read its events (or
+/// not for a long time); the oldest go beyond it.
+const MAX_QUEUED_EVENTS: usize = 4096;
+/// The X error for an atom the server does not know.
+const BAD_ATOM: u8 = 5;
 
 // ---------------------------------------------------------------------------------------------
 // Display names and Xauthority
@@ -298,7 +304,8 @@ impl PixelFormat {
     }
 
     fn supported(&self) -> bool {
-        matches!(self.bpp, 16 | 24 | 32) && self.masks.iter().all(|&m| m != 0)
+        // The protocol pads scanlines to 8, 16 or 32 bits; `is_bgrx` relies on no more.
+        matches!(self.bpp, 16 | 24 | 32) && matches!(self.pad, 8 | 16 | 32) && self.masks.iter().all(|&m| m != 0)
     }
 
     fn read_pixel(&self, b: &[u8]) -> u32 {
@@ -1065,13 +1072,23 @@ impl Conn {
         }
     }
 
-    /// Reads more from the socket (blocking up to the I/O timeout).
+    /// Reads more from the socket (blocking up to the I/O timeout). What is kept in the buffer
+    /// (part of a reply with clipboard text, say) leaves no copy behind where it was.
     fn fill(&mut self) -> Result<()> {
         if self.rpos > 0 {
-            self.rbuf.drain(..self.rpos);
+            let keep = self.rbuf.len() - self.rpos;
+            self.rbuf.copy_within(self.rpos.., 0);
+            wipe(&mut self.rbuf[keep..]);
+            self.rbuf.truncate(keep);
             self.rpos = 0;
         }
         let old = self.rbuf.len();
+        if self.rbuf.capacity() < old + 65536 {
+            let mut grown = Vec::with_capacity((old + 65536).max(self.rbuf.capacity() * 2));
+            grown.extend_from_slice(&self.rbuf);
+            wipe(&mut self.rbuf);
+            self.rbuf = grown;
+        }
         self.rbuf.resize(old + 65536, 0);
         let n = match self.sock.read(&mut self.rbuf[old..]) {
             Ok(0) => {
@@ -1135,23 +1152,34 @@ impl Conn {
     /// Queues an event or remembers an error for a request whose reply nobody waits for.
     fn stash(&mut self, p: Packet) {
         match p {
-            Packet::Event(e) => self.events.push_back(e),
+            Packet::Event(e) => {
+                if self.events.len() >= MAX_QUEUED_EVENTS {
+                    self.events.pop_front();
+                }
+                self.events.push_back(e)
+            }
             Packet::Error(e) => {
                 if self.errors.len() >= 32 {
                     self.errors.remove(0);
                 }
                 self.errors.push(e);
             }
-            Packet::Reply(..) => {} // late reply to an abandoned request
+            Packet::Reply(_, mut b) => wipe(&mut b), // late reply to an abandoned request
         }
     }
 
     /// Waits for the reply to request `seq`.
     pub fn reply(&mut self, seq: u64) -> Result<Vec<u8>> {
+        self.reply_or_error(seq)?.map_err(Into::into)
+    }
+
+    /// `reply`, with the X error the request caused (a window gone, an unknown atom) as
+    /// `Ok(Err(_))`, told apart from a failed connection.
+    fn reply_or_error(&mut self, seq: u64) -> Result<std::result::Result<Vec<u8>, XError>> {
         loop {
             match self.next_packet(true)? {
-                Some(Packet::Reply(s, b)) if s == seq => return Ok(b),
-                Some(Packet::Error(e)) if e.seq == seq => return Err(e.into()),
+                Some(Packet::Reply(s, b)) if s == seq => return Ok(Ok(b)),
+                Some(Packet::Error(e)) if e.seq == seq => return Ok(Err(e)),
                 Some(p) => self.stash(p),
                 None => {}
             }
@@ -1253,6 +1281,16 @@ impl Conn {
         Ok(())
     }
 
+    /// Reads what the server has sent so far and drops it, for a connection that only writes
+    /// requests: unread, it would fill the socket, and late errors would match later requests
+    /// once the 16-bit sequence numbers wrap.
+    pub fn discard_input(&mut self) -> Result<()> {
+        self.read_pending()?;
+        while self.poll_event()?.is_some() {}
+        self.errors.clear();
+        Ok(())
+    }
+
     /// Waits up to `timeout` for the next event.
     #[cfg(test)]
     pub fn wait_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
@@ -1291,12 +1329,17 @@ impl Conn {
         self.intern_atom(name, false)
     }
 
-    pub fn atom_name(&mut self, atom: u32) -> Result<String> {
+    /// The name of `atom`; `None` if the server knows no such atom.
+    pub fn atom_name(&mut self, atom: u32) -> Result<Option<String>> {
         let seq = self.send(Req::new(GET_ATOM_NAME, 0).u32(atom))?;
-        let r = self.reply(seq)?;
+        let r = match self.reply_or_error(seq)? {
+            Ok(r) => r,
+            Err(e) if e.code == BAD_ATOM => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let n = le16(&r, 8) as usize;
         let name = r.get(32..32 + n).ok_or("truncated GetAtomName reply")?;
-        Ok(String::from_utf8_lossy(name).into_owned())
+        Ok(Some(String::from_utf8_lossy(name).into_owned()))
     }
 
     /// Looks an extension up (cached; `None` if the server lacks it).
@@ -1376,15 +1419,42 @@ impl Conn {
         self.send_with(req, data).map(|_| ())
     }
 
-    /// Reads up to `max_bytes` of a property (rounded up to 4 bytes).
+    /// Reads up to `max_bytes` of a property (rounded up to 4 bytes). With `delete` the server
+    /// deletes it only if it was read whole (`bytes_after` 0).
     pub fn get_property(&mut self, window: u32, property: u32, kind: u32, max_bytes: usize, delete: bool) -> Result<Property> {
+        self.try_get_property(window, property, kind, max_bytes, delete)?.map_err(Into::into)
+    }
+
+    /// `get_property`, with the X error it caused (the window is gone) as `Ok(Err(_))`.
+    pub fn try_get_property(
+        &mut self,
+        window: u32,
+        property: u32,
+        kind: u32,
+        max_bytes: usize,
+        delete: bool,
+    ) -> Result<std::result::Result<Property, XError>> {
         let units = max_bytes.div_ceil(4).min(u32::MAX as usize) as u32;
         let seq = self.send(Req::new(GET_PROPERTY, delete as u8).u32(window).u32(property).u32(kind).u32(0).u32(units))?;
-        let r = self.reply(seq)?;
-        let format = r[1];
+        let mut r = match self.reply_or_error(seq)? {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(e)),
+        };
+        let (format, kind, bytes_after) = (r[1], le32(&r, 8), le32(&r, 12));
         let n = le32(&r, 16) as usize * (format / 8).max(1) as usize;
-        let value = r.get(32..32 + n).ok_or("truncated GetProperty reply")?.to_vec();
-        Ok(Property { kind: le32(&r, 8), bytes_after: le32(&r, 12), value })
+        if r.len() < 32 + n {
+            wipe(&mut r);
+            bail!("truncated GetProperty reply");
+        }
+        // The value (clipboard text, say) moves to the front of the reply, leaving no copy.
+        r.copy_within(32..32 + n, 0);
+        wipe(&mut r[n..]);
+        r.truncate(n);
+        Ok(Ok(Property { kind, bytes_after, value: r }))
+    }
+
+    pub fn delete_property(&mut self, window: u32, property: u32) -> Result<()> {
+        self.send(Req::new(DELETE_PROPERTY, 0).u32(window).u32(property)).map(|_| ())
     }
 
     pub fn set_selection_owner(&mut self, owner: u32, selection: u32, time: u32) -> Result<()> {
@@ -1699,6 +1769,9 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        // All of it: past the end may be left from earlier reads.
+        let all = self.rbuf.capacity();
+        self.rbuf.resize(all, 0);
         wipe(&mut self.rbuf);
     }
 }
@@ -2070,6 +2143,13 @@ mod tests {
             assert!(parse_setup(&b[..n], 0).is_err(), "truncated at {n}");
         }
         assert!(parse_setup(&fake_setup(8, 0, [0xff0000, 0xff00, 0xff]), 0).is_err());
+        // Scanline padding beyond 32 bits is not X11 (and would break is_bgrx's rows).
+        let pad_at = b.windows(8).position(|f| f == [24, 32, 32, 0, 0, 0, 0, 0]).unwrap() + 2;
+        for (pad, ok) in [(8, true), (16, true), (32, true), (64, false), (0, false), (24, false)] {
+            let mut b = b.clone();
+            b[pad_at] = pad;
+            assert_eq!(parse_setup(&b, 0).is_ok(), ok, "pad {pad}");
+        }
     }
 
     #[test]
@@ -2131,5 +2211,36 @@ mod tests {
         assert!(matches!(Event::parse(&ev), Event::ClientMessage { kind: 77, format: 32, data, .. } if data[0] == 9));
         ev[0] = 90;
         assert!(matches!(Event::parse(&ev), Event::Other(_)));
+    }
+
+    /// Events a connection does not read while it waits for replies are kept only up to a
+    /// bound; X errors for a request come back as such; property values are read whole.
+    #[test]
+    #[ignore = "needs Xvfb; run on the Linux test host with --ignored"]
+    fn queued_events_are_bounded() {
+        let vd = crate::platform::linux::xvfb::VirtualDisplay::spawn(Some(94), 64, 64, None).unwrap();
+        let mut c = Conn::connect(&vd.target()).unwrap();
+        let root = c.root();
+        let win = c.create_window(root, 0, 0, 1, 1, 2, CW_EVENT_MASK, &[PROPERTY_CHANGE_MASK]).unwrap();
+        let prop = c.atom("P").unwrap();
+        for i in 0..MAX_QUEUED_EVENTS as u32 + 100 {
+            c.change_property(win, prop, ATOM_STRING, 8, &i.to_le_bytes()).unwrap();
+        }
+        c.sync().unwrap();
+        assert_eq!(c.events.len(), MAX_QUEUED_EVENTS);
+        let p = c.get_property(win, prop, ANY_PROPERTY_TYPE, 1024, false).unwrap();
+        assert_eq!((p.kind, p.bytes_after, &p.value[..]), (ATOM_STRING, 0, &(MAX_QUEUED_EVENTS as u32 + 99).to_le_bytes()[..]));
+        // A window that is not there, and an atom that is not.
+        let e = c.try_get_property(win + 1000, prop, ANY_PROPERTY_TYPE, 4, false).unwrap().err().expect("no error");
+        assert_eq!(e.code, 3); // BadWindow
+        assert_eq!(c.atom_name(prop).unwrap().as_deref(), Some("P"));
+        assert_eq!(c.atom_name(0x0fff_ffff).unwrap(), None);
+        // Delete only deletes a property read whole.
+        c.change_property(win, prop, ATOM_STRING, 8, &[7; 100]).unwrap();
+        let p = c.get_property(win, prop, ANY_PROPERTY_TYPE, 8, true).unwrap();
+        assert_eq!((p.bytes_after, p.value.len()), (92, 8));
+        assert_eq!(c.get_property(win, prop, ANY_PROPERTY_TYPE, 1024, false).unwrap().value.len(), 100);
+        c.delete_property(win, prop).unwrap();
+        assert_eq!(c.get_property(win, prop, ANY_PROPERTY_TYPE, 1024, false).unwrap().kind, NONE);
     }
 }

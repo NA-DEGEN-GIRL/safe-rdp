@@ -266,7 +266,8 @@ impl CursorState {
         if let Some(&(_, c)) = self.names.iter().find(|(a, _)| *a == atom) {
             return Ok(c);
         }
-        let c = cursor_from_name(&self.conn.atom_name(atom)?);
+        // An atom the server does not know is no reason to stop tracking the cursor.
+        let c = self.conn.atom_name(atom)?.map_or(Cursor::Arrow, |name| cursor_from_name(&name));
         if self.names.len() < 256 {
             self.names.push((atom, c));
         }
@@ -276,10 +277,11 @@ impl CursorState {
     /// Applies cursor-change events received so far.
     fn update(&mut self) -> Result<Cursor> {
         self.conn.read_pending()?;
-        let notify = self.xfixes.first_event + 1; // XFixesCursorNotify
+        let notify = self.xfixes.first_event.wrapping_add(1); // XFixesCursorNotify
         while let Some(ev) = self.conn.poll_event()? {
             if let super::x11::Event::Other(raw) = ev {
-                if raw[0] & 0x7f == notify {
+                // From the server only, not sent by a client (bit 0x80).
+                if raw[0] == notify {
                     let name = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
                     self.current = self.shape(name)?;
                 }
