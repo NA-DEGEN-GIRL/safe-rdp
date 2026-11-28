@@ -65,6 +65,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     private AlertDialog dialog;
     private CancellationSignal authCancel;
     private boolean clipListening;
+    /** `onNewIntent` is replacing this screen: what the old session still reports is ignored. */
+    private boolean recreating;
     private final Object lock = new Object();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SurfaceView surface;
@@ -231,7 +233,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
 
             @Override
             public void onAuthenticationError(int code, CharSequence msg) {
-                if (isFinishing() || isDestroyed()) return;
+                if (recreating || isFinishing() || isDestroyed()) return;
                 boolean cancelled = code == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED || code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED;
                 if (cancelled) finish();
                 else showEnded(String.valueOf(msg));
@@ -240,7 +242,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     }
 
     private void connect() {
-        if (isFinishing() || isDestroyed() || session != 0) return;
+        if (recreating || isFinishing() || isDestroyed() || session != 0) return;
         int options = (host.viewOnly ? Native.OPT_VIEW_ONLY : 0) | (host.clipboard ? Native.OPT_CLIPBOARD : 0)
                 | (host.audio ? Native.OPT_AUDIO : 0) | (host.privacy ? Native.OPT_PRIVACY : 0);
         float density = getResources().getDisplayMetrics().density;
@@ -284,6 +286,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     }
 
     private void onEvent(byte[] e) {
+        if (recreating) return;
         ByteBuffer b = ByteBuffer.wrap(e).order(ByteOrder.LITTLE_ENDIAN);
         int kind = b.get() & 0xff;
         switch (kind) {
@@ -386,7 +389,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
 
     /** Shows `b` in place of any dialog showing (none once the screen is going). */
     private void show(AlertDialog.Builder b) {
-        if (isFinishing() || isDestroyed()) return;
+        if (recreating || isFinishing() || isDestroyed()) return;
         if (dialog != null) dialog.dismiss();
         dialog = b.show();
     }
@@ -729,8 +732,20 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         } catch (org.json.JSONException e) {
             // Taken as another host.
         }
+        // The old session's end arrives on the looper before the recreation: it must not finish
+        // this screen, nor anything else of the old one run.
+        recreating = true;
+        ui.removeCallbacksAndMessages(null);
+        if (authCancel != null) authCancel.cancel();
+        if (dialog != null) {
+            dialog.dismiss();
+            dialog = null;
+        }
         synchronized (lock) {
-            if (session != 0) Native.close(session);
+            if (session != 0) {
+                Native.surface(session, null);
+                Native.close(session);
+            }
         }
         setIntent(intent);
         recreate();

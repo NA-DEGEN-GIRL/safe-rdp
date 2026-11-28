@@ -186,6 +186,11 @@ impl Drop for Global {
     }
 }
 
+/// An argument array for a `Call...MethodA` (null for none, not an empty slice's dangling pointer).
+fn ptr(args: &[JValue]) -> *const JValue {
+    if args.is_empty() { std::ptr::null() } else { args.as_ptr() }
+}
+
 /// A static method: its class and ID (valid while the class is loaded, that is for good).
 #[derive(Clone, Copy)]
 pub struct Method {
@@ -253,7 +258,7 @@ impl Env {
         if let Ok(u) = up() {
             let args = [obj(t.obj)];
             let m = u.describe;
-            let s = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, args.as_ptr()) });
+            let s = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, ptr(&args)) });
             if self.pending() {
                 self.clear();
             } else if !s.obj.is_null() {
@@ -279,7 +284,7 @@ impl Env {
         {
             let args = [obj(text.obj)];
             let m = u.failure;
-            let t = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, args.as_ptr()) });
+            let t = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, ptr(&args)) });
             if !self.pending() && !t.obj.is_null() && unsafe { call!(self.0, ix::THROW, fn(JObject) -> i32, t.obj) } == JNI_OK {
                 return;
             }
@@ -320,20 +325,20 @@ impl Env {
     }
 
     pub fn call_object(self, m: Method, args: &[JValue]) -> Result<Local> {
-        let r = unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, args.as_ptr()) };
+        let r = unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, ptr(args)) };
         let r = self.local(r);
         self.check()?;
         Ok(r)
     }
 
     pub fn call_bool(self, m: Method, args: &[JValue]) -> Result<bool> {
-        let r = unsafe { call!(self.0, ix::CALL_STATIC_BOOLEAN_METHOD_A, fn(JObject, JMethod, *const JValue) -> u8, m.class, m.id, args.as_ptr()) };
+        let r = unsafe { call!(self.0, ix::CALL_STATIC_BOOLEAN_METHOD_A, fn(JObject, JMethod, *const JValue) -> u8, m.class, m.id, ptr(args)) };
         self.check()?;
         Ok(r != 0)
     }
 
     pub fn call_void(self, m: Method, args: &[JValue]) -> Result<()> {
-        unsafe { call!(self.0, ix::CALL_STATIC_VOID_METHOD_A, fn(JObject, JMethod, *const JValue) -> (), m.class, m.id, args.as_ptr()) };
+        unsafe { call!(self.0, ix::CALL_STATIC_VOID_METHOD_A, fn(JObject, JMethod, *const JValue) -> (), m.class, m.id, ptr(args)) };
         self.check()
     }
 
@@ -363,6 +368,9 @@ impl Env {
     pub fn read_bytes(self, a: JObject, out: &mut [u8]) -> Result<()> {
         if self.array_len(a) != out.len() {
             return Err(Error::msg(format!("expected {} bytes from Java, got {}", out.len(), self.array_len(a))));
+        }
+        if out.is_empty() {
+            return Ok(());
         }
         unsafe { call!(self.0, ix::GET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *mut u8) -> (), a, 0, out.len() as i32, out.as_mut_ptr()) };
         self.check()

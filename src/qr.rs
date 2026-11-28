@@ -505,7 +505,9 @@ fn data_codewords(layout: Layout, mut bits: Bits) -> Vec<u8> {
     bits.push(0, (capacity - bits.0.len()).min(4));
     bits.push(0, bits.0.len().wrapping_neg() % 8);
     let byte = |c: &[bool]| c.iter().fold(0, |a, &b| (a << 1) | u8::from(b));
-    let mut bytes: Vec<u8> = bits.0.chunks(8).map(byte).collect();
+    // Sized for the padding too, so it never moves (see `byte_segment`).
+    let mut bytes = Vec::with_capacity(layout.data_codewords().max(bits.0.len() / 8));
+    bytes.extend(bits.0.chunks(8).map(byte));
     for pad in [0xec, 0x11].into_iter().cycle() {
         if bytes.len() >= layout.data_codewords() {
             break;
@@ -550,7 +552,9 @@ pub fn encode(data: &[u8], ecc: Ecc) -> Result<QrCode> {
 }
 
 fn byte_segment(version: usize, data: &[u8]) -> Bits {
-    let mut bits = Bits::default();
+    // Room for all of it (mode, count, data, terminator and padding to the capacity), so the
+    // buffer never moves and leaves a copy of the key behind.
+    let mut bits = Bits(Vec::with_capacity(byte_capacity(version, Ecc::L) * 8 + 32));
     bits.push(4, 4);
     bits.push(data.len() as u32, count_bits(version, 4));
     for &b in data {

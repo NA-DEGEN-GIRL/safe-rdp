@@ -50,6 +50,9 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     private boolean paused = true;
     /** openCamera was called and has not answered yet. */
     private boolean opening;
+    /** Counts camera openings: a callback from an earlier one (the screen left and came back
+     *  meanwhile) is told apart from the current one's. */
+    private int openGen;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -90,6 +93,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     protected void onPause() {
         paused = true;
         opening = false;
+        openGen++;
         closeCamera();
         if (thread != null) thread.quitSafely();
         thread = null;
@@ -135,9 +139,14 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
                 reader.setOnImageAvailableListener(this::onFrame, background);
             }
             opening = true;
+            final int gen = ++openGen;
             cm.openCamera(id, getMainExecutor(), new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice d) {
+                    if (gen != openGen) {
+                        d.close();
+                        return;
+                    }
                     opening = false;
                     if (paused || done || reader == null || background == null || !preview.getHolder().getSurface().isValid()) {
                         d.close();
@@ -149,16 +158,17 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
 
                 @Override
                 public void onDisconnected(CameraDevice d) {
-                    opening = false;
+                    if (gen == openGen) opening = false;
                     d.close();
                     if (camera == d) camera = null;
                 }
 
                 @Override
                 public void onError(CameraDevice d, int error) {
-                    opening = false;
                     d.close();
                     if (camera == d) camera = null;
+                    if (gen != openGen) return;
+                    opening = false;
                     fail(getString(R.string.camera_failed, error));
                 }
             });
@@ -248,7 +258,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         runOnUiThread(() -> {
             closeCamera();
             try {
-                String alias = KeysActivity.storeKey(this, found, getIntent().getBooleanExtra("auth", false));
+                String alias = KeysActivity.storeKey(found, getIntent().getBooleanExtra("auth", false));
                 setResult(RESULT_OK, new Intent().putExtra("alias", alias));
                 finish();
             } catch (Exception e) {

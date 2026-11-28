@@ -57,6 +57,7 @@ mod libc {
         /// which are not functions.
         pub fn signal(sig: c_int, handler: usize) -> usize;
         pub fn _exit(code: c_int) -> !;
+        pub fn write(fd: c_int, buf: *const std::ffi::c_void, n: usize) -> isize;
     }
 
     pub const SIGHUP: c_int = 1;
@@ -144,28 +145,42 @@ pub fn request_sas() -> bool {
 
 /// The terminal settings `read_secret` switched echo off from, while it waits.
 static ECHO_TERMIOS: AtomicPtr<libc::Termios> = AtomicPtr::new(std::ptr::null_mut());
+/// Set while `wait_key` waits under `key qr`: a signal ending the process clears the screen too.
+static CLEAR_ON_SIGNAL: AtomicBool = AtomicBool::new(false);
+/// Clear the screen and the scrollback, cursor home.
+const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
 
-/// A signal that ends the process while `read_secret` waits (Ctrl+C, Ctrl+\): echo goes back on
-/// first, or the shell's terminal would stay without it.
+/// A signal that ends the process while `read_secret` or `wait_key` waits (Ctrl+C, Ctrl+\, a
+/// terminal closed or a kill): the terminal settings go back first, or the shell's terminal
+/// would stay without echo; for `wait_key` the screen is cleared. Only async-signal-safe calls.
 extern "C" fn restore_echo(sig: std::ffi::c_int) {
     let t = ECHO_TERMIOS.load(Ordering::SeqCst);
     if !t.is_null() {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
     }
+    if CLEAR_ON_SIGNAL.load(Ordering::SeqCst) {
+        unsafe { libc::write(1, CLEAR_SCREEN.as_ptr().cast(), CLEAR_SCREEN.len()) };
+    }
     unsafe { libc::_exit(128 + sig) };
 }
 
-/// Echo switched off on the terminal while `read_secret` waits; dropping it (also when reading
-/// panics) puts the terminal settings and the signal handlers back.
+/// Echo switched off on the terminal while `read_secret` waits (or, `raw`, the terminal made to
+/// hand over single keys, Ctrl+C included, while `wait_key` waits); dropping it (also when
+/// reading panics) puts the terminal settings and the signal handlers back.
 struct EchoOff {
     /// Where `restore_echo` finds them, for as long as its handlers are in place.
     saved: Box<libc::Termios>,
     handlers: Vec<(std::ffi::c_int, usize)>,
+    raw: bool,
 }
 
 impl EchoOff {
     /// None when stdin is not a terminal.
     fn new() -> Option<EchoOff> {
+        Self::with(false)
+    }
+
+    fn with(raw: bool) -> Option<EchoOff> {
         unsafe {
             let mut t: libc::Termios = std::mem::zeroed();
             if libc::tcgetattr(0, &mut t) != 0 {
@@ -184,8 +199,14 @@ impl EchoOff {
             }
             let mut quiet = t;
             quiet.c_lflag &= !libc::ECHO;
+            if raw {
+                quiet.c_lflag &= !(libc::ICANON | libc::ISIG);
+                quiet.c_cc[libc::VMIN] = 1;
+                quiet.c_cc[libc::VTIME] = 0;
+                CLEAR_ON_SIGNAL.store(true, Ordering::SeqCst);
+            }
             libc::tcsetattr(0, libc::TCSANOW, &quiet);
-            Some(EchoOff { saved, handlers })
+            Some(EchoOff { saved, handlers, raw })
         }
     }
 }
@@ -199,7 +220,10 @@ impl Drop for EchoOff {
             }
         }
         ECHO_TERMIOS.store(std::ptr::null_mut(), Ordering::SeqCst);
-        eprintln!();
+        CLEAR_ON_SIGNAL.store(false, Ordering::SeqCst);
+        if !self.raw {
+            eprintln!();
+        }
     }
 }
 
@@ -207,23 +231,13 @@ impl Drop for EchoOff {
 /// signal, so that the caller still runs what follows (`key qr` clears the screen).
 pub fn wait_key() -> crate::util::Result<()> {
     use std::io::Read;
-    unsafe {
-        let mut saved: libc::Termios = std::mem::zeroed();
-        let terminal = libc::tcgetattr(0, &mut saved) == 0;
-        if terminal {
-            let mut raw = saved;
-            raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(0, libc::TCSANOW, &raw);
-        }
-        let mut b = [0u8; 1];
-        let r = std::io::stdin().read(&mut b);
-        if terminal {
-            libc::tcsetattr(0, libc::TCSANOW, &saved);
-        }
-        r?;
-    }
+    // A signal meanwhile (the terminal closed, a kill) restores the terminal and clears the
+    // screen before the process ends (`restore_echo`).
+    let raw = EchoOff::with(true);
+    let mut b = [0u8; 1];
+    let r = std::io::stdin().read(&mut b);
+    drop(raw);
+    r?;
     Ok(())
 }
 

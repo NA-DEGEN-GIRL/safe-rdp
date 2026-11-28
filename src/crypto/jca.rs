@@ -133,8 +133,9 @@ impl EcdhKey {
     }
 }
 
-/// The scratch buffer size kept between records (a full frame's records are 4 MiB).
-const SCRATCH_KEEP: usize = 4 << 20;
+/// The scratch buffer size kept between records (a frame is sent in records of about 4 MiB, and
+/// a growing buffer doubles).
+const SCRATCH_KEEP: usize = (8 << 20) + TAG_LEN;
 
 /// AES-256-GCM under one key (a `javax.crypto.Cipher`, initialised anew for every nonce).
 pub struct Aead {

@@ -571,7 +571,10 @@ pub fn classify_link_error(e: &Error) -> EndKind {
     let s = e.to_string();
     if s == channel::CLOSED {
         EndKind::Closed
-    } else if ["invalid record length", "record counter exhausted", "record authentication failed"].iter().any(|p| s.starts_with(p)) {
+    } else if ["invalid record length", "record counter exhausted", "record authentication failed", "AES-GCM decryption failed"]
+        .iter()
+        .any(|p| s.starts_with(p))
+    {
         EndKind::Fatal
     } else {
         EndKind::Network

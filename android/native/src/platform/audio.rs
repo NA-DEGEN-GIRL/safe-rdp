@@ -96,7 +96,8 @@ extern "C" fn on_data(_s: *mut Stream, user: *mut c_void, data: *mut c_void, fra
 extern "C" fn on_error(_s: *mut Stream, user: *mut c_void, _error: i32) {
     // Closing a stream from its own error callback is not allowed: the next push reopens it.
     if !user.is_null() {
-        unsafe { &*(user as *const AtomicBool) }.store(true, Ordering::Release);
+        let dead = user as usize;
+        let _ = std::panic::catch_unwind(|| unsafe { &*(dead as *const AtomicBool) }.store(true, Ordering::Release));
     }
 }
 
@@ -106,6 +107,7 @@ struct Open {
     /// Freed after the stream is closed (`Drop`).
     context: *mut Context,
     dead: &'static AtomicBool,
+    opened_at: Instant,
 }
 
 impl Drop for Open {
@@ -141,9 +143,13 @@ impl AudioPlayer {
     }
 
     pub fn push(&mut self, pcm: &[i16]) {
-        if self.open.as_ref().is_some_and(|o| o.dead.load(Ordering::Acquire)) {
-            self.open = None;
-            self.retry_at = Some(Instant::now());
+        if self.open.as_ref().is_some_and(|o| o.dead.load(Ordering::Acquire))
+            && let Some(o) = self.open.take()
+        {
+            // A stream that played a while (headphones pulled out) is reopened at once; one that
+            // died right after opening (the output taken by a call) is tried again at the pace
+            // of failed opens, not with every packet.
+            self.retry_at = Some(o.opened_at + REOPEN_EVERY);
         }
         if self.open.is_none() {
             if self.retry_at.is_some_and(|t| Instant::now() < t) {
@@ -200,6 +206,6 @@ fn open(rate: u32, shared: &Arc<Shared>) -> Result<Open> {
             AAudioStream_close(s);
             return fail("cannot start sound output", r);
         }
-        Ok(Open { stream: s, context, dead })
+        Ok(Open { stream: s, context, dead, opened_at: Instant::now() })
     }
 }

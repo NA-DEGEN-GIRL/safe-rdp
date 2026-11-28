@@ -1,7 +1,5 @@
 package io.github.na_degen_girl.saferdp;
 
-import android.app.KeyguardManager;
-import android.content.Context;
 import android.os.Build;
 import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
@@ -59,7 +57,7 @@ final class KeyVault {
      * Stores 32 key bytes (zeroed here afterwards) and returns the alias. With {@code auth}, using
      * the key needs the device unlocked or a biometric check within {@link #AUTH_SECONDS}.
      */
-    static String importKey(Context c, byte[] key, boolean auth) throws GeneralSecurityException {
+    static String importKey(byte[] key, boolean auth) throws GeneralSecurityException {
         try {
             SecretKeySpec spec = new SecretKeySpec(key, "HmacSHA256");
             Mac mac = Mac.getInstance("HmacSHA256");
@@ -68,13 +66,12 @@ final class KeyVault {
             // Stored again even if a key of that fingerprint is there: with the protection asked
             // for now, and in place of one the system invalidated (new fingerprints enrolled).
             KeyStore ks = store();
-            boolean locked = deviceSecure(c);
             try {
-                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, locked, true));
+                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, true));
             } catch (GeneralSecurityException | java.security.ProviderException e) {
                 // No StrongBox (reported as StrongBoxUnavailableException, on some devices inside a
                 // KeyStoreException): the TEE then. Any other problem shows again below.
-                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, locked, false));
+                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, false));
             }
             return alias;
         } finally {
@@ -82,19 +79,13 @@ final class KeyVault {
         }
     }
 
-    /** Whether the device has a screen lock (a PIN, pattern or password). */
-    static boolean deviceSecure(Context c) {
-        KeyguardManager km = c.getSystemService(KeyguardManager.class);
-        return km != null && km.isDeviceSecure();
-    }
-
     /**
-     * With a screen lock, the key works only while the device is unlocked (whoever holds it
-     * locked cannot use the key, whatever runs on it); without one that would mean nothing.
+     * A key that needs the user is usable only for a while after an unlock or a fingerprint. No
+     * "unlocked device" requirement on the others: on many phones an unlock by face or by a
+     * trusted watch does not count as one for the Keystore, and such a key would not work at all.
      */
-    private static KeyProtection protection(boolean auth, boolean screenLock, boolean strongBox) {
+    private static KeyProtection protection(boolean auth, boolean strongBox) {
         KeyProtection.Builder b = new KeyProtection.Builder(KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY)
-                .setUnlockedDeviceRequired(screenLock)
                 .setIsStrongBoxBacked(strongBox);
         if (auth) {
             b.setUserAuthenticationRequired(true)

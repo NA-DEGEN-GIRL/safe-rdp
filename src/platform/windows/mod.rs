@@ -96,16 +96,35 @@ pub fn wait_key() -> crate::util::Result<()> {
         let mut mode = 0;
         let console = GetConsoleMode(h, &mut mode) != 0;
         if console {
+            ECHO_MODE.store(mode, std::sync::atomic::Ordering::SeqCst);
+            // Ctrl+Break and closing the window still end the process: clear the screen first.
+            SetConsoleCtrlHandler(Some(clear_on_exit), 1);
             SetConsoleMode(h, mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
         }
         let mut b = [0u8; 1];
         let r = std::io::stdin().read(&mut b);
         if console {
             SetConsoleMode(h, mode);
+            SetConsoleCtrlHandler(Some(clear_on_exit), 0);
         }
         r?;
     }
     Ok(())
+}
+
+/// A console event that ends the process while `wait_key` waits (Ctrl+Break, the window
+/// closed): the input mode goes back and the screen and scrollback are cleared before the next
+/// handler (the default one) ends the process.
+unsafe extern "system" fn clear_on_exit(_event: u32) -> i32 {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode};
+    const CLEAR: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
+    unsafe {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), ECHO_MODE.load(std::sync::atomic::Ordering::SeqCst));
+        let mut n = 0;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), CLEAR.as_ptr(), CLEAR.len() as u32, &mut n, std::ptr::null_mut());
+    }
+    0
 }
 
 /// Reads one line from stdin without echoing it when stdin is a console.

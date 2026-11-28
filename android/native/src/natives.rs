@@ -105,12 +105,13 @@ extern "C" fn log_text(env: *mut c_void, _: JObject) -> JObject {
 extern "C" fn probe(env: *mut c_void, _: JObject, target: JObject, alias: JObject, key: JObject) -> JObject {
     let env = Env::from_raw(env);
     guard(env, std::ptr::null_mut(), || {
+        // The key first: it is zeroed in Java whatever fails after.
+        let key = if key.is_null() { None } else { Some(key_arg(env, key)?) };
         let target = text_arg(env, target)?;
         let opts = ViewerOptions::default();
-        let c = if key.is_null() {
-            crate::viewer::connect(&target, &opts, &VaultKey { alias: env.bytes_raw(alias)? })?
-        } else {
-            crate::viewer::connect(&target, &opts, &key_arg(env, key)?)?
+        let c = match key {
+            None => crate::viewer::connect(&target, &opts, &VaultKey { alias: env.bytes_raw(alias)? })?,
+            Some(k) => crate::viewer::connect(&target, &opts, &k)?,
         };
         let text = format!("{} {}x{} flags {:#x} monitors {} via {}", c.host_name, c.width, c.height, c.flags, c.monitors.len(), c.addr);
         bytes_out(env, text.as_bytes())
@@ -158,13 +159,15 @@ extern "C" fn open(
 ) -> i64 {
     let env = Env::from_raw(env);
     guard(env, 0, || {
-        let target = text_arg(env, target)?;
+        // The key first: it is zeroed in Java whatever fails after.
         let key: Key = if key.is_null() { Box::new(VaultKey { alias: env.bytes_raw(alias)? }) } else { Box::new(key_arg(env, key)?) };
+        let target = text_arg(env, target)?;
         let opts = ViewerOptions {
             view_only: options & OPT_VIEW_ONLY != 0,
             clipboard: options & OPT_CLIPBOARD != 0,
             audio: options & OPT_AUDIO != 0,
-            privacy: options & OPT_PRIVACY != 0,
+            // A viewer that only watches does not blank the host either (as on the desktop).
+            privacy: options & OPT_PRIVACY != 0 && options & OPT_VIEW_ONLY == 0,
             allow_capture: false,
             downscale: downscale.clamp(1, 4) as u8,
             quality: quality.clamp(0, 255) as u8,

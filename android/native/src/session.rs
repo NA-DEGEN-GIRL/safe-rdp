@@ -210,6 +210,10 @@ impl Session {
     /// waits, so a flood neither grows the queue nor stacks dialogs.
     fn emit(&self, e: Event) {
         let mut q = lock(&self.events);
+        // After the end nothing more: the end is the last event Java sees.
+        if self.ended.load(Ordering::SeqCst) {
+            return;
+        }
         let same = |old: &Event| match (old, &e) {
             (Event::Clipboard(_), Event::Clipboard(_))
             | (Event::Notice(_), Event::Notice(_))
@@ -383,10 +387,12 @@ impl Session {
         *lock(&self.stream) = Some(stream);
         *lock(&self.out) = Some(out.clone());
         // `close` may have run between the check above and the stream being kept here.
-        if self.stopped()
-            && let Some(s) = lock(&self.stream).as_ref()
-        {
-            let _ = s.shutdown(Shutdown::Both);
+        if self.stopped() {
+            if let Some(s) = lock(&self.stream).take() {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            *lock(&self.out) = None;
+            return (EndKind::Closed, String::new());
         }
         {
             let mut input = lock(&self.input);
@@ -497,6 +503,8 @@ impl Session {
                             };
                             let (px, py) = input.touch.pointer();
                             input.touch.set_pointer(&v, px, py);
+                            // The pointer drawn too, or it stays off the smaller screen until a touch.
+                            lock(&self.screen.pointer).at = input.touch.pointer();
                         }
                         *max_tex = self.fit_screen(hdr.width, hdr.height);
                     }
@@ -520,11 +528,13 @@ impl Session {
                 }
                 ServerMsg::Clipboard(t) => {
                     if lock(&self.opts).clipboard {
-                        // Out of sight it waits: it must not replace what the user copies
-                        // in another app meanwhile.
+                        // Out of sight it waits: it must not replace what the user copies in another
+                        // app meanwhile. `CMD_RESUME` changes `paused` under the same lock.
+                        let mut held = lock(&self.held_clipboard);
                         if self.paused.load(Ordering::SeqCst) {
-                            *lock(&self.held_clipboard) = Some(t);
+                            *held = Some(t);
                         } else {
+                            drop(held);
                             self.emit(Event::Clipboard(t));
                         }
                     }
@@ -534,14 +544,12 @@ impl Session {
                     self.emit(Event::Notice(printable(&t)));
                 }
                 ServerMsg::Audio { rate, channels, codec, data, .. } => {
-                    if let Some(s) = sound.as_mut() {
-                        if self.paused.load(Ordering::SeqCst) {
-                            s.stop();
-                        } else if let Err(e) = s.play(rate, channels, codec, data)
-                            && !std::mem::replace(&mut sound_warned, true)
-                        {
-                            log!("cannot play the host's sound: {e}");
-                        }
+                    if let Some(s) = sound.as_mut()
+                        && !self.paused.load(Ordering::SeqCst)
+                        && let Err(e) = s.play(rate, channels, codec, data)
+                        && !std::mem::replace(&mut sound_warned, true)
+                    {
+                        log!("cannot play the host's sound: {e}");
                     }
                 }
                 ServerMsg::State { key, value } => {
@@ -552,7 +560,11 @@ impl Session {
                             out.send(ClientMsg::Set { key: SET_AUDIO, value: 0 });
                             continue;
                         }
-                        (SET_AUDIO, _) => sound = (value == 1).then(AudioReceiver::default),
+                        (SET_AUDIO, 1) => {
+                            // A repeated "on" keeps what plays.
+                            sound.get_or_insert_with(AudioReceiver::default);
+                        }
+                        (SET_AUDIO, _) => sound = None,
                         (SET_PRIVACY, STATE_UNAVAILABLE) => lock(&self.opts).privacy = false,
                         _ => {}
                     }
@@ -563,6 +575,13 @@ impl Session {
                 }
                 ServerMsg::Pong(t) => rtt_ms = Some((epoch.elapsed().as_micros() as u64).saturating_sub(t) / 1000),
                 _ => {}
+            }
+            // Away, sound stops at once: a quiet host sends no sound at all, so this cannot wait
+            // for the next packet. (The next one played reopens the output.)
+            if self.paused.load(Ordering::SeqCst)
+                && let Some(s) = sound.as_mut()
+            {
+                s.stop();
             }
             if let Some((fps, mbps)) = meter.update(Instant::now(), frames, bytes) {
                 self.emit(Event::Stats(viewer::stats_text(rtt_ms, fps, mbps)));
@@ -754,13 +773,17 @@ impl Session {
                 }
             }
             CMD_RESUME => {
-                self.paused.store(false, Ordering::SeqCst);
+                let held = {
+                    let mut held = lock(&self.held_clipboard);
+                    self.paused.store(false, Ordering::SeqCst);
+                    held.take()
+                };
                 let f = self.unacked.swap(u64::MAX, Ordering::SeqCst);
                 if f != u64::MAX {
                     self.send(ClientMsg::Ack(f as u32));
                 }
                 self.send(ClientMsg::Refresh);
-                if let Some(t) = lock(&self.held_clipboard).take() {
+                if let Some(t) = held {
                     self.emit(Event::Clipboard(t));
                 }
                 self.renderer.redraw();

@@ -144,9 +144,9 @@ public final class KeysActivity extends Activity {
     }
 
     /** Parses key text (UTF-8, zeroed here) and stores the key; returns its alias. */
-    static String storeKey(android.content.Context c, byte[] text, boolean auth) throws Exception {
+    static String storeKey(byte[] text, boolean auth) throws Exception {
         try {
-            return KeyVault.importKey(c, Native.parseKey(text), auth);
+            return KeyVault.importKey(Native.parseKey(text), auth);
         } finally {
             java.util.Arrays.fill(text, (byte) 0);
         }
@@ -154,7 +154,7 @@ public final class KeysActivity extends Activity {
 
     private void store(byte[] text) {
         try {
-            stored(storeKey(this, text, auth.isChecked()));
+            stored(storeKey(text, auth.isChecked()));
         } catch (Exception e) {
             Ui.alert(this, getString(R.string.import_failed), Ui.why(e));
         }

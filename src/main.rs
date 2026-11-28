@@ -675,8 +675,8 @@ fn key_cmd(args: &[String]) -> Result<()> {
 /// the screen and the terminal's scrollback.
 fn show_key_qr(k: &Secret<32>) -> Result<()> {
     use std::io::{IsTerminal, Write};
-    if !std::io::stdout().is_terminal() {
-        bail!("`key qr` draws on a terminal only (the code is the key: it must not go to a file or a pipe)");
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        bail!("`key qr` runs on a terminal only (the code is the key: it must not go to a file or a pipe, and a key on the terminal clears it)");
     }
     #[cfg(windows)]
     platform::enable_terminal_colors();
