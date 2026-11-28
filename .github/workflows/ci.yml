@@ -47,6 +47,14 @@ jobs:
       - run: sh android/build.sh
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      # The release build too (R8 and its rules), signed with a key made for this run only.
+      - run: |
+          keytool -genkeypair -keystore "$RUNNER_TEMP/ci.keystore" -storepass "$SAFERDP_KEYSTORE_PASS" -keypass "$SAFERDP_KEYSTORE_PASS" \
+            -alias ci -keyalg EC -groupname secp256r1 -validity 1 -dname 'CN=safe-rdp CI'
+          SAFERDP_KEYSTORE="$RUNNER_TEMP/ci.keystore" sh android/build.sh --release
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+          SAFERDP_KEYSTORE_PASS: ci-only-throwaway
 
   linux-targets:
     runs-on: ubuntu-latest

@@ -685,16 +685,16 @@ fn show_key_qr(k: &Secret<32>) -> Result<()> {
     unsafe { util::wipe(text.as_bytes_mut()) };
     let mut drawing = code?.to_terminal();
     let mut out = std::io::stdout();
-    write!(out, "\n{drawing}\nScan it in the safe-rdp app (Keys > Scan QR code), then press Enter to clear the screen.")?;
-    out.flush()?;
+    let shown = write!(out, "\n{drawing}\nScan it in the safe-rdp app (Keys > Scan QR code), then press any key to clear the screen.")
+        .and_then(|()| out.flush());
     unsafe { util::wipe(drawing.as_bytes_mut()) };
-    let mut line = String::new();
-    let r = std::io::stdin().read_line(&mut line);
+    // Any key, Ctrl+C too, ends the wait without ending the program first.
+    let r = if shown.is_ok() { platform::wait_key() } else { Ok(()) };
     // Clear the screen, the scrollback (where terminals support it) and go home.
-    write!(out, "\x1b[2J\x1b[3J\x1b[H")?;
-    out.flush()?;
-    r?;
-    Ok(())
+    let cleared = write!(out, "\x1b[2J\x1b[3J\x1b[H").and_then(|()| out.flush());
+    shown?;
+    cleared?;
+    r
 }
 
 fn bench(args: &[String]) -> Result<()> {

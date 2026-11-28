@@ -11,7 +11,7 @@
 use std::ops::{Add, Mul, Sub};
 
 use crate::bail;
-use crate::util::Result;
+use crate::util::{Result, SecureVec};
 
 /// Error-correction level: roughly 7, 15, 25 and 30 percent of codewords recoverable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,6 +460,38 @@ impl Grid {
 #[derive(Default)]
 struct Bits(Vec<bool>);
 
+/// Overwrites modules or bits: what the encoder handles is the key, drawn.
+fn wipe_bools(v: &mut [bool]) {
+    for b in v.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, false) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+impl Drop for Bits {
+    fn drop(&mut self) {
+        wipe_bools(&mut self.0);
+    }
+}
+
+impl Drop for Grid {
+    fn drop(&mut self) {
+        wipe_bools(&mut self.dark);
+    }
+}
+
+impl Drop for QrCode {
+    fn drop(&mut self) {
+        wipe_bools(&mut self.modules);
+    }
+}
+
+fn wipe_blocks(blocks: &mut [Vec<u8>]) {
+    for b in blocks {
+        crate::util::wipe(b);
+    }
+}
+
 impl Bits {
     fn push(&mut self, value: u32, n: usize) {
         self.0.extend((0..n).rev().map(|i| (value >> i) & 1 != 0));
@@ -537,8 +569,14 @@ pub struct QrCode {
 impl QrCode {
     fn from_bits(version: usize, ecc: Ecc, bits: Bits, mask: Option<u8>) -> QrCode {
         let layout = Layout::new(version, ecc);
-        let codewords = interleave(layout, &rs_blocks(layout, &data_codewords(layout, bits)));
-        QrCode::from_codewords(version, ecc, &codewords, mask)
+        let mut data = data_codewords(layout, bits);
+        let mut blocks = rs_blocks(layout, &data);
+        let mut codewords = interleave(layout, &blocks);
+        let code = QrCode::from_codewords(version, ecc, &codewords, mask);
+        crate::util::wipe(&mut data);
+        wipe_blocks(&mut blocks);
+        crate::util::wipe(&mut codewords);
+        code
     }
 
     /// Places the final codeword sequence and applies `mask`, or the one with the lowest penalty.
@@ -547,7 +585,7 @@ impl QrCode {
         for (k, idx) in grid.data_order().into_iter().enumerate() {
             grid.dark[idx] = codewords.get(k / 8).is_some_and(|c| (c << (k % 8)) & 0x80 != 0);
         }
-        let best = mask
+        let mut best = mask
             .map_or(0..8, |m| m..m + 1)
             .map(|m| {
                 let mut g = grid.clone();
@@ -557,7 +595,7 @@ impl QrCode {
             })
             .min_by_key(Grid::penalty)
             .unwrap_or(grid);
-        QrCode { size: best.size, modules: best.dark }
+        QrCode { size: best.size, modules: std::mem::take(&mut best.dark) }
     }
 
     pub fn size(&self) -> usize {
@@ -577,7 +615,8 @@ impl QrCode {
         const QUIET: usize = 4;
         let total = self.size + 2 * QUIET;
         let dark = |x: usize, y: usize| self.dark(x.wrapping_sub(QUIET), y.wrapping_sub(QUIET));
-        let mut out = String::new();
+        // Sized up front: a buffer that grows leaves copies behind, which the caller cannot wipe.
+        let mut out = String::with_capacity(total * total.div_ceil(2) * 16 + total * 8);
         for y in (0..total).step_by(2) {
             let mut current = None;
             for x in 0..total {
@@ -1003,21 +1042,29 @@ fn read_symbol(version: usize, dark: impl Fn(usize, usize) -> bool) -> Read {
         return Read::NoFormat;
     };
     let layout = Layout::new(version, ecc);
-    let mut codewords = vec![0u8; raw_codewords(version)];
-    for (k, idx) in Grid::new(version).data_order().into_iter().take(codewords.len() * 8).enumerate() {
+    // What is read is a key: every buffer holding it is wiped when dropped (`SecureVec`).
+    let mut codewords = SecureVec(vec![0u8; raw_codewords(version)]);
+    for (k, idx) in Grid::new(version).data_order().into_iter().take(codewords.0.len() * 8).enumerate() {
         let (x, y) = (idx % size, idx / size);
         if dark(x, y) ^ mask_bit(mask, x, y) {
-            codewords[k / 8] |= 0x80 >> (k % 8);
+            codewords.0[k / 8] |= 0x80 >> (k % 8);
         }
     }
-    let mut data = Vec::with_capacity(layout.data_codewords());
-    for (b, mut block) in deinterleave(layout, &codewords).into_iter().enumerate() {
-        if !rs_correct(&mut block, layout.ecc) {
-            return Read::Damaged;
+    let mut data = SecureVec(Vec::with_capacity(layout.data_codewords()));
+    let mut blocks = deinterleave(layout, &codewords.0);
+    let mut ok = true;
+    for (b, block) in blocks.iter_mut().enumerate() {
+        if !rs_correct(block, layout.ecc) {
+            ok = false;
+            break;
         }
-        data.extend_from_slice(&block[..layout.data_len(b)]);
+        data.0.extend_from_slice(&block[..layout.data_len(b)]);
     }
-    parse_segments(&data, version).map_or(Read::Damaged, Read::Payload)
+    wipe_blocks(&mut blocks);
+    if !ok {
+        return Read::Damaged;
+    }
+    parse_segments(&data.0, version).map_or(Read::Damaged, Read::Payload)
 }
 
 struct BitReader<'a> {
@@ -1048,7 +1095,9 @@ impl BitReader<'_> {
 fn parse_segments(data: &[u8], version: usize) -> Option<Vec<u8>> {
     const ALNUM: &[u8; 45] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
     let mut r = BitReader { data, pos: 0 };
-    let mut out = Vec::new();
+    // Room for the most a segment can expand to (numeric: 2.4 characters a byte), so the buffer
+    // never moves and leaves a copy behind; wiped if parsing fails (`SecureVec`).
+    let mut out = SecureVec(Vec::with_capacity(data.len() * 3));
     while r.remaining() >= 4 {
         match r.read(4)? {
             0 => break,
@@ -1060,7 +1109,7 @@ fn parse_segments(data: &[u8], version: usize) -> Option<Vec<u8>> {
                     if v >= 10u32.pow(digits) {
                         return None;
                     }
-                    out.extend((0..digits).rev().map(|k| b'0' + (v / 10u32.pow(k) % 10) as u8));
+                    out.0.extend((0..digits).rev().map(|k| b'0' + (v / 10u32.pow(k) % 10) as u8));
                     n -= digits;
                 }
             }
@@ -1068,16 +1117,16 @@ fn parse_segments(data: &[u8], version: usize) -> Option<Vec<u8>> {
                 let mut n = r.read(count_bits(version, 2))?;
                 while n >= 2 {
                     let v = r.read(11)? as usize;
-                    out.extend_from_slice(&[*ALNUM.get(v / 45)?, ALNUM[v % 45]]);
+                    out.0.extend_from_slice(&[*ALNUM.get(v / 45)?, ALNUM[v % 45]]);
                     n -= 2;
                 }
                 if n == 1 {
-                    out.push(*ALNUM.get(r.read(6)? as usize)?);
+                    out.0.push(*ALNUM.get(r.read(6)? as usize)?);
                 }
             }
             4 => {
                 for _ in 0..r.read(count_bits(version, 4))? {
-                    out.push(r.read(8)? as u8);
+                    out.0.push(r.read(8)? as u8);
                 }
             }
             7 => {
@@ -1099,7 +1148,7 @@ fn parse_segments(data: &[u8], version: usize) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
-    Some(out)
+    Some(std::mem::take(&mut out.0))
 }
 
 /// Reads the symbol framed by three finders, trying the estimated version and its neighbours.

@@ -35,9 +35,22 @@ final class Crypto {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static ECParameterSpec p256;
 
-    /** An exception's text for the native side. */
+    private static final byte[] OUT_OF_MEMORY = "java.lang.OutOfMemoryError".getBytes(StandardCharsets.US_ASCII);
+
+    /** An exception's text for the native side; never throws (the native side checks nothing after it). */
     static byte[] describe(Throwable t) {
-        return t.toString().getBytes(StandardCharsets.UTF_8);
+        try {
+            return t.toString().getBytes(StandardCharsets.UTF_8);
+        } catch (OutOfMemoryError e) {
+            return OUT_OF_MEMORY;
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /** The exception a native method raises, with UTF-8 text (JNI's ThrowNew takes modified UTF-8). */
+    static Throwable failure(byte[] utf8) {
+        return new IllegalStateException(new String(utf8, StandardCharsets.UTF_8));
     }
 
     static void random(byte[] out) {
@@ -138,7 +151,8 @@ final class Crypto {
         Aead x = (Aead) a;
         x.cipher.init(Cipher.ENCRYPT_MODE, x.key, new GCMParameterSpec(128, nonce));
         x.cipher.updateAAD(aad);
-        x.cipher.doFinal(in, out);
+        int expected = out.remaining();
+        if (x.cipher.doFinal(in, out) != expected) throw new GeneralSecurityException("AES-GCM wrote a record of the wrong length");
     }
 
     /** Decrypts ciphertext and tag into {@code out}; false if the tag does not verify. */
@@ -146,8 +160,9 @@ final class Crypto {
         Aead x = (Aead) a;
         x.cipher.init(Cipher.DECRYPT_MODE, x.key, new GCMParameterSpec(128, nonce));
         x.cipher.updateAAD(aad);
+        int expected = out.remaining();
         try {
-            x.cipher.doFinal(in, out);
+            if (x.cipher.doFinal(in, out) != expected) throw new GeneralSecurityException("AES-GCM opened a record of the wrong length");
             return true;
         } catch (AEADBadTagException e) {
             return false;

@@ -23,6 +23,7 @@ import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
@@ -33,6 +34,9 @@ import java.util.List;
  * Reads a key's QR code (as `safe-rdp key qr` shows it) with the camera and stores the key. The
  * frames are decoded natively from the camera's buffers; nothing is saved, and the screen cannot
  * be captured while the code is in view.
+ *
+ * Opening the camera and configuring its session complete later, on callbacks: each checks that
+ * the screen is still in use (`paused`) and the camera still wanted, and closes what came too late.
  */
 public final class ScanActivity extends Activity implements SurfaceHolder.Callback {
     private SurfaceView preview;
@@ -43,6 +47,9 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     private CameraCaptureSession capture;
     private ImageReader reader;
     private volatile boolean done;
+    private boolean paused = true;
+    /** openCamera was called and has not answered yet. */
+    private boolean opening;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -59,14 +66,20 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         hint.setTextColor(Color.WHITE);
         hint.setBackgroundColor(0x80000000);
         hint.setGravity(Gravity.CENTER);
-        Ui.pad(hint, 16);
         root.addView(hint, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        int pad = Ui.dp(this, 16);
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            hint.setPadding(pad + i.left, pad, pad + i.right, pad + i.bottom);
+            return insets;
+        });
         setContentView(root);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        paused = false;
         thread = new HandlerThread("qr");
         thread.start();
         background = new Handler(thread.getLooper());
@@ -75,6 +88,8 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
 
     @Override
     protected void onPause() {
+        paused = true;
+        opening = false;
         closeCamera();
         if (thread != null) thread.quitSafely();
         thread = null;
@@ -96,7 +111,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private void open() {
-        if (camera != null) return;
+        if (paused || opening || camera != null || done) return;
         CameraManager cm = getSystemService(CameraManager.class);
         try {
             String id = null;
@@ -109,31 +124,49 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
                 return;
             }
             StreamConfigurationMap map = cm.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            Size size = pick(map.getOutputSizes(ImageFormat.YUV_420_888));
-            preview.getHolder().setFixedSize(size.getWidth(), size.getHeight());
-            reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), ImageFormat.YUV_420_888, 2);
-            reader.setOnImageAvailableListener(this::onFrame, background);
+            Size[] sizes = map == null ? null : map.getOutputSizes(ImageFormat.YUV_420_888);
+            if (sizes == null || sizes.length == 0) {
+                fail(getString(R.string.camera_failed, -2));
+                return;
+            }
+            Size size = pick(sizes);
+            if (reader == null) {
+                reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), ImageFormat.YUV_420_888, 2);
+                reader.setOnImageAvailableListener(this::onFrame, background);
+            }
+            opening = true;
             cm.openCamera(id, getMainExecutor(), new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice d) {
+                    opening = false;
+                    if (paused || done || reader == null || background == null || !preview.getHolder().getSurface().isValid()) {
+                        d.close();
+                        return;
+                    }
                     camera = d;
                     start();
                 }
 
                 @Override
                 public void onDisconnected(CameraDevice d) {
+                    opening = false;
                     d.close();
-                    camera = null;
+                    if (camera == d) camera = null;
                 }
 
                 @Override
                 public void onError(CameraDevice d, int error) {
+                    opening = false;
                     d.close();
-                    camera = null;
+                    if (camera == d) camera = null;
                     fail(getString(R.string.camera_failed, error));
                 }
             });
-        } catch (CameraAccessException | SecurityException e) {
+            // After the camera has a request in flight: the size change recreates the surface, and
+            // `open` from that is then a no-op.
+            preview.getHolder().setFixedSize(size.getWidth(), size.getHeight());
+        } catch (CameraAccessException | SecurityException | IllegalArgumentException e) {
+            opening = false;
             fail(Ui.why(e));
         }
     }
@@ -150,30 +183,37 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private void start() {
-        if (camera == null || !preview.getHolder().getSurface().isValid()) return;
+        CameraDevice cam = camera;
+        ImageReader r = reader;
+        if (cam == null || r == null || !preview.getHolder().getSurface().isValid()) return;
         try {
-            List<OutputConfiguration> outs = Arrays.asList(new OutputConfiguration(preview.getHolder().getSurface()), new OutputConfiguration(reader.getSurface()));
-            camera.createCaptureSession(new SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, getMainExecutor(), new CameraCaptureSession.StateCallback() {
+            List<OutputConfiguration> outs = Arrays.asList(new OutputConfiguration(preview.getHolder().getSurface()), new OutputConfiguration(r.getSurface()));
+            cam.createCaptureSession(new SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, getMainExecutor(), new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(CameraCaptureSession s) {
+                    if (paused || done || camera != cam || reader != r || background == null) {
+                        s.close();
+                        return;
+                    }
                     capture = s;
                     try {
-                        CaptureRequest.Builder r = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                        r.addTarget(preview.getHolder().getSurface());
-                        r.addTarget(reader.getSurface());
-                        r.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                        s.setRepeatingRequest(r.build(), null, background);
-                    } catch (CameraAccessException | IllegalStateException e) {
+                        CaptureRequest.Builder b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                        b.addTarget(preview.getHolder().getSurface());
+                        b.addTarget(r.getSurface());
+                        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                        s.setRepeatingRequest(b.build(), null, background);
+                    } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
                         fail(Ui.why(e));
                     }
                 }
 
                 @Override
                 public void onConfigureFailed(CameraCaptureSession s) {
+                    s.close();
                     fail(getString(R.string.camera_failed, -1));
                 }
             }));
-        } catch (CameraAccessException | IllegalStateException e) {
+        } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
             fail(Ui.why(e));
         }
     }
@@ -197,18 +237,21 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         } finally {
             img.close();
         }
-        // Another QR code in view is no reason to stop looking.
-        if (text == null || done || !Ui.utf8(Arrays.copyOf(text, Math.min(6, text.length))).equals("srdp1-")) return;
+        if (text == null) return;
+        if (done || !KeysActivity.startsWithKeyPrefix(text)) {
+            // Another QR code in view (a Wi-Fi one, say) is no reason to stop looking.
+            Arrays.fill(text, (byte) 0);
+            return;
+        }
         done = true;
         final byte[] found = text;
         runOnUiThread(() -> {
             closeCamera();
             try {
-                String alias = KeysActivity.storeKey(found, getIntent().getBooleanExtra("auth", false));
+                String alias = KeysActivity.storeKey(this, found, getIntent().getBooleanExtra("auth", false));
                 setResult(RESULT_OK, new Intent().putExtra("alias", alias));
                 finish();
             } catch (Exception e) {
-                done = false;
                 fail(getString(R.string.import_failed) + ": " + Ui.why(e));
             }
         });

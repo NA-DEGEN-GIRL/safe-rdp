@@ -125,9 +125,16 @@ impl EcdhKey {
         let s = env.call_object(up()?.ecdh_agree, &[obj(self.0.obj()), obj(p.obj)])?;
         let mut out = Secret::<32>::zero();
         take(env, &s, &mut out.0)?;
+        // As the CNG and OpenSSL backends do.
+        if out.0.iter().all(|&b| b == 0) {
+            bail!("degenerate ECDH secret");
+        }
         Ok(out)
     }
 }
+
+/// The scratch buffer size kept between records (a full frame's records are 4 MiB).
+const SCRATCH_KEEP: usize = 4 << 20;
 
 /// AES-256-GCM under one key (a `javax.crypto.Cipher`, initialised anew for every nonce).
 pub struct Aead {
@@ -148,6 +155,11 @@ impl Aead {
 
     fn scratch(&self, len: usize) -> std::sync::MutexGuard<'_, Vec<u8>> {
         let mut s = self.scratch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A large record's buffer is not kept for the small ones after it.
+        if s.capacity() > SCRATCH_KEEP && len <= SCRATCH_KEEP {
+            wipe(&mut s);
+            *s = Vec::new();
+        }
         s.resize(len, 0);
         s
     }
@@ -178,11 +190,17 @@ impl Aead {
         let input = env.direct(sealed.as_mut_ptr(), n + TAG_LEN)?;
         let output = env.direct(data.as_mut_ptr(), n)?;
         let args = [obj(self.cipher.obj()), obj(nonce.obj), obj(aad.obj), obj(input.obj), obj(output.obj)];
-        if !env.call_bool(up.aead_open, &args).unwrap_or(false) {
-            wipe(data);
-            bail!("record authentication failed");
+        match env.call_bool(up.aead_open, &args) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                wipe(data);
+                bail!("record authentication failed");
+            }
+            Err(e) => {
+                wipe(data);
+                bail!("AES-GCM decryption failed: {e}");
+            }
         }
-        Ok(())
     }
 }
 

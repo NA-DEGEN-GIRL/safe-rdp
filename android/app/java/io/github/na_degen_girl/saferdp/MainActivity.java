@@ -105,7 +105,8 @@ public final class MainActivity extends Activity {
             Ui.pad(item, 12);
             item.addView(Ui.title(this, h.title()));
             String detail = h.name.isEmpty() ? "" : h.address + "  ";
-            detail += getString(R.string.key_fp, h.key.isEmpty() ? "-" : KeyVault.fingerprint(h.key));
+            String fp = getString(R.string.key_fp, h.key.isEmpty() ? "-" : KeyVault.fingerprint(h.key));
+            detail += h.key.isEmpty() || present(h.key) ? fp : getString(R.string.key_missing, fp);
             item.addView(Ui.text(this, detail, 13));
             item.setBackgroundResource(android.R.drawable.list_selector_background);
             item.setOnClickListener(v -> connect(h));
@@ -170,8 +171,14 @@ public final class MainActivity extends Activity {
         } catch (Exception e) {
             // Shown as no keys.
         }
+        // A key the host was set to use and that is gone stays chosen (shown as missing): saving
+        // other settings must not quietly switch the host to another key.
+        if (!h.key.isEmpty() && !aliases.contains(h.key)) aliases.add(0, h.key);
         List<String> labels = new ArrayList<>();
-        for (String a : aliases) labels.add(getString(R.string.key_fp, KeyVault.fingerprint(a)));
+        for (String a : aliases) {
+            String fp = getString(R.string.key_fp, KeyVault.fingerprint(a));
+            labels.add(a.equals(h.key) && !present(a) ? getString(R.string.key_missing, fp) : fp);
+        }
         if (aliases.isEmpty()) labels.add(getString(R.string.no_keys_short));
         Spinner key = new Spinner(this);
         key.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
@@ -206,8 +213,8 @@ public final class MainActivity extends Activity {
                 .setView(scroll)
                 .setNegativeButton(android.R.string.cancel, null)
                 .setPositiveButton(R.string.save, (d, w) -> {
-                    h.address = address.getText().toString().trim();
-                    h.name = name.getText().toString().trim();
+                    h.address = address.getText().toString().replaceAll("\\s+", "");
+                    h.name = name.getText().toString().replaceAll("[\\r\\n]+", " ").trim();
                     if (h.address.isEmpty()) return;
                     h.key = keys.isEmpty() ? "" : keys.get(key.getSelectedItemPosition());
                     h.quality = qualityValues[quality.getSelectedItemPosition()];
@@ -273,7 +280,17 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /** Whether the Keystore holds key {@code alias}. */
+    private static boolean present(String alias) {
+        try {
+            return KeyVault.aliases().contains(alias);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void showText(String title, String text) {
+        if (isFinishing() || isDestroyed()) return;
         TextView t = Ui.text(this, text.isEmpty() ? "-" : text, 12);
         t.setTypeface(android.graphics.Typeface.MONOSPACE);
         t.setTextIsSelectable(true);

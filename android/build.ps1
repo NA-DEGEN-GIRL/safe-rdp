@@ -43,6 +43,9 @@ Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
 $stage = New-Item -ItemType Directory -Force (Join-Path $out 'apk')
 
 # 1. The native library, always optimised: decoding and drawing in a debug build are far too slow.
+# A RUSTFLAGS in the environment would make cargo ignore the per-target flags below (the
+# linker target and the 16 KB page alignment).
+Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 $triples = @{ 'arm64-v8a' = 'aarch64-linux-android'; 'x86_64' = 'x86_64-linux-android' }
 foreach ($a in $Abi) {
     $t = $triples[$a]
@@ -96,8 +99,9 @@ Run "$bt\zipalign.exe" -P 16 -f 4 $base $aligned
 # 5. Signed: debug builds with a key made for this checkout, release builds with yours.
 $apk = Join-Path $out 'safe-rdp.apk'
 if ($Release) {
-    if (-not $env:SAFERDP_KEYSTORE) { throw 'set SAFERDP_KEYSTORE to your release keystore (apksigner asks for its password)' }
-    Run "$bt\apksigner.bat" sign --ks $env:SAFERDP_KEYSTORE --out $apk $aligned
+    if (-not $env:SAFERDP_KEYSTORE) { throw 'set SAFERDP_KEYSTORE to your release keystore (apksigner asks for its password, or set SAFERDP_KEYSTORE_PASS)' }
+    $pass = [string[]]@(if ($env:SAFERDP_KEYSTORE_PASS) { '--ks-pass'; 'env:SAFERDP_KEYSTORE_PASS' })
+    Run "$bt\apksigner.bat" sign --ks $env:SAFERDP_KEYSTORE @pass --out $apk $aligned
 } else {
     $ks = Join-Path $root 'build\debug.keystore'
     if (-not (Test-Path $ks)) {

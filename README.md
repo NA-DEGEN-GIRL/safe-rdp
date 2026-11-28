@@ -128,7 +128,7 @@ android\build.ps1 -Release   # R8-optimised, signed with the keystore in $env:SA
   The protocol only ever uses the pre-shared key as an HMAC key, so the handshake asks the Keystore for those HMACs and the key
   never returns to the app's memory. Import it with **Import from clipboard** (the clipboard is cleared afterwards; the key never
   passes through a keyboard app) or **Scan QR code** after `safe-rdp key qr` on the other machine (the code is cleared from the
-  terminal and its scrollback when you press Enter). Optionally a key needs the screen unlock or a fingerprint before connecting
+  terminal and its scrollback when you press any key, Ctrl+C included). Optionally a key needs the screen unlock or a fingerprint before connecting
   (for 5 minutes, so reconnects do not ask again).
 - **Crypto** comes from the platform's provider (Conscrypt), since the NDK has none; on-device self-test (menu → Self-test)
   checks it against the same NIST and cross-backend vectors as CNG and OpenSSL.
@@ -444,7 +444,7 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
   pointer-only DXGI frames, forged X11 events, record counters after a failed send, uploads replacing a file of the same name and
   more); each was checked against the code first, and all but one (a claimed borrow held across message boxes, which Rust's
   rules for temporaries rule out) were fixed, with tests wherever the logic can run without a desktop or administrator rights
-- Unit and integration tests: 334 on Windows (3 of them check the built executable's DLL imports), 244 on Linux + 29 that need
+- Unit and integration tests: 365 on Windows (3 of them check the built executable's DLL imports), 260 on Linux + 30 that need
   Xvfb, PipeWire, Tailscale or a long run (`cargo test -- --ignored`)
   - Crypto: SHA-256, HMAC (RFC 4231), HKDF (RFC 5869), AES-GCM (NIST), ECDH (NIST CAVS), fixed CNG↔OpenSSL byte vectors
   - Codec: [MS-XCA] spec examples, cabinet.dll golden streams and cross-decoding, fuzzing with 30,000 malformed streams, lossy codec PSNR and ffmpeg cross-checks
@@ -456,7 +456,7 @@ While the screen is still, host CPU use is close to zero. Linux Xvfb 1080p captu
   - Linux virtual display host: when the session program ends, the host stops and no Xvfb process or cookie is left behind
 - Android app on an emulator (Android 15, x86_64) → Linux virtual display host: crypto self-test (NIST and cross-backend
   vectors through Conscrypt), handshake with a Keystore key, drawing, typing from a hardware keyboard, the app's keyboard,
-  rotation, pausing in the background, reconnecting after a host restart; 41 unit tests of the app's gesture, view and key logic
+  rotation, pausing in the background, reconnecting after a host restart; 43 unit tests of the app's gesture, view and key logic
   run on the desktop. A real phone (TEE/StrongBox keys, camera QR scan, sound) is not tried yet
 - **Not tried for real yet**: service mode (needs administrator rights), turning the privacy screen on with a real monitor,
   listening to the sound, multiple monitors and HDR displays, a host on a real GNOME/Xorg desktop.

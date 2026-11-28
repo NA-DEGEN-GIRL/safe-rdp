@@ -135,6 +135,23 @@ fn ecdh() -> Result<()> {
         "pinned record",
     )?;
 
+    // crypto/mod.rs `ecdh_keeps_a_leading_zero` (made with OpenSSL).
+    let z = EcdhKey::from_private(
+        &h("4c1878c43baf7d586d7fdd9e05d6bc25d9d808e179f02fb2b0595ca324b8fe5f"),
+        &h(concat!(
+            "5de4347ae98154a6cc25f4e5df12b92956c5a678f656731780107beb1e2b9288",
+            "8e145f52939c8c8f03c7b0699fbe417f1f619e46194e8656b92fa2766f50c84e"
+        )),
+    )?;
+    let peer = h(concat!(
+        "1c3b316b2a830b95c33db030f5b822c0b84cc4f5e8e64bed07a4c3e0be9e86aa",
+        "b74fab021fcef445bfc46fdc27cc6a44a58d72a30bbb0805b9418c67a7f44296"
+    ));
+    check(
+        hex_encode(&z.agree(&peer)?.0) == "00048c61f1b2a4063a21c0ec1bac79cd87518cc7fbbb7ff025deb48c7bd26045",
+        "ecdh keeps a leading zero byte",
+    )?;
+
     let x = EcdhKey::generate()?;
     let y = EcdhKey::generate()?;
     check(x.agree(&y.public_bytes()?)?.0 == y.agree(&x.public_bytes()?)?.0, "ecdh agreement")?;

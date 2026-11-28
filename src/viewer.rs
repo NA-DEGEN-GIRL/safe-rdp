@@ -578,12 +578,17 @@ pub fn classify_link_error(e: &Error) -> EndKind {
     }
 }
 
+/// Start of the error for a key held by a key store that cannot be used now (the Android app's
+/// Keystore key, once the unlock it needs has expired): only the user can fix that.
+pub const KEY_UNAVAILABLE: &str = "key unavailable: ";
+
 /// Whether a failed connection attempt is worth repeating. A wrong key, a protocol version
-/// mismatch or a peer that is not safe-rdp will not fix itself, and a host that turned an
-/// automatic reconnect away has another viewer to serve.
+/// mismatch or a peer that is not safe-rdp will not fix itself, nor will a key that cannot be
+/// used without the user, and a host that turned an automatic reconnect away has another viewer
+/// to serve.
 pub fn retryable(e: &Error) -> bool {
     let s = e.to_string();
-    !["host failed authentication", "protocol version mismatch", "peer is not a safe-rdp endpoint", REFUSED]
+    !["host failed authentication", "protocol version mismatch", "peer is not a safe-rdp endpoint", REFUSED, KEY_UNAVAILABLE]
         .iter()
         .any(|p| s.starts_with(p))
 }

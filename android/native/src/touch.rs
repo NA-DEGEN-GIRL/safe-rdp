@@ -142,8 +142,18 @@ impl Touch {
                 self.gesture = Gesture::Multi { start, kind: Two::Undecided, moved: false, most: 2, centre, dist };
                 self.wheel = (0.0, 0.0);
             }
-            (n, Gesture::Multi { start, kind, moved, centre, dist, .. }) => {
-                self.gesture = Gesture::Multi { start, kind, moved, most: n, centre, dist };
+            (n, Gesture::Multi { start, kind, moved, most, .. }) => {
+                // Measured afresh: the pair `pair` takes may now include the new finger.
+                let (centre, dist) = self.pair();
+                self.gesture = Gesture::Multi { start, kind, moved, most: most.max(n), centre, dist };
+            }
+            (2, Gesture::Spent) => {
+                // A finger put back after a pinch or scroll: pinch (or scroll) again, no tap.
+                for f in &mut self.fingers {
+                    f.start = (f.x, f.y);
+                }
+                let (centre, dist) = self.pair();
+                self.gesture = Gesture::Multi { start: t, kind: Two::Undecided, moved: true, most: 2, centre, dist };
             }
             _ => {}
         }
@@ -185,6 +195,8 @@ impl Touch {
                         }
                         let (rx, ry) = view.to_remote(x, y);
                         self.set_pointer(view, rx, ry);
+                        // Zoomed in, dragging to an edge scrolls the view on.
+                        view.follow(rx, ry, FOLLOW_MARGIN_DP * self.density);
                         out.push(self.move_action());
                     }
                 }
@@ -267,6 +279,10 @@ impl Touch {
                     } else {
                         Gesture::Spent
                     };
+                } else {
+                    // Two or more left: measure the pair they now make, or the next move jumps.
+                    let (centre, dist) = self.pair();
+                    self.gesture = Gesture::Multi { start, kind, moved, most, centre, dist };
                 }
             }
             Gesture::Spent if left == 0 => self.gesture = Gesture::None,
@@ -428,6 +444,37 @@ mod tests {
         t.tick(1000 + LONG_MS);
         assert_eq!(t.cancel(), [Button(BTN_LEFT, false)]);
         assert_eq!(t.up(&mut v, 0, 2000), []);
+    }
+
+    #[test]
+    fn lifting_one_of_three_fingers_does_not_jump() {
+        let (mut t, mut v) = setup(Mode::Trackpad);
+        t.down(&mut v, 0, 100.0, 250.0, 0);
+        t.down(&mut v, 1, 900.0, 250.0, 0);
+        t.moved(&mut v, 1, 1100.0, 250.0, 10); // a pinch
+        t.down(&mut v, 2, 500.0, 250.0, 20);
+        // The first finger goes: the pair is now fingers 1 and 2, 600 px apart instead of 1000.
+        t.up(&mut v, 0, 50);
+        let zoom = v.zoom();
+        let a = t.moved(&mut v, 1, 1102.0, 250.0, 60);
+        assert!(a.is_empty(), "{a:?}");
+        assert!((v.zoom() - zoom).abs() < 0.05, "zoom jumped from {zoom} to {}", v.zoom());
+    }
+
+    #[test]
+    fn pinching_again_after_lifting_a_finger() {
+        let (mut t, mut v) = setup(Mode::Trackpad);
+        t.down(&mut v, 0, 400.0, 250.0, 0);
+        t.down(&mut v, 1, 500.0, 250.0, 0);
+        t.moved(&mut v, 0, 350.0, 250.0, 10);
+        t.moved(&mut v, 1, 550.0, 250.0, 10);
+        t.up(&mut v, 1, 100);
+        let zoom = v.zoom();
+        assert_eq!(t.down(&mut v, 1, 650.0, 250.0, 200), []);
+        t.moved(&mut v, 1, 800.0, 250.0, 210);
+        assert!(v.zoom() > zoom, "the second pinch zoomed: {} -> {}", zoom, v.zoom());
+        t.up(&mut v, 0, 300);
+        assert_eq!(t.up(&mut v, 1, 300), [], "no right click after a pinch");
     }
 
     #[test]

@@ -59,7 +59,12 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     private static final int F_CLIPBOARD = 1, F_VIEW_ONLY = 2, F_SAS = 4, F_AUDIO = 8, F_PRIVACY = 32;
 
     private Host host;
-    private long session;
+    /** Read without `lock` only to test for zero; calls with it hold `lock`. */
+    private volatile long session;
+    /** The dialog showing, dismissed when the screen goes. */
+    private AlertDialog dialog;
+    private CancellationSignal authCancel;
+    private boolean clipListening;
     private final Object lock = new Object();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SurfaceView surface;
@@ -172,13 +177,19 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         });
         keyboard.setVisibility(View.GONE);
         root.addView(keyboard, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        // Edge to edge: the controls keep clear of a camera cutout and of the system bars when
+        // they are swiped in; the remote screen itself uses the whole display.
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             android.graphics.Insets cut = insets.getInsets(WindowInsets.Type.displayCutout() | WindowInsets.Type.systemBars());
-            top.setPadding(cut.left, 0, cut.right, 0);
-            keyboard.setPadding(cut.left, 0, cut.right, 0);
+            top.setPadding(cut.left, cut.top, cut.right, 0);
+            keyboard.setPadding(cut.left, 0, cut.right, cut.bottom);
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) stats.getLayoutParams();
+            lp.setMargins(cut.left, cut.top, 0, 0);
+            stats.setLayoutParams(lp);
             return insets;
         });
         setContentView(root);
+        setVolumeControlStream(android.media.AudioManager.STREAM_MUSIC);
         immersive();
 
         getOnBackInvokedDispatcher().registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::back);
@@ -211,7 +222,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 .setSubtitle(host.title())
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG | BiometricManager.Authenticators.DEVICE_CREDENTIAL)
                 .build();
-        p.authenticate(new CancellationSignal(), getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
+        authCancel = new CancellationSignal();
+        p.authenticate(authCancel, getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
             @Override
             public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) {
                 connect();
@@ -219,12 +231,16 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
 
             @Override
             public void onAuthenticationError(int code, CharSequence msg) {
-                finish();
+                if (isFinishing() || isDestroyed()) return;
+                boolean cancelled = code == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED || code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED;
+                if (cancelled) finish();
+                else showEnded(String.valueOf(msg));
             }
         });
     }
 
     private void connect() {
+        if (isFinishing() || isDestroyed() || session != 0) return;
         int options = (host.viewOnly ? Native.OPT_VIEW_ONLY : 0) | (host.clipboard ? Native.OPT_CLIPBOARD : 0)
                 | (host.audio ? Native.OPT_AUDIO : 0) | (host.privacy ? Native.OPT_PRIVACY : 0);
         float density = getResources().getDisplayMetrics().density;
@@ -261,8 +277,10 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
             Native.free(s);
         }, "session-events");
         events.start();
-        registerReceiver(screenOff, new IntentFilter(Intent.ACTION_SCREEN_OFF));
-        receiverOn = true;
+        if (!receiverOn) {
+            registerReceiver(screenOff, new IntentFilter(Intent.ACTION_SCREEN_OFF), Context.RECEIVER_NOT_EXPORTED);
+            receiverOn = true;
+        }
     }
 
     private void onEvent(byte[] e) {
@@ -291,6 +309,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 monitor = b.get() & 0xff;
                 monitors = b.get() & 0xff;
                 buildBar();
+                // A new connection: what the host had is unknown again.
+                fromHost = null;
                 if ((flags & F_CLIPBOARD) == 0 || !host.clipboard) stopClipboard();
                 else startClipboard();
                 break;
@@ -310,7 +330,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 break;
             }
             case EV_NOTICE:
-                Ui.alert(this, getString(R.string.host_message), Ui.utf8(java.util.Arrays.copyOfRange(e, 1, e.length)));
+                alert(getString(R.string.host_message), Ui.utf8(java.util.Arrays.copyOfRange(e, 1, e.length)));
                 break;
             case EV_STATE: {
                 int key = b.get() & 0xff;
@@ -319,8 +339,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 if (key == Native.SET_PRIVACY) privacyOn = value == 1;
                 if (key == Native.SET_MONITOR && value != -1) monitor = value;
                 if (value == -1) {
-                    if (key == Native.SET_AUDIO) Ui.alert(this, getString(R.string.sound), getString(R.string.sound_unavailable));
-                    if (key == Native.SET_PRIVACY) Ui.alert(this, getString(R.string.privacy), getString(R.string.privacy_unavailable));
+                    if (key == Native.SET_AUDIO) alert(getString(R.string.sound), getString(R.string.sound_unavailable));
+                    if (key == Native.SET_PRIVACY) alert(getString(R.string.privacy), getString(R.string.privacy_unavailable));
                 }
                 buildBar();
                 break;
@@ -357,13 +377,22 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     private void showEnded(String why) {
         ended = true;
         status.setVisibility(View.GONE);
-        if (isFinishing() || isDestroyed()) return;
-        new AlertDialog.Builder(this)
+        show(new AlertDialog.Builder(this)
                 .setTitle(getString(R.string.session_ended, host.title()))
                 .setMessage(why)
                 .setCancelable(false)
-                .setPositiveButton(android.R.string.ok, (d, w) -> finish())
-                .show();
+                .setPositiveButton(android.R.string.ok, (d, w) -> finish()));
+    }
+
+    /** Shows `b` in place of any dialog showing (none once the screen is going). */
+    private void show(AlertDialog.Builder b) {
+        if (isFinishing() || isDestroyed()) return;
+        if (dialog != null) dialog.dismiss();
+        dialog = b.show();
+    }
+
+    private void alert(String title, String message) {
+        show(new AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton(android.R.string.ok, null));
     }
 
     // The bar.
@@ -413,11 +442,10 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
             m.show();
         });
         if (!viewOnly() && (flags & F_SAS) != 0) {
-            barButton("Ctrl+Alt+Del", v -> new AlertDialog.Builder(this)
+            barButton("Ctrl+Alt+Del", v -> show(new AlertDialog.Builder(this)
                     .setMessage(R.string.send_sas)
                     .setNegativeButton(android.R.string.cancel, null)
-                    .setPositiveButton(android.R.string.ok, (d, w) -> command(Native.CMD_SAS))
-                    .show());
+                    .setPositiveButton(android.R.string.ok, (d, w) -> command(Native.CMD_SAS))));
         }
         if ((flags & F_AUDIO) != 0) {
             barButton(getString(soundOn ? R.string.sound_on : R.string.sound_off), v -> set(Native.SET_AUDIO, soundOn ? 0 : 1));
@@ -467,11 +495,10 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         } else if (ended || session == 0) {
             finish();
         } else {
-            new AlertDialog.Builder(this)
+            show(new AlertDialog.Builder(this)
                     .setMessage(getString(R.string.disconnect_from, host.title()))
                     .setNegativeButton(android.R.string.cancel, null)
-                    .setPositiveButton(R.string.disconnect, (d, w) -> end(null))
-                    .show();
+                    .setPositiveButton(R.string.disconnect, (d, w) -> end(null)));
         }
     }
 
@@ -525,8 +552,9 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         return tool == MotionEvent.TOOL_TYPE_MOUSE || e.isFromSource(InputDevice.SOURCE_MOUSE) && tool != MotionEvent.TOOL_TYPE_FINGER;
     }
 
+    /** Hover and scrolling from a mouse; a stylus hovering over the screen is not one. */
     private boolean onSurfaceGeneric(MotionEvent e) {
-        if (e.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) return onMouse(e);
+        if (e.isFromSource(InputDevice.SOURCE_CLASS_POINTER) && isMouse(e)) return onMouse(e);
         return false;
     }
 
@@ -592,7 +620,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 || (code == KeyEvent.KEYCODE_BACK && (e.getSource() & InputDevice.SOURCE_KEYBOARD) != InputDevice.SOURCE_KEYBOARD);
         if (system || e.getAction() == KeyEvent.ACTION_MULTIPLE) return super.dispatchKeyEvent(e);
         int evdev = e.getScanCode();
-        if (evdev == 0) evdev = KEYCODES.get(code, 0);
+        // No scancode (a virtual keyboard, adb) or one beyond the standard keys: by key code.
+        if (evdev == 0 || evdev > 255) evdev = KEYCODES.get(code, 0);
         synchronized (lock) {
             if (evdev != 0 && session != 0) {
                 // Held keys come again with a repeat count: the host sees them repeat, as it would.
@@ -607,12 +636,19 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     // app read it), from the host whenever it sends.
 
     private void startClipboard() {
-        getSystemService(ClipboardManager.class).addPrimaryClipChangedListener(clipChanged);
+        // Once: the clipboard keeps one entry per registration, and reconnects hello again.
+        if (!clipListening) {
+            getSystemService(ClipboardManager.class).addPrimaryClipChangedListener(clipChanged);
+            clipListening = true;
+        }
         sendClipboard();
     }
 
     private void stopClipboard() {
-        getSystemService(ClipboardManager.class).removePrimaryClipChangedListener(clipChanged);
+        if (clipListening) {
+            getSystemService(ClipboardManager.class).removePrimaryClipChangedListener(clipChanged);
+            clipListening = false;
+        }
     }
 
     private void sendClipboard() {
@@ -678,12 +714,33 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         super.onStop();
         keyboard.releaseAll();
         command(Native.CMD_PAUSE);
-        if (!isFinishing()) ui.postDelayed(graceOver, GRACE_MS);
+        // Not while the unlock screen is up before a session exists: that is this screen's own doing.
+        if (!isFinishing() && session != 0) ui.postDelayed(graceOver, GRACE_MS);
+    }
+
+    /** Another host (or the same one, with other settings) chosen while this screen exists. */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        Host next = Host.fromIntent(intent);
+        if (next == null) return;
+        try {
+            if (host != null && next.toJson().toString().equals(host.toJson().toString()) && session != 0 && !ended) return;
+        } catch (org.json.JSONException e) {
+            // Taken as another host.
+        }
+        synchronized (lock) {
+            if (session != 0) Native.close(session);
+        }
+        setIntent(intent);
+        recreate();
     }
 
     @Override
     protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
+        if (authCancel != null) authCancel.cancel();
+        if (dialog != null) dialog.dismiss();
         stopClipboard();
         if (receiverOn) unregisterReceiver(screenOff);
         synchronized (lock) {

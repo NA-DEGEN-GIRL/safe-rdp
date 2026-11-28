@@ -86,6 +86,28 @@ pub fn enable_terminal_colors() {
     }
 }
 
+/// Waits for one key on the console (stdin), Ctrl+C included: it arrives as a key, not as the
+/// console's interrupt, so that the caller still runs what follows (`key qr` clears the screen).
+pub fn wait_key() -> crate::util::Result<()> {
+    use std::io::Read;
+    use windows_sys::Win32::System::Console::*;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0;
+        let console = GetConsoleMode(h, &mut mode) != 0;
+        if console {
+            SetConsoleMode(h, mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
+        }
+        let mut b = [0u8; 1];
+        let r = std::io::stdin().read(&mut b);
+        if console {
+            SetConsoleMode(h, mode);
+        }
+        r?;
+    }
+    Ok(())
+}
+
 /// Reads one line from stdin without echoing it when stdin is a console.
 pub fn read_secret(prompt: &str) -> crate::util::Result<String> {
     use windows_sys::Win32::System::Console::*;

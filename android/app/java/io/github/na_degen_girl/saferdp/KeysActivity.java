@@ -74,7 +74,9 @@ public final class KeysActivity extends Activity {
         for (String a : aliases) {
             LinearLayout item = Ui.row(this);
             Ui.pad(item, 8);
-            TextView t = Ui.text(this, getString(R.string.key_fp, KeyVault.fingerprint(a)) + "\n" + getString(R.string.key_where, KeyVault.where(a)), 15);
+            String lines = getString(R.string.key_fp, KeyVault.fingerprint(a)) + "\n" + getString(R.string.key_where, KeyVault.where(a));
+            if (KeyVault.needsUser(a)) lines += "\n" + getString(R.string.key_needs_user);
+            TextView t = Ui.text(this, lines, 15);
             item.addView(t, Ui.weighted());
             item.addView(Ui.button(this, getString(R.string.delete), v -> new AlertDialog.Builder(this)
                     .setTitle(R.string.delete_key)
@@ -97,19 +99,54 @@ public final class KeysActivity extends Activity {
         ClipboardManager cm = getSystemService(ClipboardManager.class);
         ClipData clip = cm.getPrimaryClip();
         CharSequence text = clip != null && clip.getItemCount() > 0 ? clip.getItemAt(0).getText() : null;
-        if (text == null) {
-            Ui.alert(this, getString(R.string.import_clipboard), getString(R.string.clipboard_empty));
+        byte[] key = text == null ? null : keyText(text);
+        if (key == null) {
+            // Something else is copied: it stays.
+            Ui.alert(this, getString(R.string.import_clipboard), getString(R.string.clipboard_no_key));
             return;
         }
         // The key leaves the clipboard whatever happens next.
         cm.clearPrimaryClip();
-        store(Ui.utf8(text.toString()));
+        store(key);
+    }
+
+    private static final byte[] KEY_PREFIX = {'s', 'r', 'd', 'p', '1', '-'};
+
+    static boolean startsWithKeyPrefix(byte[] b) {
+        if (b == null || b.length < KEY_PREFIX.length) return false;
+        for (int i = 0; i < KEY_PREFIX.length; i++) if (b[i] != KEY_PREFIX[i]) return false;
+        return true;
+    }
+
+    /**
+     * The text, trimmed, as bytes if it looks like a key ({@code srdp1-}...), else null. Encoded
+     * straight from the characters, so no other String of the key is made.
+     */
+    static byte[] keyText(CharSequence text) {
+        int a = 0, b = text.length();
+        while (a < b && Character.isWhitespace(text.charAt(a))) a++;
+        while (b > a && Character.isWhitespace(text.charAt(b - 1))) b--;
+        if (b - a < KEY_PREFIX.length || b - a > 128) return null;
+        byte[] out = new byte[b - a];
+        for (int i = a; i < b; i++) {
+            char ch = text.charAt(i);
+            if (ch < 0x21 || ch > 0x7e) {
+                java.util.Arrays.fill(out, (byte) 0);
+                return null;
+            }
+            out[i - a] = (byte) ch;
+        }
+        if (!startsWithKeyPrefix(out)) {
+            java.util.Arrays.fill(out, (byte) 0);
+            return null;
+        }
+        return out;
     }
 
     /** Parses key text (UTF-8, zeroed here) and stores the key; returns its alias. */
-    static String storeKey(byte[] text, boolean auth) throws Exception {
+    static String storeKey(android.content.Context c, byte[] text, boolean auth) throws Exception {
         try {
-            return KeyVault.importKey(Native.parseKey(text), auth);
+            return KeyVault.importKey(c, Native.parseKey(text), auth);
         } finally {
             java.util.Arrays.fill(text, (byte) 0);
         }
@@ -117,7 +154,7 @@ public final class KeysActivity extends Activity {
 
     private void store(byte[] text) {
         try {
-            stored(storeKey(text, auth.isChecked()));
+            stored(storeKey(this, text, auth.isChecked()));
         } catch (Exception e) {
             Ui.alert(this, getString(R.string.import_failed), Ui.why(e));
         }

@@ -80,6 +80,11 @@ mod libc {
     }
 
     pub const ECHO: u32 = 0o10;
+    pub const ISIG: u32 = 0o1;
+    pub const ICANON: u32 = 0o2;
+    /// Indexes into `Termios::c_cc`.
+    pub const VTIME: usize = 5;
+    pub const VMIN: usize = 6;
     pub const TCSANOW: c_int = 0;
 
     pub const PR_SET_DUMPABLE: c_int = 4;
@@ -196,6 +201,30 @@ impl Drop for EchoOff {
         ECHO_TERMIOS.store(std::ptr::null_mut(), Ordering::SeqCst);
         eprintln!();
     }
+}
+
+/// Waits for one key on the terminal (stdin), Ctrl+C included: it arrives as a key, not as the
+/// signal, so that the caller still runs what follows (`key qr` clears the screen).
+pub fn wait_key() -> crate::util::Result<()> {
+    use std::io::Read;
+    unsafe {
+        let mut saved: libc::Termios = std::mem::zeroed();
+        let terminal = libc::tcgetattr(0, &mut saved) == 0;
+        if terminal {
+            let mut raw = saved;
+            raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(0, libc::TCSANOW, &raw);
+        }
+        let mut b = [0u8; 1];
+        let r = std::io::stdin().read(&mut b);
+        if terminal {
+            libc::tcsetattr(0, libc::TCSANOW, &saved);
+        }
+        r?;
+    }
+    Ok(())
 }
 
 /// Reads one line from stdin without echoing it when stdin is a terminal.

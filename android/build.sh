@@ -37,7 +37,9 @@ rm -rf "$out"
 stage="$out/apk"
 mkdir -p "$stage"
 
-# 1. The native library, always optimised.
+# 1. The native library, always optimised. A RUSTFLAGS in the environment would make cargo
+# ignore the per-target flags below (the linker target and the 16 KB page alignment).
+unset RUSTFLAGS
 for abi in arm64-v8a x86_64; do
     case $abi in
         arm64-v8a) t=aarch64-linux-android ;;
@@ -83,8 +85,12 @@ cp "$out/dex/classes.dex" "$stage/"
 # 5. Signed: debug builds with a key made for this checkout, release builds with yours.
 apk="$out/safe-rdp.apk"
 if $release; then
-    : "${SAFERDP_KEYSTORE:?set SAFERDP_KEYSTORE to your release keystore (apksigner asks for its password)}"
-    "$bt/apksigner" sign --ks "$SAFERDP_KEYSTORE" --out "$apk" "$out/aligned.apk"
+    : "${SAFERDP_KEYSTORE:?set SAFERDP_KEYSTORE to your release keystore (apksigner asks for its password, or set SAFERDP_KEYSTORE_PASS)}"
+    if [ -n "${SAFERDP_KEYSTORE_PASS:-}" ]; then
+        "$bt/apksigner" sign --ks "$SAFERDP_KEYSTORE" --ks-pass env:SAFERDP_KEYSTORE_PASS --out "$apk" "$out/aligned.apk"
+    else
+        "$bt/apksigner" sign --ks "$SAFERDP_KEYSTORE" --out "$apk" "$out/aligned.apk"
+    fi
 else
     ks="$root/build/debug.keystore"
     [ -e "$ks" ] || keytool -genkeypair -keystore "$ks" -storepass android -keypass android -alias debug \

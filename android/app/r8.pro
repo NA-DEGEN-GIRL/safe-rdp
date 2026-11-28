@@ -9,3 +9,6 @@
 -keep class io.github.na_degen_girl.saferdp.*Activity { <init>(); }
 
 -dontobfuscate
+
+# The self-test, run with app_process from adb (see SelfTest).
+-keep class io.github.na_degen_girl.saferdp.SelfTest { public static void main(java.lang.String[]); }

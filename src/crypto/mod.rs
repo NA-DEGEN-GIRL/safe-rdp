@@ -243,6 +243,25 @@ mod tests {
         assert_eq!(data, plain);
     }
 
+    /// A shared secret whose first byte is zero (made with OpenSSL): every backend must keep it,
+    /// all 32 bytes, or one handshake in 256 fails between them.
+    #[test]
+    fn ecdh_keeps_a_leading_zero() {
+        let k = EcdhKey::from_private(&h(LEADING_ZERO_D), &h(LEADING_ZERO_Q)).unwrap();
+        assert_eq!(hex_encode(&k.agree(&h(LEADING_ZERO_PEER)).unwrap().0), LEADING_ZERO_SECRET);
+    }
+
+    const LEADING_ZERO_D: &str = "4c1878c43baf7d586d7fdd9e05d6bc25d9d808e179f02fb2b0595ca324b8fe5f";
+    const LEADING_ZERO_Q: &str = concat!(
+        "5de4347ae98154a6cc25f4e5df12b92956c5a678f656731780107beb1e2b9288",
+        "8e145f52939c8c8f03c7b0699fbe417f1f619e46194e8656b92fa2766f50c84e"
+    );
+    const LEADING_ZERO_PEER: &str = concat!(
+        "1c3b316b2a830b95c33db030f5b822c0b84cc4f5e8e64bed07a4c3e0be9e86aa",
+        "b74fab021fcef445bfc46fdc27cc6a44a58d72a30bbb0805b9418c67a7f44296"
+    );
+    const LEADING_ZERO_SECRET: &str = "00048c61f1b2a4063a21c0ec1bac79cd87518cc7fbbb7ff025deb48c7bd26045";
+
     #[test]
     fn ecdh_rejects_non_canonical_points() {
         let a = EcdhKey::generate().unwrap();

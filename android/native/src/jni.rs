@@ -36,6 +36,7 @@ pub const JNI_VERSION_1_6: i32 = 0x0001_0006;
 /// Indexes into `JNINativeInterface` (<jni.h>; the first four entries are reserved).
 mod ix {
     pub const FIND_CLASS: usize = 6;
+    pub const THROW: usize = 13;
     pub const THROW_NEW: usize = 14;
     pub const EXCEPTION_OCCURRED: usize = 15;
     pub const EXCEPTION_CLEAR: usize = 17;
@@ -121,7 +122,9 @@ pub fn env() -> Result<Env> {
     if r != JNI_OK || e.is_null() {
         return Err(Error::msg(format!("cannot attach a thread to the Java VM ({r})")));
     }
-    ATTACHED.with(|a| a.0.set(true));
+    // A thread past its thread-locals' end (in a destructor) stays attached until it exits,
+    // which the VM tolerates for daemon threads.
+    let _ = ATTACHED.try_with(|a| a.0.set(true));
     Ok(Env(e.cast()))
 }
 
@@ -162,8 +165,23 @@ impl Global {
 
 impl Drop for Global {
     fn drop(&mut self) {
-        if let Ok(env) = env() {
-            unsafe { call!(env.0, ix::DELETE_GLOBAL_REF, fn(JObject) -> (), self.0) };
+        let vm = VM.load(Ordering::Acquire) as *mut *const *const c_void;
+        if vm.is_null() {
+            return;
+        }
+        // On a thread not attached (one whose thread-locals are already being torn down
+        // included) it is attached just for this, and detached again.
+        let mut e: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let attached = call!(vm, VM_GET_ENV, fn(*mut *mut c_void, i32) -> i32, &mut e, JNI_VERSION_1_6) == JNI_OK;
+            if !attached && call!(vm, VM_ATTACH_CURRENT_THREAD_AS_DAEMON, fn(*mut *mut c_void, *mut c_void) -> i32, &mut e, std::ptr::null_mut()) != JNI_OK {
+                return;
+            }
+            let env = e as *mut *const *const c_void;
+            call!(env, ix::DELETE_GLOBAL_REF, fn(JObject) -> (), self.0);
+            if !attached {
+                call!(vm, VM_DETACH_CURRENT_THREAD, fn() -> i32);
+            }
         }
     }
 }
@@ -187,19 +205,62 @@ impl Env {
         Local { env: self, obj }
     }
 
-    /// The pending Java exception, cleared, as an error (its `toString()`).
+    fn pending(self) -> bool {
+        unsafe { call!(self.0, ix::EXCEPTION_CHECK, fn() -> u8) != 0 }
+    }
+
+    fn clear(self) {
+        unsafe { call!(self.0, ix::EXCEPTION_CLEAR, fn() -> ()) };
+    }
+
+    /// `byte[]` `a`'s contents, read without raising anything (None if that fails).
+    fn quiet_bytes(self, a: JObject) -> Option<Vec<u8>> {
+        let n = self.array_len(a);
+        let mut v = vec![0u8; n];
+        if n > 0 {
+            unsafe { call!(self.0, ix::GET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *mut u8) -> (), a, 0, n as i32, v.as_mut_ptr()) };
+        }
+        if self.pending() {
+            self.clear();
+            return None;
+        }
+        Some(v)
+    }
+
+    /// A new `byte[]` holding `data`, made without raising anything.
+    fn quiet_array(self, data: &[u8]) -> Option<Local> {
+        let n = i32::try_from(data.len()).ok()?;
+        let a = self.local(unsafe { call!(self.0, ix::NEW_BYTE_ARRAY, fn(i32) -> JObject, n) });
+        if !a.obj.is_null() && n > 0 {
+            unsafe { call!(self.0, ix::SET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *const u8) -> (), a.obj, 0, n, data.as_ptr()) };
+        }
+        if self.pending() || a.obj.is_null() {
+            self.clear();
+            return None;
+        }
+        Some(a)
+    }
+
+    /// The pending Java exception, cleared, as an error (its `toString()`). Describing it runs
+    /// no check of its own: a failure there (out of memory, say) cannot recurse.
     fn check(self) -> Result<()> {
-        if unsafe { call!(self.0, ix::EXCEPTION_CHECK, fn() -> u8) } == 0 {
+        if !self.pending() {
             return Ok(());
         }
         let t = self.local(unsafe { call!(self.0, ix::EXCEPTION_OCCURRED, fn() -> JObject) });
-        unsafe { call!(self.0, ix::EXCEPTION_CLEAR, fn() -> ()) };
-        let text = up()
-            .and_then(|u| self.call_object(u.describe, &[obj(t.obj)]))
-            .and_then(|s| self.bytes(&s))
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_else(|_| "a Java exception".into());
-        Err(Error::msg(text))
+        self.clear();
+        let mut text = None;
+        if let Ok(u) = up() {
+            let args = [obj(t.obj)];
+            let m = u.describe;
+            let s = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, args.as_ptr()) });
+            if self.pending() {
+                self.clear();
+            } else if !s.obj.is_null() {
+                text = self.quiet_bytes(s.obj).map(|b| String::from_utf8_lossy(&b).into_owned());
+            }
+        }
+        Err(Error::msg(text.unwrap_or_else(|| "a Java exception".into())))
     }
 
     pub fn find_class(self, name: &std::ffi::CStr) -> Result<Global> {
@@ -209,10 +270,30 @@ impl Env {
     }
 
     /// Raises a `java.lang.IllegalStateException` with `msg` for when the native method returns.
+    /// The text goes to Java as UTF-8 bytes (`Crypto.failure`): `ThrowNew` takes JNI's modified
+    /// UTF-8, which text from a host (an emoji in a notice) need not be.
     pub fn throw(self, msg: &str) {
-        let Ok(c) = self.find_class(c"java/lang/IllegalStateException") else { return };
-        let text = std::ffi::CString::new(msg.replace('\0', " ")).unwrap_or_default();
-        unsafe { call!(self.0, ix::THROW_NEW, fn(JObject, *const c_char) -> i32, c.0, text.as_ptr()) };
+        self.clear();
+        if let Ok(u) = up()
+            && let Some(text) = self.quiet_array(msg.as_bytes())
+        {
+            let args = [obj(text.obj)];
+            let m = u.failure;
+            let t = self.local(unsafe { call!(self.0, ix::CALL_STATIC_OBJECT_METHOD_A, fn(JObject, JMethod, *const JValue) -> JObject, m.class, m.id, args.as_ptr()) });
+            if !self.pending() && !t.obj.is_null() && unsafe { call!(self.0, ix::THROW, fn(JObject) -> i32, t.obj) } == JNI_OK {
+                return;
+            }
+            self.clear();
+        }
+        // Without the Java side (or its memory): ASCII, which modified UTF-8 shares.
+        let ascii: String = msg.chars().map(|c| if c.is_ascii() && c != '\0' { c } else { '?' }).collect();
+        let text = std::ffi::CString::new(ascii).unwrap_or_default();
+        let c = self.local(unsafe { call!(self.0, ix::FIND_CLASS, fn(*const c_char) -> JObject, c"java/lang/IllegalStateException".as_ptr()) });
+        if self.pending() || c.obj.is_null() {
+            self.clear();
+            return;
+        }
+        unsafe { call!(self.0, ix::THROW_NEW, fn(JObject, *const c_char) -> i32, c.obj, text.as_ptr()) };
     }
 
     pub fn global(self, l: &Local) -> Result<Global> {
@@ -258,13 +339,16 @@ impl Env {
 
     /// A new `byte[]` holding `data`.
     pub fn byte_array(self, data: &[u8]) -> Result<Local> {
-        let a = self.local(unsafe { call!(self.0, ix::NEW_BYTE_ARRAY, fn(i32) -> JObject, data.len() as i32) });
+        let n = i32::try_from(data.len()).map_err(|_| Error::msg("too much data for a Java array"))?;
+        let a = self.local(unsafe { call!(self.0, ix::NEW_BYTE_ARRAY, fn(i32) -> JObject, n) });
         self.check()?;
         if a.obj.is_null() {
             return Err(Error::msg("NewByteArray failed"));
         }
-        unsafe { call!(self.0, ix::SET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *const u8) -> (), a.obj, 0, data.len() as i32, data.as_ptr()) };
-        self.check()?;
+        if n > 0 {
+            unsafe { call!(self.0, ix::SET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *const u8) -> (), a.obj, 0, n, data.as_ptr()) };
+            self.check()?;
+        }
         Ok(a)
     }
 
@@ -282,15 +366,6 @@ impl Env {
         }
         unsafe { call!(self.0, ix::GET_BYTE_ARRAY_REGION, fn(JObject, i32, i32, *mut u8) -> (), a, 0, out.len() as i32, out.as_mut_ptr()) };
         self.check()
-    }
-
-    /// The contents of `byte[]` `a` (empty for null).
-    pub fn bytes(self, a: &Local) -> Result<Vec<u8>> {
-        let mut v = vec![0; self.array_len(a.obj)];
-        if !v.is_empty() {
-            self.read_bytes(a.obj, &mut v)?;
-        }
-        Ok(v)
     }
 
     pub fn bytes_raw(self, a: JObject) -> Result<Vec<u8>> {
@@ -313,7 +388,10 @@ impl Env {
 
     /// A direct `ByteBuffer` over `len` bytes at `p`, which must outlive every use Java makes of it.
     pub fn direct(self, p: *mut u8, len: usize) -> Result<Local> {
-        // A zero-length buffer at a dangling pointer is fine for Java, but not every JNI accepts null.
+        // A zero-length buffer at a dangling pointer (an empty slice's) is fine for Java; null is not.
+        if p.is_null() || i64::try_from(len).is_err() {
+            return Err(Error::msg("no memory for a direct buffer"));
+        }
         let b = self.local(unsafe { call!(self.0, ix::NEW_DIRECT_BYTE_BUFFER, fn(*mut c_void, i64) -> JObject, p.cast(), len as i64) });
         self.check()?;
         if b.obj.is_null() {
@@ -337,6 +415,7 @@ impl Env {
 /// class loader knows the app's classes; this library's own threads only see the system's).
 pub struct Up {
     pub describe: Method,
+    pub failure: Method,
     pub random: Method,
     pub digest: Method,
     pub digest_update: Method,
@@ -375,6 +454,7 @@ pub fn init(env: Env) -> Result<()> {
     let m = |c: &Global, name: &std::ffi::CStr, sig: &std::ffi::CStr| env.static_method(c, name, sig);
     let up = Up {
         describe: m(&crypto, c"describe", c"(Ljava/lang/Throwable;)[B")?,
+        failure: m(&crypto, c"failure", c"([B)Ljava/lang/Throwable;")?,
         random: m(&crypto, c"random", c"([B)V")?,
         digest: m(&crypto, c"digest", c"()Ljava/lang/Object;")?,
         digest_update: m(&crypto, c"digestUpdate", c"(Ljava/lang/Object;Ljava/nio/ByteBuffer;)V")?,

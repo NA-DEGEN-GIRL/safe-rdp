@@ -1,5 +1,7 @@
 package io.github.na_degen_girl.saferdp;
 
+import android.app.KeyguardManager;
+import android.content.Context;
 import android.os.Build;
 import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
@@ -57,20 +59,22 @@ final class KeyVault {
      * Stores 32 key bytes (zeroed here afterwards) and returns the alias. With {@code auth}, using
      * the key needs the device unlocked or a biometric check within {@link #AUTH_SECONDS}.
      */
-    static String importKey(byte[] key, boolean auth) throws GeneralSecurityException {
-        SecretKeySpec spec = new SecretKeySpec(key, "HmacSHA256");
+    static String importKey(Context c, byte[] key, boolean auth) throws GeneralSecurityException {
         try {
+            SecretKeySpec spec = new SecretKeySpec(key, "HmacSHA256");
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(spec);
             String alias = PREFIX + hex(mac.doFinal(FINGERPRINT_LABEL), 8);
+            // Stored again even if a key of that fingerprint is there: with the protection asked
+            // for now, and in place of one the system invalidated (new fingerprints enrolled).
             KeyStore ks = store();
-            if (ks.containsAlias(alias)) return alias;
+            boolean locked = deviceSecure(c);
             try {
-                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, true));
+                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, locked, true));
             } catch (GeneralSecurityException | java.security.ProviderException e) {
                 // No StrongBox (reported as StrongBoxUnavailableException, on some devices inside a
                 // KeyStoreException): the TEE then. Any other problem shows again below.
-                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, false));
+                ks.setEntry(alias, new KeyStore.SecretKeyEntry(spec), protection(auth, locked, false));
             }
             return alias;
         } finally {
@@ -78,9 +82,19 @@ final class KeyVault {
         }
     }
 
-    private static KeyProtection protection(boolean auth, boolean strongBox) {
+    /** Whether the device has a screen lock (a PIN, pattern or password). */
+    static boolean deviceSecure(Context c) {
+        KeyguardManager km = c.getSystemService(KeyguardManager.class);
+        return km != null && km.isDeviceSecure();
+    }
+
+    /**
+     * With a screen lock, the key works only while the device is unlocked (whoever holds it
+     * locked cannot use the key, whatever runs on it); without one that would mean nothing.
+     */
+    private static KeyProtection protection(boolean auth, boolean screenLock, boolean strongBox) {
         KeyProtection.Builder b = new KeyProtection.Builder(KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY)
-                .setUnlockedDeviceRequired(true)
+                .setUnlockedDeviceRequired(screenLock)
                 .setIsStrongBoxBacked(strongBox);
         if (auth) {
             b.setUserAuthenticationRequired(true)
@@ -110,11 +124,25 @@ final class KeyVault {
         }
     }
 
+    /** Whether using the key asks for an unlock or a fingerprint (false if unknown). */
+    static boolean needsUser(String alias) {
+        try {
+            return info(alias).isUserAuthenticationRequired();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static KeyInfo info(String alias) throws GeneralSecurityException {
+        SecretKey k = (SecretKey) store().getKey(alias, null);
+        if (k == null) throw new GeneralSecurityException("no stored key " + alias);
+        return (KeyInfo) SecretKeyFactory.getInstance(k.getAlgorithm(), STORE).getKeySpec(k, KeyInfo.class);
+    }
+
     /** Where the key lives: "StrongBox", "TEE" or "software". */
     static String where(String alias) {
         try {
-            SecretKey k = (SecretKey) store().getKey(alias, null);
-            KeyInfo info = (KeyInfo) SecretKeyFactory.getInstance(k.getAlgorithm(), STORE).getKeySpec(k, KeyInfo.class);
+            KeyInfo info = info(alias);
             if (Build.VERSION.SDK_INT >= 31) {
                 switch (info.getSecurityLevel()) {
                     case KeyProperties.SECURITY_LEVEL_STRONGBOX: return "StrongBox";

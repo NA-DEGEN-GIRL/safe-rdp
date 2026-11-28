@@ -120,17 +120,36 @@ impl Renderer {
     }
 
     pub fn start(self: &Arc<Self>, screen: Arc<Screen>) -> Result<()> {
+        /// However the thread ends (a panic included): a window handed over and not taken yet is
+        /// let go, and whoever waits for a detach is woken, not left waiting for a thread that is
+        /// gone (the UI thread, in `surfaceDestroyed`).
+        struct Ended(Arc<Renderer>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.running.store(false, Ordering::SeqCst);
+                let mut s = lock(&self.0.state);
+                if let Some(Command::Attach(w)) = s.command.take() {
+                    unsafe { ANativeWindow_release(w) };
+                }
+                s.detached = true;
+                drop(s);
+                self.0.cv.notify_all();
+            }
+        }
         let me = self.clone();
         self.running.store(true, Ordering::SeqCst);
-        std::thread::Builder::new().name("render".into()).spawn(move || {
-            if let Err(e) = me.run(&screen) {
-                log!("drawing failed: {e}");
+        let spawned = std::thread::Builder::new().name("render".into()).spawn(move || {
+            let _ended = Ended(me.clone());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.run(&screen))) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log!("drawing failed: {e}"),
+                Err(_) => log!("drawing failed (out of memory?)"),
             }
-            me.running.store(false, Ordering::SeqCst);
-            // Whoever waits for a detach must not wait for a thread that is gone.
-            lock(&me.state).detached = true;
-            me.cv.notify_all();
-        })?;
+        });
+        if let Err(e) = spawned {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -142,6 +161,10 @@ impl Renderer {
     /// Draws into `window` from now on (an `ANativeWindow` this call takes over).
     pub fn attach(&self, window: *mut ANativeWindow) {
         let mut s = lock(&self.state);
+        if s.stop || !self.running.load(Ordering::SeqCst) {
+            unsafe { ANativeWindow_release(window) };
+            return;
+        }
         if let Some(Command::Attach(old)) = s.command.replace(Command::Attach(window)) {
             unsafe { ANativeWindow_release(old) };
         }
@@ -168,7 +191,13 @@ impl Renderer {
     }
 
     pub fn stop(&self) {
-        lock(&self.state).stop = true;
+        let mut s = lock(&self.state);
+        s.stop = true;
+        // Not drawn into any more: let go of a window handed over meanwhile.
+        if let Some(Command::Attach(w)) = s.command.take() {
+            unsafe { ANativeWindow_release(w) };
+        }
+        drop(s);
         self.cv.notify_all();
     }
 
@@ -265,19 +294,13 @@ impl Gl {
             let mut config: EGLConfig = std::ptr::null_mut();
             let mut n = 0;
             if eglChooseConfig(display, attrs.as_ptr(), &mut config, 1, &mut n) != EGL_TRUE || n < 1 {
-                eglTerminate(display);
                 crate::bail!("no suitable EGL configuration ({:#x})", eglGetError());
-            }
-            let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
-            let context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attrs.as_ptr());
-            if context == EGL_NO_CONTEXT {
-                eglTerminate(display);
-                crate::bail!("cannot create an OpenGL ES 3 context ({:#x})", eglGetError());
             }
             Ok(Gl {
                 display,
                 config,
-                context,
+                // Made for each window (`attach`), destroyed with it (`detach`).
+                context: EGL_NO_CONTEXT,
                 surface: None,
                 program: 0,
                 u_rect: -1,
@@ -296,14 +319,22 @@ impl Gl {
     fn attach(&mut self, window: *mut ANativeWindow) -> Result<()> {
         self.detach();
         unsafe {
+            let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
+            self.context = eglCreateContext(self.display, self.config, EGL_NO_CONTEXT, ctx_attrs.as_ptr());
+            if self.context == EGL_NO_CONTEXT {
+                ANativeWindow_release(window);
+                crate::bail!("cannot create an OpenGL ES 3 context ({:#x})", eglGetError());
+            }
             let s = eglCreateWindowSurface(self.display, self.config, window, std::ptr::null());
             if s == EGL_NO_SURFACE {
                 ANativeWindow_release(window);
+                self.drop_context();
                 crate::bail!("eglCreateWindowSurface failed ({:#x})", eglGetError());
             }
             if eglMakeCurrent(self.display, s, s, self.context) != EGL_TRUE {
                 eglDestroySurface(self.display, s);
                 ANativeWindow_release(window);
+                self.drop_context();
                 crate::bail!("eglMakeCurrent failed ({:#x})", eglGetError());
             }
             self.surface = Some((s, window));
@@ -319,34 +350,70 @@ impl Gl {
         Ok(())
     }
 
-    /// Wipes and deletes the screen texture, then lets go of the window.
+    fn drop_context(&mut self) {
+        if self.context != EGL_NO_CONTEXT {
+            unsafe { eglDestroyContext(self.display, self.context) };
+            self.context = EGL_NO_CONTEXT;
+        }
+    }
+
+    /// Overwrites the screen texture with zeros on the GPU (drawing into it: nothing that size is
+    /// allocated in this process), then deletes it.
+    unsafe fn wipe_texture(&mut self) {
+        if self.tex == 0 {
+            return;
+        }
+        let (tw, th) = self.tex_size;
+        unsafe {
+            let mut fbo = 0;
+            glGenFramebuffers(1, &mut fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.tex, 0);
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE {
+                glViewport(0, 0, tw as i32, th as i32);
+                glClearColor(0.0, 0.0, 0.0, 0.0);
+                glClear(GL_COLOR_BUFFER_BIT);
+            } else {
+                // A band of zero rows at a time.
+                let rows = (1 << 20) / (tw * 4).max(1);
+                let zeros = vec![0u8; tw * 4 * rows.max(1)];
+                glBindTexture(GL_TEXTURE_2D, self.tex);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                let mut y = 0;
+                while y < th {
+                    let n = rows.max(1).min(th - y);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y as i32, tw as i32, n as i32, GL_RGBA, GL_UNSIGNED_BYTE, zeros.as_ptr().cast());
+                    y += n;
+                }
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &fbo);
+            glDeleteTextures(1, &self.tex);
+            glFinish();
+        }
+        self.tex = 0;
+        self.tex_size = (0, 0);
+    }
+
+    /// Wipes and deletes the screen texture, then lets go of the window and the context.
     fn detach(&mut self) {
         let Some((s, w)) = self.surface.take() else { return };
         unsafe {
-            if self.tex != 0 {
-                let (tw, th) = self.tex_size;
-                let zeros = vec![0u8; tw * th * 4];
-                glBindTexture(GL_TEXTURE_2D, self.tex);
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tw as i32, th as i32, GL_RGBA, GL_UNSIGNED_BYTE, zeros.as_ptr().cast());
-                glDeleteTextures(1, &self.tex);
-                glFinish();
-                self.tex = 0;
-                self.tex_size = (0, 0);
+            self.wipe_texture();
+            if self.pointer_tex != 0 {
+                glDeleteTextures(1, &self.pointer_tex);
+            }
+            if self.program != 0 {
+                glDeleteProgram(self.program);
             }
             eglMakeCurrent(self.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroySurface(self.display, s);
             ANativeWindow_release(w);
         }
-        // Without a current context the other objects cannot be deleted; they go with it.
         self.program = 0;
         self.pointer_tex = 0;
         self.pointer = None;
-        unsafe {
-            eglDestroyContext(self.display, self.context);
-            let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
-            self.context = eglCreateContext(self.display, self.config, EGL_NO_CONTEXT, ctx_attrs.as_ptr());
-        }
+        self.drop_context();
     }
 
     fn draw(&mut self, screen: &Screen) {
@@ -355,6 +422,9 @@ impl Gl {
         unsafe {
             eglQuerySurface(self.display, surface, EGL_WIDTH, &mut sw);
             eglQuerySurface(self.display, surface, EGL_HEIGHT, &mut sh);
+            if sw <= 0 || sh <= 0 {
+                return;
+            }
             glViewport(0, 0, sw, sh);
             glClearColor(0.0, 0.0, 0.0, 1.0);
             glClear(GL_COLOR_BUFFER_BIT);
@@ -485,10 +555,9 @@ impl Gl {
 impl Drop for Gl {
     fn drop(&mut self) {
         self.detach();
-        unsafe {
-            eglDestroyContext(self.display, self.context);
-            eglTerminate(self.display);
-        }
+        self.drop_context();
+        // The display is not terminated: it is the process's, and another session's renderer
+        // may still be using it.
     }
 }
 

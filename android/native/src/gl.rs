@@ -33,7 +33,6 @@ pub const EGL_HEIGHT: i32 = 0x3056;
 unsafe extern "C" {
     pub fn eglGetDisplay(id: *mut c_void) -> EGLDisplay;
     pub fn eglInitialize(d: EGLDisplay, major: *mut i32, minor: *mut i32) -> u32;
-    pub fn eglTerminate(d: EGLDisplay) -> u32;
     pub fn eglChooseConfig(d: EGLDisplay, attrs: *const i32, configs: *mut EGLConfig, size: i32, n: *mut i32) -> u32;
     pub fn eglCreateContext(d: EGLDisplay, c: EGLConfig, share: EGLContext, attrs: *const i32) -> EGLContext;
     pub fn eglDestroyContext(d: EGLDisplay, ctx: EGLContext) -> u32;
@@ -80,6 +79,9 @@ pub const GL_LINK_STATUS: GLenum = 0x8B82;
 pub const GL_BLEND: GLenum = 0x0BE2;
 pub const GL_SRC_ALPHA: GLenum = 0x0302;
 pub const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
+pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
+pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+pub const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 
 #[link(name = "GLESv3")]
 unsafe extern "C" {
@@ -116,4 +118,9 @@ unsafe extern "C" {
     pub fn glDisable(cap: GLenum);
     pub fn glBlendFunc(s: GLenum, d: GLenum);
     pub fn glFinish();
+    pub fn glGenFramebuffers(n: i32, out: *mut GLuint);
+    pub fn glDeleteFramebuffers(n: i32, f: *const GLuint);
+    pub fn glBindFramebuffer(target: GLenum, f: GLuint);
+    pub fn glFramebufferTexture2D(target: GLenum, attachment: GLenum, textarget: GLenum, tex: GLuint, level: GLint);
+    pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
 }

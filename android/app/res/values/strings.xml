@@ -44,7 +44,9 @@
     <string name="key_where">stored in: %1$s</string>
     <string name="delete_key">Delete key</string>
     <string name="delete_key_explained">Key %1$s will be deleted from this phone. Hosts that use it cannot be reached until a key is imported again.</string>
-    <string name="clipboard_empty">The clipboard holds no text.</string>
+    <string name="clipboard_no_key">The clipboard holds no key (text starting with srdp1-). Copy the key first.</string>
+    <string name="key_needs_user">needs an unlock or fingerprint</string>
+    <string name="key_missing">%1$s (missing: import it again)</string>
     <string name="key_stored">Key stored</string>
     <string name="key_stored_explained">Fingerprint %1$s, in %2$s. The clipboard was cleared.</string>
     <string name="import_failed">Cannot import the key</string>

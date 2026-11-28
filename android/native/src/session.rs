@@ -100,6 +100,10 @@ impl Event {
 /// The pre-shared key, however it is held.
 pub type Key = Box<dyn Psk + Send + Sync>;
 
+/// Events that may wait in the queue at most: Java takes them as they come, so this many only
+/// pile up if the host floods (the kinds it can repeat are merged first, `emit`).
+const MAX_EVENTS: usize = 256;
+
 struct Input {
     touch: Touch,
     /// Mouse buttons held (Android's MotionEvent button bits).
@@ -108,15 +112,35 @@ struct Input {
     wheel: (f32, f32),
 }
 
+impl Input {
+    /// Forgets held buttons, half-made gestures and partial wheel steps (what the host was told
+    /// is released separately, by `ClientMsg::ReleaseAll` or a new connection).
+    fn reset(&mut self) {
+        self.touch.cancel();
+        self.buttons = 0;
+        self.wheel = (0.0, 0.0);
+    }
+}
+
+/// How a connection's reading ended: a link problem is classified as the desktop viewers do; a
+/// message that cannot be decoded is the host's fault, and reconnecting would not help.
+type ReadEnd = (EndKind, Error);
+
+fn fatal(e: Error) -> ReadEnd {
+    (EndKind::Fatal, e)
+}
+
 pub struct Session {
     target: String,
     key: Key,
     opts: Mutex<ViewerOptions>,
+    /// View only by the user's choice; `is_view_only` adds the host's.
     view_only: bool,
     pub screen: Arc<Screen>,
     pub renderer: Arc<Renderer>,
     out: Mutex<Option<Arc<OutQueue>>>,
     stream: Mutex<Option<TcpStream>>,
+    // Lock order: `input`, then `screen.view`, then `screen.pointer`.
     input: Mutex<Input>,
     events: Mutex<VecDeque<Event>>,
     events_cv: Condvar,
@@ -125,15 +149,18 @@ pub struct Session {
     ended: AtomicBool,
     /// The host's capability flags of the current connection.
     flags: AtomicU32,
-    /// Off the screen: frames are not acknowledged, so the host stops sending them.
+    /// Off the screen: frames are not acknowledged (so the host stops sending them), sound is not
+    /// played and the host's clipboard text waits in `held_clipboard`.
     paused: AtomicBool,
     /// The newest frame not acknowledged while paused (`u64::MAX`: none).
     unacked: AtomicU64,
+    held_clipboard: Mutex<Option<String>>,
     last_notice: Mutex<Option<Instant>>,
 }
 
 impl Session {
     pub fn start(target: String, key: Key, opts: ViewerOptions, mode: Mode, density: f32) -> Result<Arc<Session>> {
+        let density = if density.is_finite() { density.clamp(0.5, 8.0) } else { 1.0 };
         let screen = Arc::new(Screen::new(density));
         let renderer = Renderer::new();
         renderer.start(screen.clone())?;
@@ -154,20 +181,50 @@ impl Session {
             flags: AtomicU32::new(0),
             paused: AtomicBool::new(false),
             unacked: AtomicU64::new(u64::MAX),
+            held_clipboard: Mutex::new(None),
             last_notice: Mutex::new(None),
         });
         let me = s.clone();
-        std::thread::Builder::new().name("session".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("session".into()).spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.control()));
             if r.is_err() {
                 me.end("the viewer failed while handling the host's data (out of memory?)".into());
             }
-        })?;
+            // A tiles message decoding when the session was closed may have drawn after the
+            // first wipe.
+            me.screen.wipe();
+        });
+        if let Err(e) = spawned {
+            s.renderer.stop();
+            return Err(e.into());
+        }
         Ok(s)
     }
 
+    /// View only, by the user's choice or the host's (`F_VIEW_ONLY`).
+    fn is_view_only(&self) -> bool {
+        self.view_only || self.flags.load(Ordering::SeqCst) & F_VIEW_ONLY != 0
+    }
+
+    /// Queues an event for Java. Of the kinds a host can send over and over only the newest
+    /// waits, so a flood neither grows the queue nor stacks dialogs.
     fn emit(&self, e: Event) {
-        lock(&self.events).push_back(e);
+        let mut q = lock(&self.events);
+        let same = |old: &Event| match (old, &e) {
+            (Event::Clipboard(_), Event::Clipboard(_))
+            | (Event::Notice(_), Event::Notice(_))
+            | (Event::Cursor(_), Event::Cursor(_))
+            | (Event::Stats(_), Event::Stats(_))
+            | (Event::Haptic, Event::Haptic) => true,
+            (Event::State(a, _), Event::State(b, _)) => a == b,
+            _ => false,
+        };
+        if let Some(i) = q.iter().position(same) {
+            q[i] = e;
+        } else if q.len() < MAX_EVENTS || matches!(e, Event::Status(..) | Event::Hello { .. }) {
+            q.push_back(e);
+        }
+        drop(q);
         self.events_cv.notify_all();
     }
 
@@ -202,16 +259,21 @@ impl Session {
         }
         self.renderer.stop();
         self.screen.wipe();
+        lock(&self.held_clipboard).take();
     }
 
-    /// Ends the session at the user's request.
+    /// Ends the session at the user's request (again: nothing more happens).
     pub fn close(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        if let Some(out) = lock(&self.out).as_ref() {
-            out.send(ClientMsg::ReleaseAll);
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
         }
-        // Let the release go out before the socket closes; the writer is quick.
-        std::thread::sleep(Duration::from_millis(30));
+        if let Some(out) = lock(&self.out).as_ref()
+            && !self.is_view_only()
+            && out.send(ClientMsg::ReleaseAll)
+        {
+            // Let the release go out before the socket closes; the writer is quick.
+            std::thread::sleep(Duration::from_millis(30));
+        }
         if let Some(s) = lock(&self.stream).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -311,26 +373,34 @@ impl Session {
     /// One connection, until it ends: how and why.
     fn run(&self, conn: Connection) -> (EndKind, String) {
         let Connection { stream, mut reader, mut writer, width, height, flags, host_name, monitors, monitor, .. } = conn;
-        self.flags.store(flags, Ordering::SeqCst);
-        let out = Arc::new(OutQueue::default());
-        *lock(&self.stream) = stream.try_clone().ok();
-        *lock(&self.out) = Some(out.clone());
         if self.stopped() {
             let _ = stream.shutdown(Shutdown::Both);
+            return (EndKind::Closed, String::new());
+        }
+        self.flags.store(flags, Ordering::SeqCst);
+        self.unacked.store(u64::MAX, Ordering::SeqCst);
+        let out = Arc::new(OutQueue::default());
+        *lock(&self.stream) = Some(stream);
+        *lock(&self.out) = Some(out.clone());
+        // `close` may have run between the check above and the stream being kept here.
+        if self.stopped()
+            && let Some(s) = lock(&self.stream).as_ref()
+        {
+            let _ = s.shutdown(Shutdown::Both);
         }
         {
+            let mut input = lock(&self.input);
+            input.reset();
             let mut v = lock(&self.screen.view);
             v.set_remote(width as f32, height as f32);
-            let mut input = lock(&self.input);
-            let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
-            if input.touch.pointer() == (0.0, 0.0) {
-                input.touch.set_pointer(&v, cx, cy);
-                lock(&self.screen.pointer).at = (cx, cy);
-            }
+            let (px, py) = input.touch.pointer();
+            let at = if (px, py) == (0.0, 0.0) { (width as f32 / 2.0, height as f32 / 2.0) } else { (px, py) };
+            input.touch.set_pointer(&v, at.0, at.1);
+            lock(&self.screen.pointer).at = input.touch.pointer();
         }
         self.emit(Event::Hello { flags, width: width as u16, height: height as u16, monitor, monitors: monitors.len() as u8, name: host_name });
         self.emit(Event::Status(CONNECTED, String::new()));
-        self.fit_screen(width, height);
+        let mut max_tex = self.fit_screen(width, height);
 
         // Pings carry the time they were sent, since `epoch`; the host echoes it.
         let epoch = Instant::now();
@@ -353,61 +423,85 @@ impl Session {
             })
         };
         let r = match writer_thread {
-            Ok(_) => self.read(&mut reader, &out, (width, height), epoch),
-            Err(e) => Err(Error::from(e)),
+            Ok(_) => self.read(&mut reader, &out, (width, height), epoch, &mut max_tex),
+            Err(e) => Err(fatal(e.into())),
         };
         out.close();
-        let _ = stream.shutdown(Shutdown::Both);
+        if let Some(s) = lock(&self.stream).take() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
         *lock(&self.out) = None;
-        *lock(&self.stream) = None;
         let stalled = out.stalled();
         match r {
             Ok(()) => (EndKind::Closed, "the host closed the connection".into()),
+            Err((EndKind::Fatal, e)) => (EndKind::Fatal, e.to_string()),
             Err(_) if stalled => (EndKind::Network, viewer::STALLED.into()),
-            Err(e) => {
-                let kind = viewer::classify_link_error(&e);
+            Err((kind, e)) => {
                 let reason = if kind == EndKind::Closed { "the host closed the connection".into() } else { e.to_string() };
                 (kind, reason)
             }
         }
     }
 
-    /// Asks the host for a smaller picture if this one is more than the phone takes.
-    fn fit_screen(&self, w: usize, h: usize) {
+    /// Asks the host for a smaller picture if this one (`w`x`h`, as sent at the current scale) is
+    /// more than the phone takes; returns the texture size limit it went by (0: not known yet).
+    fn fit_screen(&self, w: usize, h: usize) -> usize {
         let max_tex = self.screen.max_texture.load(Ordering::SeqCst).max(0) as usize;
-        let fits = |n: usize| (w / n) * (h / n) <= MAX_PIXELS && (max_tex == 0 || (w / n <= max_tex && h / n <= max_tex));
-        if fits(1) {
-            return;
+        let current = lock(&self.opts).downscale.clamp(1, 4) as usize;
+        // The host's full size, as far as this picture tells it.
+        let (fw, fh) = (w * current, h * current);
+        let fits = |n: usize| (fw / n) * (fh / n) <= MAX_PIXELS && (max_tex == 0 || (fw / n <= max_tex && fh / n <= max_tex));
+        if fits(current) {
+            return max_tex;
         }
-        let current = lock(&self.opts).downscale.max(1) as usize;
-        if let Some(n) = (current + 1..=4).find(|&n| fits(n * current) || n == 4) {
+        let n = (current + 1..=4).find(|&n| fits(n)).unwrap_or(4);
+        if n > current {
             log!("the remote screen ({w}x{h}) is too large for this phone; asking for 1/{n}");
             lock(&self.opts).downscale = n as u8;
             self.send(ClientMsg::Set { key: SET_DOWNSCALE, value: n as u32 });
         }
+        max_tex
     }
 
     /// Reads the host's messages until the connection ends.
-    fn read(&self, reader: &mut channel::RecordReader<TcpStream>, out: &OutQueue, mut size: (usize, usize), epoch: Instant) -> Result<()> {
-        let mut dec = TileDecoder::new()?;
+    fn read(
+        &self,
+        reader: &mut channel::RecordReader<TcpStream>,
+        out: &OutQueue,
+        mut size: (usize, usize),
+        epoch: Instant,
+        max_tex: &mut usize,
+    ) -> std::result::Result<(), ReadEnd> {
+        let mut dec = TileDecoder::new().map_err(fatal)?;
         let mut sound = lock(&self.opts).audio.then(AudioReceiver::default);
         let mut sound_warned = false;
         let (mut frames, mut bytes) = (0u64, 0u64);
         let mut meter = RateMeter::new(Instant::now());
         let mut rtt_ms = None;
         loop {
-            let rec = reader.recv()?;
+            let rec = reader.recv().map_err(|e| (viewer::classify_link_error(&e), e))?;
             bytes += rec.len() as u64 + 20;
-            match ServerMsg::decode(rec)? {
+            match ServerMsg::decode(rec).map_err(fatal)? {
                 ServerMsg::Tiles(p) => {
-                    let hdr = codec::parse_header(p)?;
-                    if (hdr.width, hdr.height) != size {
-                        size = (hdr.width, hdr.height);
-                        lock(&self.screen.view).set_remote(hdr.width as f32, hdr.height as f32);
-                        self.fit_screen(hdr.width, hdr.height);
+                    let hdr = codec::parse_header(p).map_err(fatal)?;
+                    // The renderer learns the GPU's texture limit only once it has a surface.
+                    let known = self.screen.max_texture.load(Ordering::SeqCst).max(0) as usize;
+                    if (hdr.width, hdr.height) != size || known != *max_tex {
+                        if (hdr.width, hdr.height) != size {
+                            size = (hdr.width, hdr.height);
+                            let mut input = lock(&self.input);
+                            let v = {
+                                let mut v = lock(&self.screen.view);
+                                v.set_remote(hdr.width as f32, hdr.height as f32);
+                                v.clone()
+                            };
+                            let (px, py) = input.touch.pointer();
+                            input.touch.set_pointer(&v, px, py);
+                        }
+                        *max_tex = self.fit_screen(hdr.width, hdr.height);
                     }
                     if hdr.width * hdr.height <= MAX_PIXELS {
-                        self.tiles(&mut dec, p, hdr.width, hdr.height)?;
+                        self.tiles(&mut dec, p, hdr.width, hdr.height).map_err(fatal)?;
                     }
                     if hdr.last {
                         frames += 1;
@@ -426,7 +520,13 @@ impl Session {
                 }
                 ServerMsg::Clipboard(t) => {
                     if lock(&self.opts).clipboard {
-                        self.emit(Event::Clipboard(t));
+                        // Out of sight it waits: it must not replace what the user copies
+                        // in another app meanwhile.
+                        if self.paused.load(Ordering::SeqCst) {
+                            *lock(&self.held_clipboard) = Some(t);
+                        } else {
+                            self.emit(Event::Clipboard(t));
+                        }
                     }
                 }
                 ServerMsg::Notice(t) => {
@@ -434,17 +534,30 @@ impl Session {
                     self.emit(Event::Notice(printable(&t)));
                 }
                 ServerMsg::Audio { rate, channels, codec, data, .. } => {
-                    if let Some(s) = sound.as_mut()
-                        && !self.paused.load(Ordering::SeqCst)
-                        && let Err(e) = s.play(rate, channels, codec, data)
-                        && !std::mem::replace(&mut sound_warned, true)
-                    {
-                        log!("cannot play the host's sound: {e}");
+                    if let Some(s) = sound.as_mut() {
+                        if self.paused.load(Ordering::SeqCst) {
+                            s.stop();
+                        } else if let Err(e) = s.play(rate, channels, codec, data)
+                            && !std::mem::replace(&mut sound_warned, true)
+                        {
+                            log!("cannot play the host's sound: {e}");
+                        }
                     }
                 }
                 ServerMsg::State { key, value } => {
-                    if key == SET_AUDIO {
-                        sound = (value == 1).then(AudioReceiver::default);
+                    let wanted = lock(&self.opts).audio;
+                    match (key, value) {
+                        (SET_AUDIO, 1) if !wanted => {
+                            // Sound the user did not ask for is refused.
+                            out.send(ClientMsg::Set { key: SET_AUDIO, value: 0 });
+                            continue;
+                        }
+                        (SET_AUDIO, _) => sound = (value == 1).then(AudioReceiver::default),
+                        (SET_PRIVACY, STATE_UNAVAILABLE) => lock(&self.opts).privacy = false,
+                        _ => {}
+                    }
+                    if (key, value) == (SET_AUDIO, STATE_UNAVAILABLE) {
+                        lock(&self.opts).audio = false;
                     }
                     self.emit(Event::State(key, value));
                 }
@@ -495,16 +608,17 @@ impl Session {
     }
 
     fn act(&self, actions: Vec<Action>) {
+        let view_only = self.is_view_only();
         for a in actions {
             match a {
                 Action::Move(x, y) => {
                     lock(&self.screen.pointer).at = (x as f32, y as f32);
-                    if !self.view_only {
+                    if !view_only {
                         self.send(ClientMsg::MouseMove { x, y });
                     }
                 }
-                Action::Button(button, down) if !self.view_only => self.send(ClientMsg::MouseButton { button, down }),
-                Action::Wheel { delta, horizontal } if !self.view_only => self.send(ClientMsg::Wheel { delta, horizontal }),
+                Action::Button(button, down) if !view_only => self.send(ClientMsg::MouseButton { button, down }),
+                Action::Wheel { delta, horizontal } if !view_only => self.send(ClientMsg::Wheel { delta, horizontal }),
                 Action::Haptic => self.emit(Event::Haptic),
                 _ => {}
             }
@@ -514,6 +628,9 @@ impl Session {
 
     /// A touch: `kind` 0 down, 1 move, 2 up, 3 cancel.
     pub fn touch(&self, kind: i32, id: i32, x: f32, y: f32, t: u64) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
         let actions = {
             let mut input = lock(&self.input);
             let mut view = lock(&self.screen.view);
@@ -533,9 +650,12 @@ impl Session {
         self.act(actions);
     }
 
-    /// A mouse (or touchpad, or stylus used as one): `kind` 0 moved, 1 buttons changed, 2 scrolled.
-    /// `buttons` are MotionEvent's button bits; scrolling is in notches.
+    /// A mouse (or touchpad): `kind` 0 moved, 1 buttons changed, 2 scrolled. `buttons` are
+    /// MotionEvent's button bits; scrolling is in notches.
     pub fn mouse(&self, kind: i32, x: f32, y: f32, buttons: i32, v: f32, h: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
         let mut actions = Vec::new();
         {
             let mut input = lock(&self.input);
@@ -543,10 +663,7 @@ impl Session {
             let (rx, ry) = view.to_remote(x, y);
             input.touch.set_pointer(&view, rx, ry);
             drop(view);
-            {
-                let mut p = lock(&self.screen.pointer);
-                p.drawn = false;
-            }
+            lock(&self.screen.pointer).drawn = false;
             actions.push(Action::Move(rx.round() as u16, ry.round() as u16));
             if kind == 1 {
                 // BUTTON_PRIMARY, SECONDARY, TERTIARY, BACK, FORWARD.
@@ -558,7 +675,7 @@ impl Session {
                 }
                 input.buttons = buttons;
             }
-            if kind == 2 {
+            if kind == 2 && v.is_finite() && h.is_finite() {
                 let wheel = &mut input.wheel;
                 wheel.0 += h * 120.0;
                 wheel.1 += v * 120.0;
@@ -576,7 +693,7 @@ impl Session {
 
     /// A key (Linux evdev code, as `KeyEvent.getScanCode()` gives and the app's keyboard sends).
     pub fn key(&self, evdev: i32, down: bool) {
-        if self.view_only {
+        if self.is_view_only() {
             return;
         }
         let Some((vk, scan, ext)) = u16::try_from(evdev).ok().and_then(keymap::from_evdev) else { return };
@@ -586,35 +703,55 @@ impl Session {
 
     /// A setting (`SET_*`); kept for reconnects too.
     pub fn set(&self, key: u8, value: u32) {
-        {
-            let mut o = lock(&self.opts);
-            match key {
-                SET_QUALITY => o.quality = value as u8,
-                SET_DOWNSCALE => o.downscale = value.clamp(1, 4) as u8,
-                SET_MONITOR => o.monitor = value as u8,
-                SET_AUDIO => o.audio = value == 1,
-                SET_PRIVACY => o.privacy = value == 1,
-                _ => return,
-            }
-        }
-        if self.view_only && key == SET_PRIVACY {
+        if key == SET_PRIVACY && self.is_view_only() {
             return;
         }
+        let value = {
+            let mut o = lock(&self.opts);
+            match key {
+                SET_QUALITY if value <= QUALITY_LOW => {
+                    o.quality = value as u8;
+                    value
+                }
+                SET_DOWNSCALE => {
+                    o.downscale = value.clamp(1, 4) as u8;
+                    o.downscale as u32
+                }
+                SET_MONITOR if value <= MONITOR_ALL as u32 => {
+                    o.monitor = value as u8;
+                    value
+                }
+                SET_AUDIO => {
+                    o.audio = value == 1;
+                    o.audio as u32
+                }
+                SET_PRIVACY => {
+                    o.privacy = value == 1;
+                    o.privacy as u32
+                }
+                _ => return,
+            }
+        };
         self.send(ClientMsg::Set { key, value });
     }
 
     pub fn command(&self, cmd: i32) {
+        let view_only = self.is_view_only();
         match cmd {
-            CMD_SAS if !self.view_only => self.send(ClientMsg::Sas),
+            CMD_SAS if !view_only => self.send(ClientMsg::Sas),
             CMD_REFRESH => self.send(ClientMsg::Refresh),
-            CMD_RELEASE_ALL if !self.view_only => self.send(ClientMsg::ReleaseAll),
-            CMD_PAUSE => {
-                self.paused.store(true, Ordering::SeqCst);
-                if !self.view_only {
+            CMD_RELEASE_ALL => {
+                lock(&self.input).reset();
+                if !view_only {
                     self.send(ClientMsg::ReleaseAll);
                 }
-                let cancel = lock(&self.input).touch.cancel();
-                self.act(cancel);
+            }
+            CMD_PAUSE => {
+                self.paused.store(true, Ordering::SeqCst);
+                lock(&self.input).reset();
+                if !view_only {
+                    self.send(ClientMsg::ReleaseAll);
+                }
             }
             CMD_RESUME => {
                 self.paused.store(false, Ordering::SeqCst);
@@ -623,6 +760,9 @@ impl Session {
                     self.send(ClientMsg::Ack(f as u32));
                 }
                 self.send(ClientMsg::Refresh);
+                if let Some(t) = lock(&self.held_clipboard).take() {
+                    self.emit(Event::Clipboard(t));
+                }
                 self.renderer.redraw();
             }
             CMD_RESET_VIEW => {
@@ -630,7 +770,13 @@ impl Session {
                 self.renderer.redraw();
             }
             CMD_TRACKPAD | CMD_DIRECT => {
-                lock(&self.input).touch.mode = if cmd == CMD_TRACKPAD { Mode::Trackpad } else { Mode::Direct };
+                let mut input = lock(&self.input);
+                input.reset();
+                input.touch.mode = if cmd == CMD_TRACKPAD { Mode::Trackpad } else { Mode::Direct };
+                drop(input);
+                if !view_only {
+                    self.send(ClientMsg::ReleaseAll);
+                }
                 self.renderer.redraw();
             }
             _ => {}
@@ -638,12 +784,15 @@ impl Session {
     }
 
     pub fn clipboard(&self, text: String) {
-        if lock(&self.opts).clipboard && !self.view_only && self.flags.load(Ordering::SeqCst) & F_CLIPBOARD != 0 && text.len() <= MAX_CLIPBOARD {
+        if lock(&self.opts).clipboard && !self.is_view_only() && self.flags.load(Ordering::SeqCst) & F_CLIPBOARD != 0 && text.len() <= MAX_CLIPBOARD {
             self.send(ClientMsg::Clipboard(text));
         }
     }
 
     pub fn surface_size(&self, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
         lock(&self.screen.view).set_surface(w as f32, h as f32);
         self.renderer.redraw();
     }

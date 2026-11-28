@@ -114,22 +114,32 @@ final class KeyboardView extends View {
     @Override
     protected void onMeasure(int w, int h) {
         int width = MeasureSpec.getSize(w);
-        // Five rows: about 44 dp each, less in landscape so the remote screen keeps most of the height.
+        // Five rows: about 44 dp each, less in landscape so the remote screen keeps most of the
+        // height; the padding (a cutout, the navigation bar) comes on top.
         int screenH = getResources().getDisplayMetrics().heightPixels;
-        int height = Math.min(Math.round(5 * 44 * density), screenH * 2 / 5);
+        int keys = Math.min(Math.round(5 * 44 * density), screenH * 2 / 5);
+        int height = keys + getPaddingTop() + getPaddingBottom();
+        if (MeasureSpec.getMode(h) != MeasureSpec.UNSPECIFIED) height = Math.min(height, MeasureSpec.getSize(h));
         setMeasuredDimension(width, height);
     }
 
+    /** The height of one row of keys, inside the padding. */
+    private float rowHeight() {
+        return Math.max(0, getHeight() - getPaddingTop() - getPaddingBottom()) / (float) rows.length;
+    }
+
     private void layout() {
-        float rowH = (float) getHeight() / rows.length;
+        float rowH = rowHeight();
         float gap = 2 * density;
+        float left = getPaddingLeft(), top = getPaddingTop();
+        float width = Math.max(0, getWidth() - getPaddingLeft() - getPaddingRight());
         for (int r = 0; r < rows.length; r++) {
             float units = 0;
             for (Key key : rows[r]) units += key.width;
-            float unit = getWidth() / Math.max(units, 15f);
-            float x = (getWidth() - unit * units) / 2;
+            float unit = width / Math.max(units, 15f);
+            float x = left + (width - unit * units) / 2;
             for (Key key : rows[r]) {
-                key.box.set(x + gap, r * rowH + gap, x + key.width * unit - gap, (r + 1) * rowH - gap);
+                key.box.set(x + gap, top + r * rowH + gap, x + key.width * unit - gap, top + (r + 1) * rowH - gap);
                 x += key.width * unit;
             }
         }
@@ -138,7 +148,7 @@ final class KeyboardView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         layout();
-        float rowH = (float) getHeight() / rows.length;
+        float rowH = rowHeight();
         textPaint.setTextSize(Math.min(rowH * 0.38f, 18 * density));
         subPaint.setTextSize(Math.min(rowH * 0.26f, 12 * density));
         for (Key[] row : rows) {
@@ -215,6 +225,8 @@ final class KeyboardView extends View {
             }
             return;
         }
+        // A second finger on a key already held (a wide one, like the space bar) adds nothing.
+        if (down.containsValue(key)) return;
         down.put(id, key);
         sink.key(key.code, true);
         Runnable r = new Runnable() {
@@ -250,5 +262,12 @@ final class KeyboardView extends View {
         for (int code : new ArrayList<>(mods.keySet())) sink.key(code, false);
         mods.clear();
         invalidate();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        releaseAll();
+        handler.removeCallbacksAndMessages(null);
+        super.onDetachedFromWindow();
     }
 }
