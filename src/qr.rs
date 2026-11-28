@@ -443,6 +443,8 @@ impl Grid {
                 }
             }
         }
+        // A row of the symbol.
+        wipe_bools(&mut line);
         for y in 1..n {
             for x in 1..n {
                 let c = self.dark[y * n + x];
@@ -525,13 +527,22 @@ fn rs_blocks(layout: Layout, data: &[u8]) -> Vec<Vec<u8>> {
         .map(|b| {
             let (block, tail) = rest.split_at(layout.data_len(b));
             rest = tail;
-            [block, &rs_remainder(block, &divisor)].concat()
+            // What is computed from the data (a key, for `key qr`) is wiped like it.
+            let mut ecc = rs_remainder(block, &divisor);
+            let mut out = Vec::with_capacity(block.len() + ecc.len());
+            out.extend_from_slice(block);
+            out.extend_from_slice(&ecc);
+            crate::util::wipe(&mut ecc);
+            out
         })
         .collect()
 }
 
 fn interleave(layout: Layout, blocks: &[Vec<u8>]) -> Vec<u8> {
-    layout.order().map(|(b, i)| blocks[b][i]).collect()
+    // Room for all of it: a buffer that grew would leave copies behind.
+    let mut out = Vec::with_capacity(blocks.iter().map(Vec::len).sum());
+    out.extend(layout.order().map(|(b, i)| blocks[b][i]));
+    out
 }
 
 fn deinterleave(layout: Layout, codewords: &[u8]) -> Vec<Vec<u8>> {

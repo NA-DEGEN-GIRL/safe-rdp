@@ -1,5 +1,8 @@
 //! Key storage on Linux: `$XDG_CONFIG_HOME/safe-rdp/key` (default `~/.config/safe-rdp/key`),
-//! directory 0700 and file 0600, like an SSH private key.
+//! file 0600 in a directory made 0700, like an SSH private key. As with `~/.ssh`, a directory
+//! that is there already is taken as long as it is this user's and nobody else can write to it:
+//! others reading it see that there is a key, not the key; and a link to such a directory (a
+//! dotfile manager's) is followed, as only this user could have put it there.
 
 use super::xvfb::O_NOFOLLOW;
 use crate::keys::format_key;
@@ -39,7 +42,7 @@ fn save_key(path: &Path, k: &Secret<32>) -> Result<()> {
     // One made before (by hand, say) must not let anyone else replace the key.
     let m = std::fs::metadata(dir)?;
     if !m.is_dir() || m.uid() != unsafe { geteuid() } || m.mode() & 0o022 != 0 {
-        crate::bail!("{} must be a directory of this user that nobody else can write to; run `chmod 700` on it", dir.display());
+        crate::bail!("{} must be a directory of this user that nobody else can write to; run `chmod go-w` on it", dir.display());
     }
     let tmp = dir.join(".key.tmp");
     let _ = std::fs::remove_file(&tmp);

@@ -70,6 +70,7 @@ pub const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 pub const GL_UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
 pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const GL_MAX_TEXTURE_SIZE: GLenum = 0x0D33;
+pub const GL_VIEWPORT: GLenum = 0x0BA2;
 pub const GL_COLOR_BUFFER_BIT: GLenum = 0x4000;
 pub const GL_TRIANGLE_STRIP: GLenum = 0x0005;
 pub const GL_VERTEX_SHADER: GLenum = 0x8B31;

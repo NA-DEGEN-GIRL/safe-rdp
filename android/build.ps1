@@ -8,6 +8,10 @@
 # Needs the Android SDK (platform 36, build-tools 36+), the NDK, a JDK 17+ and the Rust targets
 # aarch64-linux-android / x86_64-linux-android. Output: android\build\<debug|release>\safe-rdp.apk
 
+# Windows PowerShell 5 writes the libraries deflated whatever level is asked for (step 4), and
+# Android does not install such an APK.
+#Requires -Version 7
+
 param(
     [switch]$Release,
     [ValidateSet('arm64-v8a', 'x86_64')][string[]]$Abi = @('arm64-v8a', 'x86_64')

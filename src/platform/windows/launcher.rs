@@ -69,6 +69,8 @@ const DEVICE_REFRESH_MS: u32 = 15_000;
 const CLIPBOARD_CLEAR_MS: u32 = 60_000;
 /// Next try at emptying the clipboard while another program holds it open.
 const CLIPBOARD_RETRY_MS: u32 = 1_000;
+/// How long closing the launcher keeps trying to clear it.
+const CLIPBOARD_EXIT_WAIT: Duration = Duration::from_secs(2);
 /// How often a running host's key is compared with the stored one.
 const KEY_CHECK_MS: u32 = 2_000;
 /// Time a stopping host gets to exit on its own (its stdin is closed first) before it is killed.
@@ -4122,7 +4124,17 @@ impl App {
         if let Some(p) = host {
             stop_host(p, Duration::from_millis(800));
         }
-        self.clear_clipboard();
+        // No timer fires once the window is gone: while another program has the clipboard open,
+        // tried again here for a while rather than leaving the key there.
+        let until = Instant::now() + CLIPBOARD_EXIT_WAIT;
+        loop {
+            self.clear_clipboard();
+            if self.st.borrow().clip_seq.is_none() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe { KillTimer(self.hwnd, TIMER_CLIPBOARD) };
         if self.st.borrow().key_shown {
             scrub_edit(self.c.k_shown);
         }

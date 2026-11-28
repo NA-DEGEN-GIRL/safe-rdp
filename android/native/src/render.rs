@@ -358,13 +358,16 @@ impl Gl {
     }
 
     /// Overwrites the screen texture with zeros on the GPU (drawing into it: nothing that size is
-    /// allocated in this process), then deletes it.
+    /// allocated in this process), its smaller copies (mipmaps) too, then deletes it. The
+    /// viewport is put back; the clear colour is not (`draw` sets it every time).
     unsafe fn wipe_texture(&mut self) {
         if self.tex == 0 {
             return;
         }
         let (tw, th) = self.tex_size;
         unsafe {
+            let mut viewport = [0; 4];
+            glGetIntegerv(GL_VIEWPORT, viewport.as_mut_ptr());
             let mut fbo = 0;
             glGenFramebuffers(1, &mut fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -388,11 +391,18 @@ impl Gl {
             }
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glDeleteFramebuffers(1, &fbo);
+            if self.mipmapped {
+                // Made again from the level that is zeros now.
+                glBindTexture(GL_TEXTURE_2D, self.tex);
+                glGenerateMipmap(GL_TEXTURE_2D);
+            }
             glDeleteTextures(1, &self.tex);
             glFinish();
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
         }
         self.tex = 0;
         self.tex_size = (0, 0);
+        self.mipmapped = false;
     }
 
     /// Wipes and deletes the screen texture, then lets go of the window and the context.
@@ -466,9 +476,10 @@ impl Gl {
         }
         unsafe {
             if self.tex == 0 || self.tex_size != (w, h) {
-                if self.tex == 0 {
-                    glGenTextures(1, &mut self.tex);
-                }
+                // A screen of another size: the old one is not left in memory the driver may
+                // keep (giving the texture a new size does not overwrite it).
+                self.wipe_texture();
+                glGenTextures(1, &mut self.tex);
                 glBindTexture(GL_TEXTURE_2D, self.tex);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w as i32, h as i32, 0, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null());
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);

@@ -237,6 +237,12 @@ impl Bridge {
                 let owner = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
                 let selection = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
                 if selection == self.atoms.clipboard && owner != self.win {
+                    // One from before we took the clipboard, which waited in the queue meanwhile,
+                    // is no news: we own it still, and letting go of the text would leave us
+                    // refusing every paste.
+                    if self.owned.is_some() && self.conn.get_selection_owner(self.atoms.clipboard)? == self.win {
+                        return Ok(());
+                    }
                     wipe_string(&mut self.owned);
                     self.fetch = None;
                     if owner != NONE {

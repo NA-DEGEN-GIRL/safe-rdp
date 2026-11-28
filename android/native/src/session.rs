@@ -514,9 +514,14 @@ impl Session {
                     if hdr.last {
                         frames += 1;
                         self.renderer.redraw();
+                        // Under the lock `CMD_RESUME` changes `paused` under: a frame noted after
+                        // it had looked would be acknowledged at some later return, long out of
+                        // date, and the host would hold its frames back.
+                        let held = lock(&self.held_clipboard);
                         if self.paused.load(Ordering::SeqCst) {
                             self.unacked.store(hdr.frame as u64, Ordering::SeqCst);
                         } else {
+                            drop(held);
                             out.send(ClientMsg::Ack(hdr.frame));
                         }
                     }
@@ -773,12 +778,11 @@ impl Session {
                 }
             }
             CMD_RESUME => {
-                let held = {
+                let (held, f) = {
                     let mut held = lock(&self.held_clipboard);
                     self.paused.store(false, Ordering::SeqCst);
-                    held.take()
+                    (held.take(), self.unacked.swap(u64::MAX, Ordering::SeqCst))
                 };
-                let f = self.unacked.swap(u64::MAX, Ordering::SeqCst);
                 if f != u64::MAX {
                     self.send(ClientMsg::Ack(f as u32));
                 }

@@ -43,7 +43,10 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 pub const SERVICE_NAME: &str = "SafeRdpHost";
 const DISPLAY_NAME: &str = "safe-rdp host";
-const SAS_EVENT: &str = r"Global\SafeRdpSas";
+/// Followed by the suffix of the agent's stop event: the event that agent signals to have the
+/// service generate Ctrl+Alt+Del. Named anew for every agent, like the stop event: a fixed name
+/// could be taken by any program before the service starts.
+const SAS_EVENT: &str = r"Global\SafeRdpSas-";
 /// Followed by a random suffix: the event the service signals to stop one agent.
 const AGENT_STOP_EVENT: &str = r"Global\SafeRdpAgentStop-";
 /// The agent's first argument, followed by the name of its stop event.
@@ -77,11 +80,19 @@ static AGENT_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 static STATUS: AtomicUsize = AtomicUsize::new(0);
 static STOP_EVENT: AtomicUsize = AtomicUsize::new(0);
 static SESSION_EVENT: AtomicUsize = AtomicUsize::new(0);
+/// In the agent: the name of its Ctrl+Alt+Del event (`watch_stop_event` learns it).
+static SAS_NAME: OnceLock<String> = OnceLock::new();
+
+/// The name of the Ctrl+Alt+Del event of the agent whose stop event is named `stop_event`.
+fn sas_event_name(stop_event: &str) -> Option<String> {
+    Some(format!("{SAS_EVENT}{}", stop_event.strip_prefix(AGENT_STOP_EVENT)?))
+}
 
 /// Called by the agent: asks the service to generate Ctrl+Alt+Del.
 pub fn request_sas() -> bool {
+    let Some(name) = SAS_NAME.get() else { return false };
     unsafe {
-        let h = OpenEventW(EVENT_MODIFY_STATE, 0, wide(SAS_EVENT).as_ptr());
+        let h = OpenEventW(EVENT_MODIFY_STATE, 0, wide(name).as_ptr());
         if h.is_null() {
             return false;
         }
@@ -104,6 +115,9 @@ pub fn agent_stop_event(args: &[String]) -> (Option<&str>, &[String]) {
 /// cannot be opened or waited on is never taken for a stop request; the service then
 /// terminates the agent instead.
 pub fn watch_stop_event(name: &str, stop: &'static AtomicBool) -> Result<()> {
+    if let Some(sas) = sas_event_name(name) {
+        let _ = SAS_NAME.set(sas);
+    }
     let h = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(name).as_ptr()) };
     if h.is_null() {
         return Err(Error::last_os(&format!("OpenEventW({name})")));
@@ -217,6 +231,26 @@ fn stop_and_wait(svc: &Sc) -> bool {
             known = QueryServiceStatus(svc.0, &mut st) != 0;
         }
         known && st.dwCurrentState == SERVICE_STOPPED
+    }
+}
+
+/// Copies this program to `to`. A service that stopped just now (`stopped`) reports that a moment
+/// before its process is gone, and its executable stays in use until then: tried again for a
+/// few seconds.
+fn copy_program(from: &std::path::Path, to: &std::path::Path, stopped: bool) -> std::io::Result<()> {
+    let t = Instant::now();
+    loop {
+        match std::fs::copy(from, to) {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if stopped
+                    && [ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE].map(|c| Some(c as i32)).contains(&e.raw_os_error())
+                    && t.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -387,6 +421,7 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
     let scm = open_scm()?;
     let key = key_for_service(expect)?;
 
+    let mut stopped = false;
     if let Some(svc) = open_service(&scm) {
         log!("stopping the existing service...");
         // Its agent reads the key when it starts: one still running would keep the old key while
@@ -395,6 +430,7 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
             drop(key);
             exit_with(EXIT_NOT_STOPPED, NOT_STOPPED);
         }
+        stopped = true;
     }
     // Run from Program Files so that only administrators can replace the SYSTEM binary. Copied
     // before the key or its fingerprint change: when this fails (the copy there is still open,
@@ -405,7 +441,7 @@ pub fn install(host_args: &[String], port: u16, enable_sas: bool, expect: Option
     let exe = dir.join("safe-rdp.exe");
     let me = std::env::current_exe()?;
     if !same_file(&me, &exe)
-        && let Err(e) = std::fs::copy(&me, &exe)
+        && let Err(e) = copy_program(&me, &exe, stopped)
     {
         // Back to how it was, as far as that goes.
         let note = match open_service(&scm) {
@@ -633,8 +669,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
             return;
         }
         STATUS.store(h as usize, Ordering::SeqCst);
-        STOP_EVENT.store(CreateEventW(null(), 1, 0, null()) as usize, Ordering::SeqCst);
-        SESSION_EVENT.store(CreateEventW(null(), 0, 0, null()) as usize, Ordering::SeqCst);
+        let (stop, session) = (CreateEventW(null(), 1, 0, null()), CreateEventW(null(), 0, 0, null()));
+        if stop.is_null() || session.is_null() {
+            // Without them it could neither wait nor be stopped.
+            set_state(SERVICE_STOPPED, ERROR_NOT_ENOUGH_MEMORY);
+            return;
+        }
+        STOP_EVENT.store(stop as usize, Ordering::SeqCst);
+        SESSION_EVENT.store(session as usize, Ordering::SeqCst);
         // Log only into a directory that is provably the administrators' (see keystore); the
         // agent refuses to start without one as well.
         let code = match keystore::check_service_dir() {
@@ -699,7 +741,12 @@ fn kill_on_close_job() -> Result<HANDLE> {
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const c_void, size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+        if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const c_void, size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32) == 0 {
+            // A job that kept nothing from outliving the service.
+            let e = Error::last_os("SetInformationJobObject");
+            CloseHandle(job);
+            return Err(e);
+        }
         Ok(job)
     }
 }
@@ -709,6 +756,8 @@ struct Agent {
     process: HANDLE,
     /// Signalled to ask the agent to stop.
     stop_event: OwnedHandle,
+    /// Signalled by the agent to have Ctrl+Alt+Del generated.
+    sas_event: OwnedHandle,
     session: u32,
     started: Instant,
 }
@@ -756,7 +805,14 @@ fn spawn(token: HANDLE, exe: &str, cmd: &str, desktop: Option<&str>, job: HANDLE
         if CreateProcessAsUserW(token, wide(exe).as_ptr(), wcmd.as_mut_ptr(), null(), null(), 0, flags, null(), null(), &si, &mut pi) == 0 {
             return Err(Error::last_os("CreateProcessAsUserW"));
         }
-        AssignProcessToJobObject(job, pi.hProcess);
+        if AssignProcessToJobObject(job, pi.hProcess) == 0 {
+            // Not left to run outside the job: it would outlive a service that died.
+            let e = Error::last_os("AssignProcessToJobObject");
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return Err(e);
+        }
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
         Ok(pi.hProcess)
@@ -774,6 +830,7 @@ fn agent_command(exe: &str, stop_event: &str, host_args: &[String]) -> Vec<Strin
 fn launch_agent(session: u32, job: HANDLE) -> Result<Agent> {
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let (stop_event, name) = new_stop_event(SYSTEM_ONLY)?;
+    let sas_event = create_event(&sas_event_name(&name).ok_or("the stop event's name")?, SYSTEM_ONLY, false)?;
     let cmd = command_line(&agent_command(&exe, &name, AGENT_ARGS.get().map_or(&[], Vec::as_slice)))?;
     unsafe {
         let mut tok: HANDLE = null_mut();
@@ -792,20 +849,20 @@ fn launch_agent(session: u32, job: HANDLE) -> Result<Agent> {
         }
         let r = spawn(dup, &exe, &cmd, Some(r"winsta0\default"), job);
         CloseHandle(dup);
-        Ok(Agent { process: r?, stop_event, session, started: Instant::now() })
+        Ok(Agent { process: r?, stop_event, sas_event, session, started: Instant::now() })
     }
 }
 
 fn supervise() -> Result<()> {
     let stop = STOP_EVENT.load(Ordering::SeqCst) as HANDLE;
     let session_evt = SESSION_EVENT.load(Ordering::SeqCst) as HANDLE;
-    let sas = create_event(SAS_EVENT, SYSTEM_ONLY, false)?;
     let job = kill_on_close_job()?;
     log!("service started");
 
     let mut agent: Option<Agent> = None;
     let mut next_launch = Instant::now();
     let mut backoff = Duration::from_secs(2);
+    let mut failed = None;
     loop {
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         if let Some(a) = agent.take_if(|a| a.session != session) {
@@ -827,19 +884,19 @@ fn supervise() -> Result<()> {
             }
         }
 
-        let mut handles = vec![stop, sas.as_raw_handle() as HANDLE, session_evt];
+        let mut handles = vec![stop, session_evt];
         if let Some(a) = &agent {
-            handles.push(a.process);
+            handles.extend([a.process, a.sas_event.as_raw_handle() as HANDLE]);
         }
         let r = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 2000) };
         match r.wrapping_sub(WAIT_OBJECT_0) {
             0 => break,
-            1 => {
+            1 => {}
+            3 => {
                 log!("generating Ctrl+Alt+Del");
                 unsafe { SendSAS(0) };
             }
-            2 => {}
-            3 => {
+            2 => {
                 let Some(a) = agent.take() else { continue };
                 let mut code = 0u32;
                 unsafe { GetExitCodeProcess(a.process, &mut code) };
@@ -850,6 +907,11 @@ fn supervise() -> Result<()> {
                 next_launch = Instant::now() + backoff;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
+            // Not waited on again: it would fail at once every time, and never see a stop.
+            _ if r == WAIT_FAILED => {
+                failed = Some(Error::last_os("WaitForMultipleObjects"));
+                break;
+            }
             _ => {}
         }
     }
@@ -858,6 +920,9 @@ fn supervise() -> Result<()> {
         a.stop(AGENT_STOP_WAIT);
     }
     unsafe { CloseHandle(job) };
+    if let Some(e) = failed {
+        return Err(e);
+    }
     log!("service stopped");
     Ok(())
 }
@@ -910,6 +975,13 @@ mod tests {
     use super::*;
 
     const EXE: &str = r"C:\Program Files\safe-rdp\safe-rdp.exe";
+
+    #[test]
+    fn the_sas_event_is_named_after_the_stop_event() {
+        let name = format!("{AGENT_STOP_EVENT}00112233aabbccdd");
+        assert_eq!(sas_event_name(&name).unwrap(), r"Global\SafeRdpSas-00112233aabbccdd");
+        assert_eq!(sas_event_name(r"Global\Other-00112233aabbccdd"), None);
+    }
 
     #[test]
     fn arguments_survive_the_command_line() {
@@ -1099,7 +1171,8 @@ mod tests {
         let mut watch: HANDLE = null_mut();
         let me = unsafe { GetCurrentProcess() };
         assert!(unsafe { DuplicateHandle(me, process, me, &mut watch, 0, 0, DUPLICATE_SAME_ACCESS) } != 0);
-        (Agent { process, stop_event, session: 0, started: Instant::now() }, watch)
+        let sas_event = create_event(&sas_event_name(name).unwrap(), TEST_SDDL, false).unwrap();
+        (Agent { process, stop_event, sas_event, session: 0, started: Instant::now() }, watch)
     }
 
     #[test]

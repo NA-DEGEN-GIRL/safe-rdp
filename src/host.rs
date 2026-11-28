@@ -1174,6 +1174,15 @@ struct Input {
     privacy: Toggle<Held>,
 }
 
+/// Records that the viewer acknowledged frame `id`. Never backwards: an older acknowledgement
+/// arriving late (a viewer back from a pause) would hold frames back until the viewer
+/// acknowledged a newer one, which it then never gets.
+fn advance_ack(acked: &AtomicU32, id: u32) {
+    if id.wrapping_sub(acked.load(Ordering::SeqCst)) < 1 << 31 {
+        acked.store(id, Ordering::SeqCst);
+    }
+}
+
 impl Input {
     fn new(
         host: Arc<Host>,
@@ -1242,7 +1251,7 @@ impl Input {
 
     fn handle(&mut self, m: ClientMsg) -> Result<()> {
         match m {
-            ClientMsg::Ack(id) => self.shared.acked.store(id, Ordering::SeqCst),
+            ClientMsg::Ack(id) => advance_ack(&self.shared.acked, id),
             ClientMsg::Refresh => self.shared.refresh.store(true, Ordering::SeqCst),
             ClientMsg::Ping(t) => self.out.send(&ServerMsg::Pong(t))?,
             // The receiving thread names the session (`receive`).
@@ -1833,6 +1842,8 @@ fn capture_loop(
     let mut capture_failures = 0u32;
     let mut scaled = LockedBuf::new(0);
     let mut last_upgrade_try = Instant::now();
+    // Since when the monitor shared is not there, and whether the viewer was told.
+    let mut monitor_gone: Option<(Instant, bool)> = None;
 
     while !ctl.stopped() {
         let t0 = Instant::now();
@@ -1887,7 +1898,11 @@ fn capture_loop(
         if switched || capturer.is_none() || last_geometry_check.elapsed() > Duration::from_millis(500) {
             last_geometry_check = Instant::now();
             let current = capturer.as_ref().map(|c| c.area());
-            match capture::resolve(sel) {
+            let area = capture::resolve(sel);
+            if area.is_some() && monitor_gone.take().is_some() {
+                log!("monitor available again");
+            }
+            match area {
                 Some(a) if switched || current != Some(a) => {
                     capturer = None; // release the old device/DCs before creating new ones
                     match Capturer::open(sel, a) {
@@ -1914,7 +1929,20 @@ fn capture_loop(
                     }
                 }
                 Some(_) => {}
-                None if capturer.is_none() => log!("monitor not available"),
+                // Logged once, not on every pass: it may stay away for as long as the session
+                // lasts. The viewer is told once that lasts (a mode change takes the monitors
+                // away for a moment).
+                None if capturer.is_none() => match &mut monitor_gone {
+                    None => {
+                        log!("monitor not available");
+                        monitor_gone = Some((Instant::now(), false));
+                    }
+                    Some((since, told)) if !*told && since.elapsed() > Duration::from_secs(3) => {
+                        *told = true;
+                        out.notice("the monitor shown is not available on the host right now".into())?;
+                    }
+                    Some(_) => {}
+                },
                 None => {}
             }
         }
@@ -2010,6 +2038,24 @@ fn capture_loop(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn acknowledgements_do_not_go_backwards() {
+        let acked = AtomicU32::new(0);
+        advance_ack(&acked, 7);
+        assert_eq!(acked.load(Ordering::SeqCst), 7);
+        advance_ack(&acked, 5);
+        assert_eq!(acked.load(Ordering::SeqCst), 7);
+        advance_ack(&acked, 7);
+        advance_ack(&acked, 9);
+        assert_eq!(acked.load(Ordering::SeqCst), 9);
+        // Frame numbers wrap around.
+        acked.store(u32::MAX - 1, Ordering::SeqCst);
+        advance_ack(&acked, 1);
+        assert_eq!(acked.load(Ordering::SeqCst), 1);
+        advance_ack(&acked, u32::MAX);
+        assert_eq!(acked.load(Ordering::SeqCst), 1);
+    }
 
     fn opts() -> HostOptions {
         HostOptions { monitor: MonitorSel::Index(1), ..HostOptions::default() }
