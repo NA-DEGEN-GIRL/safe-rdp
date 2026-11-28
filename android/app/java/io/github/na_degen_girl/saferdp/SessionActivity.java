@@ -721,7 +721,8 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         keyboard.releaseAll();
         command(Native.CMD_PAUSE);
         // Not while the unlock screen is up before a session exists: that is this screen's own doing.
-        if (!isFinishing() && session != 0) {
+        // Nor for a session that is over or being replaced, whose handle is cleared a moment later.
+        if (!recreating && !ended && !isFinishing() && session != 0) {
             ui.postDelayed(graceOver, GRACE_MS);
             SessionService.start(this);
         }

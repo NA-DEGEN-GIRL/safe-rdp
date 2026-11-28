@@ -63,9 +63,11 @@
             android:theme="@style/Theme.Session"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden" />
 
+        <!-- Stopped with the task: swiped away from the recent apps, nothing of the session stays. -->
         <service
             android:name=".SessionService"
             android:exported="false"
+            android:stopWithTask="true"
             android:foregroundServiceType="shortService" />
     </application>
 </manifest>
