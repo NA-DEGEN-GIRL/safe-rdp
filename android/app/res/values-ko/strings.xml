@@ -76,4 +76,6 @@
     <string name="scan_hint">키의 QR 코드에 카메라를 비추세요 (safe-rdp key qr).</string>
     <string name="no_camera">이 기기에는 카메라가 없습니다.</string>
     <string name="camera_failed">카메라 오류 (%1$d).</string>
+    <string name="session_channel">세션</string>
+    <string name="session_kept">세션 연결을 잠시 유지합니다</string>
 </resources>

@@ -46,6 +46,7 @@ import java.nio.ByteOrder;
  * A session: the remote screen full screen, a bar of controls behind the button at the top, the
  * PC keyboard at the bottom. While the app is out of sight the session is paused (the host stops
  * sending frames), and it ends after {@link #GRACE_MS} or at once when the screen turns off.
+ * {@link SessionService} runs meanwhile, or Android would freeze the app and close the connection.
  */
 public final class SessionActivity extends Activity implements SurfaceHolder.Callback {
     /** How long a session outlives the app being left. */
@@ -301,6 +302,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
                 } else if (state == CONNECTING) {
                     status.setText(getString(R.string.connecting, host.title()));
                 } else if (state == ENDED) {
+                    SessionService.stop();
                     if (text.isEmpty() || isFinishing()) finish();
                     else showEnded(text);
                 }
@@ -709,6 +711,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
     protected void onStart() {
         super.onStart();
         ui.removeCallbacks(graceOver);
+        SessionService.stop();
         command(Native.CMD_RESUME);
     }
 
@@ -718,7 +721,10 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         keyboard.releaseAll();
         command(Native.CMD_PAUSE);
         // Not while the unlock screen is up before a session exists: that is this screen's own doing.
-        if (!isFinishing() && session != 0) ui.postDelayed(graceOver, GRACE_MS);
+        if (!isFinishing() && session != 0) {
+            ui.postDelayed(graceOver, GRACE_MS);
+            SessionService.start(this);
+        }
     }
 
     /** Another host (or the same one, with other settings) chosen while this screen exists. */
@@ -758,6 +764,7 @@ public final class SessionActivity extends Activity implements SurfaceHolder.Cal
         if (dialog != null) dialog.dismiss();
         stopClipboard();
         if (receiverOn) unregisterReceiver(screenOff);
+        SessionService.stop();
         synchronized (lock) {
             if (session != 0) {
                 Native.surface(session, null);

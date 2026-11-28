@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A monitor: the status bar icon of the service that keeps a session while the app is left. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFF" android:pathData="M4,4h16a2,2 0,0 1,2 2v10a2,2 0,0 1,-2 2h-16a2,2 0,0 1,-2 -2v-10a2,2 0,0 1,2 -2zM4,6v10h16v-10z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M8,20h8v2h-8z" />
+</vector>

@@ -139,8 +139,8 @@ android\build.ps1 -Release   # R8-optimised, signed with the keystore in $env:SA
   position, so the host's layout and input method decide the characters, Hangul included. The system keyboard is never used:
   nothing typed goes through a keyboard app. Text from a keyboard app (swipe, voice) does not reach the host; use the clipboard.
 - **Lifecycle**: leaving the app pauses the session (the host stops sending frames); it ends after 30 s away, at once when the
-  screen turns off. Lost connections reconnect as in the Windows viewer; that includes the one Android itself closes a few
-  seconds after the app is left (15 and later do, when they freeze the app): the session is back on return.
+  screen turns off. A foreground service runs for those 30 s, as Android (15 and later) otherwise freezes an app a few
+  seconds after it is left and closes its connections. Lost connections reconnect as in the Windows viewer.
 - Not yet: file transfer.
 
 ## Features

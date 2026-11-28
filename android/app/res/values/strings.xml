@@ -79,4 +79,6 @@
     <string name="scan_hint">Point the camera at the key\'s QR code (safe-rdp key qr).</string>
     <string name="no_camera">This device has no camera.</string>
     <string name="camera_failed">The camera failed (%1$d).</string>
+    <string name="session_channel">Session</string>
+    <string name="session_kept">The session stays connected for a moment</string>
 </resources>

@@ -7,6 +7,7 @@
 
 # Started by name from the manifest.
 -keep class io.github.na_degen_girl.saferdp.*Activity { <init>(); }
+-keep class io.github.na_degen_girl.saferdp.SessionService { <init>(); }
 
 -dontobfuscate
 

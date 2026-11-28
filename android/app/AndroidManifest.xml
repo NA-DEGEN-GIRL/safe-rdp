@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
     <!-- Only to read a key's QR code; asked for when that is chosen. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- For SessionService: a session left for a moment is not cut off by the app being frozen. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <!-- To offer opening the Tailscale app when its VPN is off. -->
     <queries>
@@ -60,5 +62,10 @@
             android:exported="false"
             android:theme="@style/Theme.Session"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden" />
+
+        <service
+            android:name=".SessionService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
     </application>
 </manifest>
